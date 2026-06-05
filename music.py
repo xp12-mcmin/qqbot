@@ -1,6 +1,18 @@
 """
-点歌功能模块 - 修复版
+点歌功能模块 - 支持下载和QQ语音转换
+
+FFmpeg 下载地址（用于音频转语音）：
+- 官方下载：https://ffmpeg.org/download.html
+- Windows 完整版：https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip
+- 解压后将 bin/ffmpeg.exe 放到项目目录
 """
+
+import aiohttp
+import asyncio
+import json
+import os
+import re
+import subprocess
 
 import aiohttp
 import asyncio
