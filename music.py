@@ -1,11 +1,13 @@
 """
-点歌功能模块 - 独立文件
+点歌功能模块 - 修复版
 """
 
 import aiohttp
 import asyncio
 import json
 import os
+import re
+import subprocess
 
 
 class MusicService:
@@ -47,23 +49,34 @@ class MusicService:
             async with aiohttp.ClientSession() as session:
                 async with session.get(config["url"], params=params, timeout=15) as resp:
                     if resp.status == 200:
+                        # 尝试解析 JSON
                         try:
                             data = await resp.json(content_type=None)
                         except:
                             text = await resp.text()
                             data = json.loads(text)
                         
+                        # 打印调试信息，方便排查
+                        print(f"[点歌调试] API返回: code={data.get('code')}")
+                        
+                        # 关键：检查返回的 code 是否为 0
                         if data.get("code") == 0:
+                            # 获取 data 字段中的歌曲信息
                             song_data = data.get("data", {})
                             if song_data:
-                                return {
-                                    "success": True,
-                                    "source": config["name"],
-                                    "name": song_data.get("song", "未知"),
-                                    "artist": song_data.get("singer", "未知"),
-                                    "url": song_data.get("music", ""),
-                                    "cover": song_data.get("cover", "")
-                                }
+                                music_url = song_data.get("music", "")
+                                # 确保获取到音乐链接
+                                if music_url:
+                                    return {
+                                        "success": True,
+                                        "source": config["name"],
+                                        "name": song_data.get("song", "未知"),
+                                        "artist": song_data.get("singer", "未知"),
+                                        "url": music_url,
+                                        "cover": song_data.get("cover", "")
+                                    }
+                                else:
+                                    return {"success": False, "msg": "未获取到播放链接"}
                             else:
                                 return {"success": False, "msg": "未找到相关歌曲"}
                         else:
@@ -82,17 +95,86 @@ class MusicService:
         
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.get(url, timeout=30) as resp:
+                async with session.get(url, timeout=60) as resp:
                     if resp.status == 200:
                         with open(filepath, 'wb') as f:
                             f.write(await resp.read())
+                        print(f"[下载] 成功: {filepath}")
                         return filepath
                     else:
+                        print(f"[下载] HTTP {resp.status}")
                         return None
         except Exception as e:
-            print(f"[下载失败] {e}")
+            print(f"[下载] 失败: {e}")
             return None
-
+    
+    async def convert_to_amr(self, input_path: str) -> str:
+        """将音频文件转换为 QQ 语音格式 (AMR)"""
+        try:
+            output_path = input_path.replace('.m4a', '.amr').replace('.mp3', '.amr')
+            
+            # 使用项目目录下的 ffmpeg
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            ffmpeg_path = os.path.join(script_dir, "ffmpeg.exe")
+            
+            # 如果项目目录没有，尝试系统 PATH
+            if not os.path.exists(ffmpeg_path):
+                import shutil
+                ffmpeg_path = shutil.which('ffmpeg')
+                if not ffmpeg_path:
+                    print(f"[转换] ffmpeg 未找到，跳过语音转换")
+                    return None
+            
+            print(f"[转换] 使用 ffmpeg: {ffmpeg_path}")
+            
+            # 先转成 wav 中间格式（避免编码器问题）
+            temp_wav = input_path.replace('.m4a', '.wav').replace('.mp3', '.wav')
+            
+            # 步骤1：转成 wav
+            cmd1 = [ffmpeg_path, '-i', input_path, '-y', temp_wav]
+            process1 = await asyncio.create_subprocess_exec(
+                *cmd1,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            await process1.wait()
+            
+            if not os.path.exists(temp_wav):
+                print(f"[转换] 转 wav 失败")
+                return None
+            
+            # 步骤2：wav 转 amr
+            cmd2 = [
+                ffmpeg_path, '-i', temp_wav,
+                '-acodec', 'amr_nb',
+                '-ar', '8000',
+                '-ac', '1',
+                '-y',
+                output_path
+            ]
+            process2 = await asyncio.create_subprocess_exec(
+                *cmd2,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            await process2.wait()
+            
+            # 清理临时文件
+            if os.path.exists(temp_wav):
+                os.remove(temp_wav)
+            
+            if os.path.exists(output_path):
+                size = os.path.getsize(output_path)
+                if size < 1024 * 1024:  # 小于1MB
+                    print(f"[转换] 成功: {output_path} ({size} bytes)")
+                    return output_path
+                else:
+                    print(f"[转换] 文件太大: {size} bytes")
+                    os.remove(output_path)
+            return None
+        except Exception as e:
+            print(f"[转换] 失败: {e}")
+            return None
 
 _music_service = None
 

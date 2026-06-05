@@ -5443,9 +5443,9 @@ class MessageHandler:
         return None
     # ==================== 辅助方法 ====================
     async def _music(self, group_id: int, user_id: str, keyword: str) -> Dict:
-        """点歌 - 下载并发送到群里"""
+        """点歌 - 下载并发送QQ语音"""
         
-        # 防重复执行锁（3秒内同一群不重复执行）
+        # 防重复执行锁
         import time
         lock_key = f"music_lock_{group_id}"
         now = time.time()
@@ -5455,9 +5455,8 @@ class MessageHandler:
         
         if lock_key in self._music_locks:
             if now - self._music_locks[lock_key] < 3:
-                print(f"[点歌] 群{group_id} 触发冷却，跳过重复执行")
+                print(f"[点歌] 群{group_id} 触发冷却，跳过")
                 return None
-        
         self._music_locks[lock_key] = now
         
         # 发送搜索提示
@@ -5492,42 +5491,71 @@ class MessageHandler:
             "params": {
                 "message_type": "group",
                 "group_id": int(group_id),
-                "message": f"[CQ:at,qq={user_id}] 📥 正在下载《{song_name}》，请稍候...\n"
+                "message": f"[CQ:at,qq={user_id}] 📥 正在下载《{song_name}》，请稍候..."
             }
         }))
         
         filepath = await music.download_music(music_url, filename)
         
-        # 构建消息
+        # 构建消息基础部分
+        msg_base = f"🎵 点歌成功！\n🎤 《{song_name}》- {artist}\n🔗 下载链接：{music_url}"
+        
         if filepath and os.path.exists(filepath):
-            msg = f"🎵 点歌成功！\n🎤 《{song_name}》- {artist}\n📁 文件已上传，请查看群文件。\n💡 如果没看到文件，可能是被拦截了。\n🔗 备用链接：{music_url}"
+            # ========== 尝试转换为 QQ 语音 ==========
+            amr_path = await music.convert_to_amr(filepath)
             
-            # 尝试上传群文件
-            await self.websocket.send(json.dumps({
-                "action": "upload_group_file",
-                "params": {
-                    "group_id": int(group_id),
-                    "file": filepath,
-                    "name": f"{song_name}-{artist}.m4a"
-                }
-            }))
-            
-            # 发送带封面的消息
-            if cover_url:
-                return {
+            if amr_path and os.path.exists(amr_path):
+                # 发送语音消息
+                await self.websocket.send(json.dumps({
                     "action": "send_msg",
                     "params": {
                         "message_type": "group",
                         "group_id": int(group_id),
-                        "message": f"[CQ:image,file={cover_url}]\n{msg}"
+                        "message": f"[CQ:record,file=file:///{os.path.abspath(amr_path)}]"
                     }
-                }
+                }))
+                print(f"[点歌] 已发送语音消息")
+                
+                # 同时发送封面图和下载链接
+                if cover_url:
+                    return {
+                        "action": "send_msg",
+                        "params": {
+                            "message_type": "group",
+                            "group_id": int(group_id),
+                            "message": f"[CQ:image,file={cover_url}]\n{msg_base}\n📢 已发送语音消息，点击可直接播放"
+                        }
+                    }
+                else:
+                    return self._create_reply("group", user_id, group_id, 
+                        f"{msg_base}\n📢 已发送语音消息，点击可直接播放")
             else:
-                return self._create_reply("group", user_id, group_id, msg)
+                # 转换失败，上传群文件
+                print(f"[点歌] 转换失败，上传群文件")
+                await self.websocket.send(json.dumps({
+                    "action": "upload_group_file",
+                    "params": {
+                        "group_id": int(group_id),
+                        "file": filepath,
+                        "name": f"{song_name}-{artist}.m4a"
+                    }
+                }))
+                
+                if cover_url:
+                    return {
+                        "action": "send_msg",
+                        "params": {
+                            "message_type": "group",
+                            "group_id": int(group_id),
+                            "message": f"[CQ:image,file={cover_url}]\n{msg_base}\n📁 文件已上传群文件"
+                        }
+                    }
+                else:
+                    return self._create_reply("group", user_id, group_id, 
+                        f"{msg_base}\n📁 文件已上传群文件")
         else:
             # 下载失败，只发链接
-            return self._create_reply("group", user_id, group_id, 
-                f"🎵 点歌成功！\n🎤 《{song_name}》- {artist}\n🔗 [点击收听]({music_url})")
+            return self._create_reply("group", user_id, group_id, msg_base)
     async def _set_group_card(self, group_id: int, target_id: str, new_name: str, operator_id: str) -> Dict:
         """修改群成员群名片"""
         try:
@@ -6070,6 +6098,8 @@ class MessageHandler:
                 ("!清除我的记忆", "清除个人对话记忆"),
                 ("!搜索记忆 <关键词>", "搜索历史对话"),
                 ("!上一句", "查看自己刚才说的话"),
+                ("申请管理员", "申请成为AI管理员"),
+                ("申请状态", "查看申请状态"),
             ]
             img = generator.create_help_page("基础功能", "【📌 基础功能】", commands, is_admin)
             img_base64 = generator.image_to_base64(img)
@@ -6132,7 +6162,23 @@ class MessageHandler:
         
         # 5. AI性格
         if category_str in ["5", "性格"]:
-            img = generator.create_personality_help_page(is_admin)
+            commands = [
+                ("--- 群聊命令 ---", ""),
+                ("!本群性格", "查看本群当前性格"),
+                ("!本群切换 猫娘/默认", "切换本群性格"),
+                ("!本群恢复", "恢复跟随全局"),
+                ("", ""),
+                ("--- 私聊说明 ---", ""),
+                ("私聊固定使用【默认助手】", "不受任何群性格影响"),
+            ]
+            if is_admin:
+                commands.extend([
+                    ("", ""),
+                    ("--- 管理员命令 ---", ""),
+                    ("!全局切换 猫娘/默认", "设置全局默认性格"),
+                    ("!远程性格 <群号> <模式>", "远程修改任意群的性格"),
+                ])
+            img = generator.create_help_page("AI性格系统", "【🎭 AI性格系统】", commands, is_admin)
             img_base64 = generator.image_to_base64(img)
             return self._send_help_image(message_type, user_id, group_id, img_base64)
         
@@ -6152,13 +6198,17 @@ class MessageHandler:
         # 7. 黑名单
         if category_str in ["7", "黑名单"]:
             commands = [
-                ("!ban @用户", "拉黑用户（全局）"),
-                ("!unban @用户", "解禁用户"),
+                ("!ban <QQ> [原因]", "拉黑用户（全局）"),
+                ("!unban <QQ>", "解禁用户"),
                 ("!blacklist", "查看黑名单"),
-                ("!ban-g 群号", "拉黑整个群（连坐）"),
-                ("!unban-g 群号", "解禁整个群"),
-                ("!批准申请 <QQ>", "批准管理员申请"),
+                ("!ban-g <群号>", "拉黑整个群（连坐）"),
+                ("!unban-g <群号>", "解禁整个群"),
             ]
+            if is_admin:
+                commands.extend([
+                    ("!批准申请 <QQ>", "批准管理员申请"),
+                    ("!拒绝申请 <QQ>", "拒绝管理员申请"),
+                ])
             img = generator.create_help_page("黑名单管理", "【🚫 黑名单管理】", commands, is_admin)
             img_base64 = generator.image_to_base64(img)
             return self._send_help_image(message_type, user_id, group_id, img_base64)
@@ -6193,49 +6243,109 @@ class MessageHandler:
         
         # 10. 入群欢迎
         if category_str in ["10", "入群欢迎", "欢迎"]:
-            img = generator.create_welcome_help_page()
+            commands = [
+                ("!欢迎配置", "查看欢迎配置"),
+                ("!开启欢迎", "开启本群欢迎"),
+                ("!关闭欢迎", "关闭本群欢迎"),
+                ("!设置欢迎 <消息>", "设置本群欢迎语"),
+                ("", "💡 变量: {name}, {user_id}, {group_id}"),
+            ]
+            if is_admin:
+                commands.append(("!欢迎开关 开/关", "全局开关（仅AI管理员）"))
+            img = generator.create_help_page("入群欢迎", "【🎉 入群欢迎系统】", commands, is_admin)
             img_base64 = generator.image_to_base64(img)
             return self._send_help_image(message_type, user_id, group_id, img_base64)
         
-        # 11. 婚姻系统（今日老婆）
+        # 11. 婚姻系统
         if category_str in ["11", "婚姻", "婚姻系统", "老婆", "今日老婆"]:
-            img = generator.create_marriage_help_page(is_admin)
+            commands = [
+                ("--- 基础命令 ---", ""),
+                ("今日老婆", "随机抽取今日老婆（每天一次）"),
+                ("结婚 @对方", "和对方结婚（双方需单身）"),
+                ("离婚", "解除婚姻关系"),
+                ("配偶", "查询自己的配偶"),
+                ("夫妻榜", "查看本群夫妻排行榜"),
+                ("", "✨ 每天0点重置今日老婆"),
+            ]
+            img = generator.create_help_page("婚姻系统", "【💑 婚姻系统】", commands, is_admin)
             img_base64 = generator.image_to_base64(img)
             return self._send_help_image(message_type, user_id, group_id, img_base64)
-        # 在婚姻系统之后，管理员命令之前添加
-
+        
         # 12. 改名功能
         if category_str in ["12", "改名", "改名功能", "rename"]:
-            img = generator.create_rename_help_page(is_admin)
+            commands = [
+                ("--- 修改群成员名片 ---", ""),
+                ("!改名 @对方 <新名字>", "修改指定群成员的名片"),
+                ("", "需要群管理员或AI管理员权限"),
+                ("", "示例: !改名 @张三 李四"),
+                ("", ""),
+                ("--- 修改机器人名字 ---", ""),
+                ("改我名 <新名字>", "修改机器人自己的名片"),
+                ("", "需要AI管理员权限"),
+                ("", "示例: 改我名 小可爱"),
+            ]
+            img = generator.create_help_page("改名功能", "【✏️ 改名功能】", commands, is_admin)
             img_base64 = generator.image_to_base64(img)
             return self._send_help_image(message_type, user_id, group_id, img_base64)
+        
         # 13. 点歌功能
         if category_str in ["13", "点歌", "点歌功能", "music"]:
-            img = generator.create_music_help_page(is_admin)
+            commands = [
+                ("点歌 <歌曲名>", "搜索并下载歌曲"),
+                ("", "支持QQ音乐、网易云等"),
+                ("", "✅ 自动下载音频"),
+                ("", "✅ 转换为QQ语音消息"),
+                ("", "✅ 发送封面图和链接"),
+                ("", "💡 示例: 点歌 稻香"),
+            ]
+            img = generator.create_help_page("点歌功能", "【🎵 点歌功能】", commands, is_admin)
             img_base64 = generator.image_to_base64(img)
-            return self._send_help_image(message_type, user_id, group_id, img_base64) 
-        # 12. 管理员命令
+            return self._send_help_image(message_type, user_id, group_id, img_base64)
+        
+        # 14. 管理员命令
         if category_str in ["14", "管理", "管理员"] and is_admin:
             commands = [
+                ("--- 管理员申请 ---", ""),
+                ("!批准申请 <QQ>", "批准管理员申请"),
+                ("!拒绝申请 <QQ> [原因]", "拒绝管理员申请"),
+                ("", ""),
+                ("--- 好感度管理 ---", ""),
+                ("!好感度设置 <QQ> <数值>", "设置好感度"),
+                ("!好感度增加 <QQ> <数值>", "增加好感度"),
+                ("!好感度减少 <QQ> <数值>", "减少好感度"),
+                ("!好感度重置群", "重置本群好感度"),
+                ("", ""),
                 ("--- 打卡管理 ---", ""),
                 ("!打卡添加 <群号>", "添加打卡群"),
                 ("!打卡时间 <HH:MM>", "修改打卡时间"),
+                ("", ""),
                 ("--- 刷屏命令 ---", ""),
                 ("!刷屏 <QQ> [时长]", "刷屏攻击"),
                 ("!停止刷屏", "停止刷屏"),
                 ("!刷屏状态", "查看刷屏状态"),
+                ("", ""),
                 ("--- 禁言命令 ---", ""),
                 ("!禁言 <QQ> [分钟]", "禁言成员"),
                 ("!解禁 <QQ>", "解除禁言"),
-                ("--- 商店管理 ---", ""),
-                ("!商店添加 <ID> <名称> <价格> <类型> <描述> [冷却]", "添加商品"),
-                ("!商店移除 <商品ID>", "移除商品"),
+                ("", ""),
+                ("--- 黑名单管理 ---", ""),
+                ("!ban <QQ> [原因]", "封禁用户"),
+                ("!unban <QQ>", "解封用户"),
+                ("!ban-g <群号>", "拉黑整个群"),
+                ("!unban-g <群号>", "解禁整个群"),
+                ("", ""),
+                ("--- 性格管理 ---", ""),
+                ("!全局切换 猫娘/默认", "设置全局默认性格"),
+                ("!远程性格 <群号> <模式>", "远程修改群性格"),
+                ("", ""),
+                ("--- 欢迎管理 ---", ""),
+                ("!欢迎开关 开/关", "全局欢迎开关"),
             ]
             img = generator.create_help_page("管理员命令", "【⚙️ 管理员命令】", commands, is_admin)
             img_base64 = generator.image_to_base64(img)
             return self._send_help_image(message_type, user_id, group_id, img_base64)
-       
-        # 13. 其他功能
+        
+        # 15. 其他功能
         if category_str in ["15", "其他"]:
             commands = [
                 ("--- 绿茶反击 ---", ""),
@@ -6247,6 +6357,7 @@ class MessageHandler:
                 ("!绿茶添加黑名单 <QQ>", "添加黑名单"),
                 ("!绿茶移除黑名单 <QQ>", "移除黑名单"),
                 ("!绿茶语录", "随机语录"),
+                ("", ""),
                 ("--- 自动重进 ---", ""),
                 ("!自动重进 开关 开/关", "全局开关"),
                 ("!自动重进 状态", "查看状态"),
@@ -6255,6 +6366,7 @@ class MessageHandler:
                 ("!自动重进 移除群 <群号>", "移除监控群"),
                 ("!自动重进 开启群 <群号>", "开启群"),
                 ("!自动重进 关闭群 <群号>", "关闭群"),
+                ("", ""),
                 ("--- 自动解禁 ---", ""),
                 ("!自动解禁 开关 开/关", "全局开关"),
                 ("!自动解禁 状态", "查看状态"),
@@ -6263,6 +6375,10 @@ class MessageHandler:
                 ("!自动解禁 移除群 <群号>", "移除群白名单"),
                 ("!自动解禁 添加用户 <QQ>", "添加用户白名单"),
                 ("!自动解禁 移除用户 <QQ>", "移除用户白名单"),
+                ("", ""),
+                ("--- 视频解析 ---", ""),
+                ("!视频解析 开/关", "开启/关闭视频解析"),
+                ("!视频解析 群发/私聊", "设置发送方式"),
             ]
             img = generator.create_help_page("其他功能", "【🔧 其他功能】", commands, is_admin)
             img_base64 = generator.image_to_base64(img)
