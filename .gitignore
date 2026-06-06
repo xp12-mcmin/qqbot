@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE
+.vs/
+.vscode/
+.idea/
+*.sln
+*.pyproj
+
+# 数据文件
+data/
+exports/
+backups/
+bot_data/
+*.json
+!requirements.txt
+
+# 临时文件
+*.exe
+*.log
+startup_debug.txt
+msg_cache.json
+clock_config.json
+
+# 字体
+fonts/
+
+# Minecraft 相关
+mc/
+
+# 测试
+test*.png
+test_memory/
+
+# 其他
+*.TXT
+UpgradeLog.htm
+1111111.TXT
