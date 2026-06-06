@@ -5482,8 +5482,8 @@ class MessageHandler:
         music_url = result.get('url')
         cover_url = result.get('cover')
         
-        # 下载音乐
-        safe_name = re.sub(r'[\\/*?:"<>|]', '', f"{song_name}-{artist}")
+        # ========== 使用时间戳做文件名（避免中文和特殊字符）==========
+        safe_name = f"music_{int(time.time()*1000)}_{user_id}"
         filename = f"{safe_name}.m4a"
         
         await self.websocket.send(json.dumps({
@@ -5514,7 +5514,7 @@ class MessageHandler:
                         "message": f"[CQ:record,file=file:///{os.path.abspath(amr_path)}]"
                     }
                 }))
-                print(f"[点歌] 已发送语音消息")
+                print(f"[点歌] 已发送语音消息: {amr_path}")
                 
                 # 同时发送封面图和下载链接
                 if cover_url:
@@ -5556,6 +5556,7 @@ class MessageHandler:
         else:
             # 下载失败，只发链接
             return self._create_reply("group", user_id, group_id, msg_base)
+
     async def _set_group_card(self, group_id: int, target_id: str, new_name: str, operator_id: str) -> Dict:
         """修改群成员群名片"""
         try:
