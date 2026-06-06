@@ -4539,7 +4539,7 @@ class MessageHandler:
             return self._create_reply(message_type, user_id, group_id, "\n".join(lines))
         
         # ========== 6. 商店 ==========
-        if text_lower in ["!商店", "！商店"]:
+        if text_lower in ["!商店", "！商店", "!商城", "！商城"]:
             if not hasattr(self, 'favorability') or self.favorability is None:
                 return self._create_reply(message_type, user_id, group_id, "❌ 好感度系统未初始化")
             items = self.favorability.get_shop_items()
@@ -4549,8 +4549,7 @@ class MessageHandler:
             for item in items:
                 lines.append(f"  {item['id']}: {item['name']} - {item['cost']}❤️")
                 lines.append(f"     {item['description']}")
-            return self._create_reply(message_type, user_id, group_id, "\n".join(lines))
-        
+            return self._create_reply(message_type, user_id, group_id, "\n".join(lines))        
         # ========== 7. 购买 ==========
         if text_lower.startswith(("!购买", "！购买")):
             if not hasattr(self, 'favorability') or self.favorability is None:
