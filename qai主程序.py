@@ -5481,8 +5481,9 @@ class MessageHandler:
         music_url = result.get('url')
         cover_url = result.get('cover')
         
-        # ========== 使用时间戳做文件名（避免中文和特殊字符）==========
-        safe_name = f"music_{int(time.time()*1000)}_{user_id}"
+        # ========== 使用歌曲名做文件名（清理特殊字符）==========
+        import re
+        safe_name = re.sub(r'[\\/*?:"<>|]', '', song_name)
         filename = f"{safe_name}.m4a"
         
         await self.websocket.send(json.dumps({
@@ -5536,7 +5537,7 @@ class MessageHandler:
                     "params": {
                         "group_id": int(group_id),
                         "file": filepath,
-                        "name": f"{song_name}-{artist}.m4a"
+                        "name": f"{song_name}.m4a"
                     }
                 }))
                 
@@ -6480,6 +6481,69 @@ class MessageHandler:
         }
 
 # ==================== WebSocket连接主程序 ====================
+async def auto_sign_all_groups(websocket, handler):
+    """自动获取群列表并对所有群打卡"""
+    try:
+        print("[自动打卡] 开始获取群列表...")
+        
+        # 创建Future等待响应
+        loop = asyncio.get_event_loop()
+        future = loop.create_future()
+        echo = f"auto_sign_getlist_{int(time.time())}"
+        
+        # 存储到全局或handler的pending_requests
+        if not hasattr(handler, 'pending_requests'):
+            handler.pending_requests = {}
+        handler.pending_requests[echo] = future
+        
+        # 发送 get_group_list 请求
+        await websocket.send(json.dumps({
+            "action": "get_group_list",
+            "params": {"no_cache": False},
+            "echo": echo
+        }))
+        
+        # 等待响应（超时10秒）
+        try:
+            response = await asyncio.wait_for(future, timeout=10.0)
+        except asyncio.TimeoutError:
+            print("[自动打卡] 获取群列表超时")
+            return
+        
+        # 解析群列表
+        if response.get("status") == "ok" and response.get("retcode") == 0:
+            groups = response.get("data", [])
+            if not groups:
+                print("[自动打卡] 群列表为空")
+                return
+            print(f"[自动打卡] 获取到 {len(groups)} 个群")
+        else:
+            print(f"[自动打卡] 获取群列表失败: {response}")
+            return
+        
+        # 遍历打卡
+        success = 0
+        for group in groups:
+            group_id = group.get("group_id")
+            if group_id:
+                try:
+                    await websocket.send(json.dumps({
+                        "action": "send_group_sign",
+                        "params": {"group_id": group_id},
+                        "echo": f"auto_sign_{group_id}_{int(time.time())}"
+                    }))
+                    success += 1
+                    print(f"[自动打卡] 已发送打卡请求到群 {group_id}")
+                    await asyncio.sleep(0.3)  # 避免请求过快
+                except Exception as e:
+                    print(f"[自动打卡] 打卡群 {group_id} 失败: {e}")
+        
+        print(f"[自动打卡] 批量打卡完成，成功 {success}/{len(groups)} 个群")
+        
+    except Exception as e:
+        print(f"[自动打卡] 批量打卡异常: {e}")
+        import traceback
+        traceback.print_exc()
 async def _handle_quick_spam(self, text: str, user_id: str, message_type: str, 
                             group_id: str, is_admin: bool) -> Optional[Dict]:
     """处理快捷刷屏命令 @机器人 QQ号 [时长]"""
@@ -7180,7 +7244,7 @@ async def handle_http_post(request):
         return web.Response(text="ERROR", status=500)
 
 async def run_bot():
-    """主机器人连接函数 - 支持 WebSocket + HTTP"""
+    """主机器人连接函数 - 支持 WebSocket + HTTP，自动获取群列表打卡"""
     global http_handler
     
     # 1. 创建处理器
@@ -7211,7 +7275,9 @@ async def run_bot():
             return [convert_sets(item) for item in obj]
         return obj
     
-    # 记录上次重置的日期
+    # 记录上次打卡的日期
+    last_sign_date = None
+    # 记录上次重置老婆的日期
     last_reset_date = None
     
     while True:
@@ -7222,10 +7288,16 @@ async def run_bot():
                 
                 handler.websocket = websocket
                 
+                # 设置刷屏器的websocket
                 if hasattr(handler, 'spammer') and handler.spammer:
                     if hasattr(handler.spammer, 'set_websocket'):
                         handler.spammer.set_websocket(websocket)
                 
+                # 初始化 pending_requests（如果不存在）
+                if not hasattr(handler, 'pending_requests'):
+                    handler.pending_requests = {}
+                
+                # 获取机器人ID
                 current_bot_id = None
                 try:
                     hello_data = await asyncio.wait_for(websocket.recv(), timeout=5.0)
@@ -7248,7 +7320,11 @@ async def run_bot():
                         raw_data = await asyncio.wait_for(websocket.recv(), timeout=1.0)
                         data = json.loads(raw_data)
                         
+                        # 处理API响应（包括群列表响应）
                         if "echo" in data:
+                            echo = data.get("echo")
+                            if hasattr(handler, 'pending_requests') and echo in handler.pending_requests:
+                                handler.pending_requests[echo].set_result(data)
                             continue
                         
                         reply = await handler.handle_message(data)
@@ -7261,26 +7337,26 @@ async def run_bot():
                                 
                     except asyncio.TimeoutError:
                         current_time = time.time()
-                        if current_time - last_check_time > 60:
+                        if current_time - last_check_time > 60:  # 每分钟检查一次
                             last_check_time = current_time
                             now = datetime.now()
+                            current_date = now.strftime("%Y-%m-%d")
                             
-                            # 每天0点执行打卡
-                            if now.hour == 0 and now.minute == 0:
-                                if hasattr(handler, 'sign_sender'):
-                                    try:
-                                        await handler.sign_sender.send_daily_sign(websocket)
-                                        print("[定时] 打卡发送完成")
-                                    except Exception as e:
-                                        print(f"[定时] 打卡失败: {e}")
+                            # ========== 每天0点执行自动打卡（自动获取群列表） ==========
+                            if last_sign_date != current_date and now.hour == 0 and now.minute == 0:
+                                print(f"[定时] 触发00:00自动打卡")
+                                await auto_sign_all_groups(websocket, handler)
+                                last_sign_date = current_date
                             
                             # ========== 每日重置今日老婆记录 ==========
-                            today_str = now.strftime("%Y-%m-%d")
-                            if last_reset_date != today_str and now.hour == 0 and now.minute < 5:
+                            if last_reset_date != current_date and now.hour == 0 and now.minute < 5:
                                 if hasattr(handler, 'today_wife_record'):
                                     handler.today_wife_record = {}
-                                    last_reset_date = today_str
-                                    print(f"[定时] 今日老婆记录已重置 ({today_str})")
+                                    last_reset_date = current_date
+                                    print(f"[定时] 今日老婆记录已重置 ({current_date})")
+                            
+                            # ========== 可选：其他定时任务 ==========
+                            # 其他需要定时执行的任务可以在这里添加
                             
                         continue
                         
