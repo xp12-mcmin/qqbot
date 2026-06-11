@@ -3477,9 +3477,20 @@ class MessageHandler:
         # ... 现有代码 ...
         
         # 骂人模块总开关（默认关闭）
+        # 骂人模块总开关（默认关闭）
         self.scolding_enabled = False  # 默认关闭，需要管理员手动开启
         self.scolding_config_file = "data/scolding_config.json"
-        self._load_scolding_config()  # 从文件加载配置
+        # 防御性调用：防止方法没定义时崩溃
+        if hasattr(self, '_load_scolding_config'):
+            self._load_scolding_config()
+        else:
+            print("[骂人模块] _load_scolding_config 方法未找到，使用默认值")
+        # 同样保护所有可能有问题的调用
+        # ========== 防御性检查：好感度辅助方法 ==========
+        for method_name in ['_extract_at_target_from_raw', '_extract_target_user', '_extract_delta_value']:
+            if not hasattr(self, method_name):
+                print(f"[好感度修复] {method_name} 方法未找到")
+
         # 初始化 AI 性格（传入黑名单）
         self.ai = OllamaAI()
         if hasattr(self.ai, 'personality_mgr'):
@@ -3596,6 +3607,70 @@ class MessageHandler:
                 return role
             del self._role_cache[key]
         return None
+    def _extract_at_target_from_raw(self, raw_message_data, exclude_bot=True):
+        """从原始消息中提取被@的用户QQ号（排除机器人自己）"""
+        if not raw_message_data:
+            return None
+        
+        raw_msg = raw_message_data.get("message", [])
+        if not isinstance(raw_msg, list):
+            return None
+        
+        bot_id = str(self.bot_self_id) if self.bot_self_id else ""
+        
+        for seg in raw_msg:
+            if isinstance(seg, dict) and seg.get("type") == "at":
+                at_qq = str(seg.get("data", {}).get("qq", ""))
+                if exclude_bot and at_qq == bot_id:
+                    continue
+                if at_qq:
+                    return at_qq
+        return None
+
+
+    def _extract_target_user(self, text, raw_message_data):
+        """
+        智能提取目标用户：
+        1. 优先从@提取（使用原始消息，能识别CQ码）
+        2. 其次从文本里提取纯数字QQ号
+        3. 最后返回 None
+        """
+        # 1. 优先从@提取
+        at_user = self._extract_at_target_from_raw(raw_message_data)
+        if at_user:
+            return at_user
+        
+        # 2. 从文本提取纯数字（5位以上才算QQ号）
+        import re
+        qq_match = re.search(r'(\d{5,11})', text)
+        if qq_match:
+            return qq_match.group(1)
+        
+        return None
+
+
+    def _extract_delta_value(self, text, default=10, exclude_user=None):
+        """
+        提取好感度变化数值（排除QQ号和已排除的用户）
+        智能识别：只取 <= 4 位的数字作为变化值
+        """
+        import re
+        parts = text.split()
+        
+        for part in parts:
+            # 必须是纯数字
+            if not part.lstrip('-').isdigit():
+                continue
+            # 排除QQ号（5位以上）
+            if len(part.lstrip('-')) >= 5:
+                continue
+            # 排除已识别的目标用户
+            if exclude_user and part == exclude_user:
+                continue
+            # 这就是数值
+            return int(part)
+        
+        return default
 
     def _set_cached_role(self, group_id: int, user_id: int, role: str, ttl: int = 10):
         """缓存角色（默认10秒）"""
@@ -4464,7 +4539,7 @@ class MessageHandler:
                     "❌ 请@要结婚的对象（不能是机器人）\n示例: 结婚 @对方")
             
             return await self._marry(group_id, user_id, target)
-        
+            
         # ========== 离婚 ==========
         if text_lower in ["!离婚", "！离婚", "离婚"]:
             if message_type != "group":
@@ -4483,7 +4558,35 @@ class MessageHandler:
                 return self._create_reply(message_type, user_id, group_id, "❌ 该命令只能在群聊中使用")
             return await self._marriage_rank(group_id)
         
-        # ... 后续其他命令 ...     
+        # ... 后续其他命令 ...
+        #=============点歌============
+        #=============点歌============
+        if text_lower.startswith(("!点歌", "！点歌", "点歌")):
+            if message_type != "group":
+                return self._create_reply(message_type, user_id, group_id, "❌ 该命令只能在群聊中使用")
+            
+            # 提取歌曲名
+            keyword = text.strip()
+            if keyword.startswith("!点歌"):
+                keyword = keyword[3:].strip()
+            elif keyword.startswith("！点歌"):
+                keyword = keyword[3:].strip()
+            elif keyword.startswith("点歌"):
+                keyword = keyword[2:].strip()
+            
+            if not keyword or keyword == "!" or keyword == "！":
+                return self._create_reply(message_type, user_id, group_id, 
+                    "❌ 请指定歌曲名\n示例: 点歌 稻香")
+            
+            # ✅ 调用 _music
+            result = await self._music(group_id, user_id, keyword)
+            
+            # ✅ 关键：如果 _music 返回 None，说明是重复请求，也要返回一个"占位"回复
+            if result is None:
+                # 返回一个空回复（不发消息），但阻止继续执行
+                return {"action": "ignore", "params": {}}  # 特殊标记
+            
+            return result
         # ========== 2. 打卡命令 ==========
         if text_lower in ["!打卡", "！打卡", "!sign", "！sign", "打卡"]:
             responses = [
@@ -4512,21 +4615,41 @@ class MessageHandler:
             return self._create_reply(message_type, user_id, group_id, msg)
         
         # ========== 4. 好感度查看 ==========
+        # ========== 4. 好感度查看（修复版：支持@用户 + 显示昵称）==========
         if text_lower in ["!好感度", "！好感度", "!好感", "！好感"]:
-            target_user = user_id
-            import re
-            at_match = re.search(r'\[CQ:at,qq=(\d+)\]', text)
-            if at_match:
-                target_user = at_match.group(1)
+            # 智能提取目标用户
+            target_user = self._extract_target_user(text, raw_message_data)
+            if not target_user:
+                target_user = user_id
+            
+            # 获取好感度信息
+            if not hasattr(self, 'favorability') or not self.favorability:
+                return self._create_reply(message_type, user_id, group_id, "❌ 好感度系统未初始化")
             
             info = self.favorability.get_favor_info(target_user)
+            
+            # 获取目标用户昵称（优先@对象）
+            if target_user != user_id:
+                # 查的是别人，尝试获取昵称
+                target_name = await self._get_member_name(int(group_id) if message_type == "group" else 0, target_user)
+                user_display = f"{target_name}({target_user})"
+            else:
+                user_display = f"你({user_id})"
+            
             msg = f"""【❤️ 好感度信息】
-    用户: {target_user}
-    好感度: {info['favor']} ❤️
-    等级: {info['level_name']}"""
+        👤 用户: {user_display}
+        ❤️ 好感度: {info['favor']} 分
+        🏆 等级: {info['level_name']}"""
+            
             if info.get('title'):
-                msg += f"\n称号: {info['title']}"
+                msg += f"\n🎖️ 称号: {info['title']}"
+            
+            # 显示一些额外信息
+            if info.get('last_change'):
+                msg += f"\n📊 上次变化: {info['last_change']}"
+            
             return self._create_reply(message_type, user_id, group_id, msg)
+
         
         # ========== 5. 好感榜 ==========
         if text_lower in ["!好感榜", "！好感榜", "!排行榜", "！排行榜"]:
@@ -4600,26 +4723,7 @@ class MessageHandler:
                 return self._create_reply(message_type, user_id, group_id, "❌ 该命令只能在群聊中使用")
             status = self.ai.personality_mgr.get_group_status(group_id)
             return self._create_reply(message_type, user_id, group_id, status)
-        #=============点歌============
-        if text_lower.startswith(("!点歌", "！点歌", "点歌")):
-            if message_type != "group":
-                return self._create_reply(message_type, user_id, group_id, "❌ 该命令只能在群聊中使用")
-            
-            # 提取歌曲名
-            keyword = text.strip()
-            if keyword.startswith("!点歌"):
-                keyword = keyword[3:].strip()
-            elif keyword.startswith("！点歌"):
-                keyword = keyword[3:].strip()
-            elif keyword.startswith("点歌"):
-                keyword = keyword[2:].strip()
-            
-            if not keyword or keyword == "!" or keyword == "！":
-                return self._create_reply(message_type, user_id, group_id, 
-                    "❌ 请指定歌曲名\n示例: 点歌 稻香")
-            
-            # 直接返回，不要继续执行后面的代码
-            return await self._music(group_id, user_id, keyword)      
+
         # ========== 10. 记忆命令 ==========
         if text_lower in ["!记忆状态", "！记忆状态"]:
             if hasattr(self.ai, 'memory_module'):
@@ -4876,116 +4980,114 @@ class MessageHandler:
             else:
                 return self._create_reply(message_type, user_id, group_id, 
                     "📝 格式: !设置欢迎 <欢迎消息>\n\n可用变量:\n{name} - 新人昵称\n{user_id} - 新人QQ号\n{group_id} - 本群群号\n\n示例:\n!设置欢迎 🎉 欢迎{name}加入本群！")        
-        # ---------- 13.1 好感度全榜（管理员）----------
-        if text_lower in ["!好感度全榜", "！好感度全榜"]:
-            print("[调试] 匹配到好感度全榜命令")
-            rank = self.favorability.get_rank(20)
-            if not rank:
-                return self._create_reply(message_type, user_id, group_id, "📭 暂无好感度数据")
-            lines = ["【❤️ 全局好感度完整排行榜（前20名）】"]
-            for i, user in enumerate(rank, 1):
-                lines.append(f"  {i}. {user['user_id']}: {user['favor']} ❤️")
-            return self._create_reply(message_type, user_id, group_id, "\n".join(lines))
-        
-        # ---------- 13.2 好感度管理 ----------
-        if text_lower.startswith(("!好感度开关", "！好感度开关")):
-            parts = text.split()
-            if len(parts) >= 2:
-                enabled = parts[1] in ["开", "on", "开启"]
-                self.favorability.set_enabled(enabled)
-                return self._create_reply(message_type, user_id, group_id, f"✅ 好感度系统已{'开启' if enabled else '关闭'}")
+        # ========== 管理员好感度管理（修复版）==========
+        if is_admin:
+            # ---------- 好感度全榜 ----------
+            if text_lower in ["!好感度全榜", "！好感度全榜"]:
+                rank = self.favorability.get_rank(20)
+                if not rank:
+                    return self._create_reply(message_type, user_id, group_id, "📭 暂无好感度数据")
+                lines = ["【❤️ 全局好感度完整排行榜（前20名）】"]
+                for i, user in enumerate(rank, 1):
+                    title_str = f" [{user['title']}]" if user.get('title') else ""
+                    lines.append(f"  {i}. {user['user_id']}{title_str}: {user['favor']} ❤️")
+                return self._create_reply(message_type, user_id, group_id, "\n".join(lines))
+            
+            # ---------- 好感度开关 ----------
+            if text_lower.startswith(("!好感度开关", "！好感度开关")):
+                parts = text.split()
+                if len(parts) >= 2 and parts[1] in ["开", "on", "开启"]:
+                    self.favorability.set_enabled(True)
+                    return self._create_reply(message_type, user_id, group_id, "✅ 好感度系统已开启")
+                elif len(parts) >= 2 and parts[1] in ["关", "off", "关闭"]:
+                    self.favorability.set_enabled(False)
+                    return self._create_reply(message_type, user_id, group_id, "❌ 好感度系统已关闭")
+                else:
+                    status = "开启" if self.favorability.config.get("enabled", True) else "关闭"
+                    return self._create_reply(message_type, user_id, group_id, 
+                        f"⚙️ 好感度系统状态: {status}\n用法: !好感度开关 开/关")
+            
+            # ---------- 好感度通知 ----------
+            if text_lower.startswith(("!好感度通知", "！好感度通知")):
+                parts = text.split()
+                if len(parts) >= 2 and parts[1] in ["开", "on", "开启"]:
+                    self.favorability.set_notify_enabled(True)
+                    return self._create_reply(message_type, user_id, group_id, "✅ 好感度通知已开启")
+                elif len(parts) >= 2 and parts[1] in ["关", "off", "关闭"]:
+                    self.favorability.set_notify_enabled(False)
+                    return self._create_reply(message_type, user_id, group_id, "❌ 好感度通知已关闭")
+                return self._create_reply(message_type, user_id, group_id, 
+                    f"⚙️ 通知状态: {'开启' if self.favorability.config.get('notify_enabled', True) else '关闭'}\n用法: !好感度通知 开/关")
+            
+            # ---------- 好感度AI开关（修复大小写问题）----------
+            if text_lower.startswith(("!好感度ai", "！好感度ai")):
+                parts = text.split()
+                if len(parts) >= 2:
+                    if parts[1] in ["开", "on", "开启"]:
+                        self.favorability.set_ai_enabled(True)
+                        return self._create_reply(message_type, user_id, group_id, "✅ 好感度AI分析已开启")
+                    elif parts[1] in ["关", "off", "关闭"]:
+                        self.favorability.set_ai_enabled(False)
+                        return self._create_reply(message_type, user_id, group_id, "❌ 好感度AI分析已关闭")
+                    elif parts[1] in ["状态", "status"]:
+                        status = "开启" if self.favorability.config.get("ai_enabled", True) else "关闭"
+                        return self._create_reply(message_type, user_id, group_id, f"🤖 好感度AI分析状态: {status}")
+                return self._create_reply(message_type, user_id, group_id, "格式: !好感度AI 开/关/状态")
+            
+            # ---------- 好感度设置（修复@提取）----------
+            if text_lower.startswith(("!好感度设置", "！好感度设置")):
+                # 智能提取目标用户
+                target_user = self._extract_target_user(text, raw_message_data)
+                if not target_user:
+                    return self._create_reply(message_type, user_id, group_id, 
+                        "❌ 请指定QQ号或@用户\n示例: !好感度设置 123456 100\n示例: !好感度设置 @某人 100")
+                
+                # 提取数值
+                delta = self._extract_delta_value(text, default=None, exclude_user=target_user)
+                if delta is None:
+                    return self._create_reply(message_type, user_id, group_id, 
+                        "❌ 请指定数值\n示例: !好感度设置 123456 100")
+                
+                success, msg = self.favorability.set_favor(target_user, delta, user_id)
+                return self._create_reply(message_type, user_id, group_id, msg)
+            
+            # ---------- 好感度增加（修复@提取+数值识别）----------
+            if text_lower.startswith(("!好感度增加", "！好感度增加")):
+                target_user = self._extract_target_user(text, raw_message_data)
+                if not target_user:
+                    return self._create_reply(message_type, user_id, group_id, 
+                        "❌ 请指定QQ号或@用户\n示例: !好感度增加 123456 10\n示例: !好感度增加 @某人 10")
+                
+                # 智能提取变化值（默认10）
+                delta = self._extract_delta_value(text, default=10, exclude_user=target_user)
+                
+                # 如果只输入了QQ号没数值，用默认10
+                # 如果输入了非数字，提示
+                if not any(p.lstrip('-').isdigit() and len(p.lstrip('-')) <= 4 for p in text.split()):
+                    delta = 10
+                
+                success, msg = self.favorability.add_favor(target_user, delta, user_id)
+                return self._create_reply(message_type, user_id, group_id, msg)
+            
+            # ---------- 好感度减少（修复@提取+数值识别）----------
+            if text_lower.startswith(("!好感度减少", "！好感度减少")):
+                target_user = self._extract_target_user(text, raw_message_data)
+                if not target_user:
+                    return self._create_reply(message_type, user_id, group_id, 
+                        "❌ 请指定QQ号或@用户\n示例: !好感度减少 123456 10\n示例: !好感度减少 @某人 10")
+                
+                delta = self._extract_delta_value(text, default=10, exclude_user=target_user)
+                if not any(p.lstrip('-').isdigit() and len(p.lstrip('-')) <= 4 for p in text.split()):
+                    delta = 10
+                
+                success, msg = self.favorability.add_favor(target_user, -delta, user_id)
+                return self._create_reply(message_type, user_id, group_id, msg)
+            
+            # ---------- 好感度重置全群 ----------
+            if text_lower in ["!好感度重置全群", "！好感度重置全群"]:
+                success, msg = self.favorability.reset_all(user_id)
+                return self._create_reply(message_type, user_id, group_id, msg)
 
-        if text_lower.startswith(("!好感度通知", "！好感度通知")):
-            parts = text.split()
-            if len(parts) >= 2:
-                enabled = parts[1] in ["开", "on", "开启"]
-                self.favorability.set_notify_enabled(enabled)
-                return self._create_reply(message_type, user_id, group_id, f"✅ 好感度通知已{'开启' if enabled else '关闭'}")
-
-        if text_lower.startswith(("!好感度AI", "！好感度AI")):
-            parts = text.split()
-            if len(parts) >= 2:
-                if parts[1] in ["开", "on", "开启"]:
-                    self.favorability.set_ai_enabled(True)
-                    return self._create_reply(message_type, user_id, group_id, "✅ 好感度AI分析已开启")
-                elif parts[1] in ["关", "off", "关闭"]:
-                    self.favorability.set_ai_enabled(False)
-                    return self._create_reply(message_type, user_id, group_id, "❌ 好感度AI分析已关闭")
-                elif parts[1] in ["状态", "status"]:
-                    status = "开启" if self.favorability.config.get("ai_enabled", True) else "关闭"
-                    return self._create_reply(message_type, user_id, group_id, f"🤖 好感度AI分析状态: {status}")
-
-        if text_lower.startswith(("!好感度设置", "！好感度设置")):
-            parts = text.split()
-            target_user = None
-            for part in parts:
-                if part.isdigit() and len(part) >= 5:
-                    target_user = part
-                    break
-            if not target_user:
-                import re
-                at_match = re.search(r'\[CQ:at,qq=(\d+)\]', text)
-                if at_match:
-                    target_user = at_match.group(1)
-            if not target_user:
-                return self._create_reply(message_type, user_id, group_id, "❌ 请指定QQ号\n示例: !好感度设置 123456 100")
-            value = None
-            for part in parts:
-                if part.lstrip('-').isdigit():
-                    value = int(part)
-                    break
-            if value is None:
-                return self._create_reply(message_type, user_id, group_id, "❌ 请指定数值")
-            success, msg = self.favorability.set_favor(target_user, value, user_id)
-            return self._create_reply(message_type, user_id, group_id, msg)
-
-        if text_lower.startswith(("!好感度增加", "！好感度增加")):
-            parts = text.split()
-            target_user = None
-            for part in parts:
-                if part.isdigit() and len(part) >= 5:
-                    target_user = part
-                    break
-            if not target_user:
-                import re
-                at_match = re.search(r'\[CQ:at,qq=(\d+)\]', text)
-                if at_match:
-                    target_user = at_match.group(1)
-            if not target_user:
-                return self._create_reply(message_type, user_id, group_id, "❌ 请指定QQ号")
-            delta = 10
-            for part in parts:
-                if part.isdigit() and len(part) <= 4:
-                    delta = int(part)
-                    break
-            success, msg = self.favorability.add_favor(target_user, delta, user_id)
-            return self._create_reply(message_type, user_id, group_id, msg)
-
-        if text_lower.startswith(("!好感度减少", "！好感度减少")):
-            parts = text.split()
-            target_user = None
-            for part in parts:
-                if part.isdigit() and len(part) >= 5:
-                    target_user = part
-                    break
-            if not target_user:
-                import re
-                at_match = re.search(r'\[CQ:at,qq=(\d+)\]', text)
-                if at_match:
-                    target_user = at_match.group(1)
-            if not target_user:
-                return self._create_reply(message_type, user_id, group_id, "❌ 请指定QQ号")
-            delta = 10
-            for part in parts:
-                if part.isdigit() and len(part) <= 4:
-                    delta = int(part)
-                    break
-            success, msg = self.favorability.add_favor(target_user, -delta, user_id)
-            return self._create_reply(message_type, user_id, group_id, msg)
-
-        if text_lower in ["!好感度重置全群", "！好感度重置全群"]:
-            success, msg = self.favorability.reset_all(user_id)
-            return self._create_reply(message_type, user_id, group_id, msg)
 
         # ---------- 13.3 防撤回 ----------
         # ========== 防撤回系统命令 ==========
@@ -5444,119 +5546,121 @@ class MessageHandler:
     async def _music(self, group_id: int, user_id: str, keyword: str) -> Dict:
         """点歌 - 下载并发送QQ语音"""
         
-        # 防重复执行锁
-        import time
-        lock_key = f"music_lock_{group_id}"
-        now = time.time()
+        # ========== 计数去重 ==========
+        if not hasattr(self, '_music_count'):
+            self._music_count = {}
         
-        if not hasattr(self, '_music_locks'):
-            self._music_locks = {}
+        import hashlib
+        command_key = f"music_{group_id}_{user_id}_{keyword}"
+        command_hash = hashlib.md5(command_key.encode()).hexdigest()
         
-        if lock_key in self._music_locks:
-            if now - self._music_locks[lock_key] < 3:
-                print(f"[点歌] 群{group_id} 触发冷却，跳过")
-                return None
-        self._music_locks[lock_key] = now
+        count = self._music_count.get(command_hash, 0)
         
-        # 发送搜索提示
+        if count >= 1:
+            # 重复请求：发送提示消息，然后返回（不继续处理）
+            print(f"[点歌] 重复命令，已忽略: {command_key}")
+            return self._create_reply("group", user_id, group_id, 
+                "⏰ 点歌命令已收到，正在处理中，请勿重复发送~")
+        
+        # 第一次：计数+1，发送"正在处理"提示
+        self._music_count[command_hash] = count + 1
+        
+        # 发送"正在处理"提示
         await self.websocket.send(json.dumps({
             "action": "send_msg",
             "params": {
                 "message_type": "group",
                 "group_id": int(group_id),
-                "message": f"[CQ:at,qq={user_id}] 🔍 正在搜索《{keyword}》..."
+                "message": f"[CQ:at,qq={user_id}] 🎵 正在搜索《{keyword}》，请稍候..."
             }
         }))
         
-        # 调用点歌模块
-        from music import get_music_service
-        music = get_music_service()
-        result = await music.search(keyword)
+        # 延迟清理计数
+        async def cleanup():
+            await asyncio.sleep(5)
+            if command_hash in self._music_count:
+                del self._music_count[command_hash]
+                print(f"[点歌] 已清理计数: {command_hash}")
         
-        if not result.get("success"):
-            return self._create_reply("group", user_id, group_id, f"❌ 点歌失败：{result.get('msg')}")
+        asyncio.create_task(cleanup())
         
-        song_name = result.get('name')
-        artist = result.get('artist')
-        music_url = result.get('url')
-        cover_url = result.get('cover')
-        
-        # ========== 使用歌曲名做文件名（清理特殊字符）==========
-        import re
-        safe_name = re.sub(r'[\\/*?:"<>|]', '', song_name)
-        filename = f"{safe_name}.m4a"
-        
-        await self.websocket.send(json.dumps({
-            "action": "send_msg",
-            "params": {
-                "message_type": "group",
-                "group_id": int(group_id),
-                "message": f"[CQ:at,qq={user_id}] 📥 正在下载《{song_name}》，请稍候..."
-            }
-        }))
-        
-        filepath = await music.download_music(music_url, filename)
-        
-        # 构建消息基础部分
-        msg_base = f"🎵 点歌成功！\n🎤 《{song_name}》- {artist}\n🔗 下载链接：{music_url}"
-        
-        if filepath and os.path.exists(filepath):
-            # ========== 尝试转换为 QQ 语音 ==========
-            amr_path = await music.convert_to_amr(filepath)
+        # ========== 点歌逻辑 ==========
+        try:
+            from music import get_music_service
+            music = get_music_service()
+            result = await music.search(keyword)
             
-            if amr_path and os.path.exists(amr_path):
-                # 发送语音消息
-                await self.websocket.send(json.dumps({
-                    "action": "send_msg",
-                    "params": {
-                        "message_type": "group",
-                        "group_id": int(group_id),
-                        "message": f"[CQ:record,file=file:///{os.path.abspath(amr_path)}]"
-                    }
-                }))
-                print(f"[点歌] 已发送语音消息: {amr_path}")
+            if not result.get("success"):
+                return self._create_reply("group", user_id, group_id, 
+                    f"❌ 点歌失败：{result.get('msg')}")
+            
+            song_name = result.get('name')
+            artist = result.get('artist')
+            music_url = result.get('url')
+            cover_url = result.get('cover')
+            
+            import re
+            safe_name = re.sub(r'[\\/*?:"<>|]', '', song_name)
+            filename = f"{safe_name}.m4a"
+            
+            filepath = await music.download_music(music_url, filename)
+            msg_base = f"🎵 《{song_name}》- {artist}\n🔗 {music_url}"
+            
+            if filepath and os.path.exists(filepath):
+                amr_path = await music.convert_to_amr(filepath)
                 
-                # 同时发送封面图和下载链接
-                if cover_url:
-                    return {
+                if amr_path and os.path.exists(amr_path):
+                    await self.websocket.send(json.dumps({
                         "action": "send_msg",
                         "params": {
                             "message_type": "group",
                             "group_id": int(group_id),
-                            "message": f"[CQ:image,file={cover_url}]\n{msg_base}\n📢 已发送语音消息，点击可直接播放"
+                            "message": f"[CQ:record,file=file:///{os.path.abspath(amr_path)}]"
                         }
-                    }
+                    }))
+                    print(f"[点歌] 已发送语音消息: {amr_path}")
+                    
+                    if cover_url:
+                        return {
+                            "action": "send_msg",
+                            "params": {
+                                "message_type": "group",
+                                "group_id": int(group_id),
+                                "message": f"[CQ:image,file={cover_url}]\n{msg_base}\n📢 已发送语音"
+                            }
+                        }
+                    else:
+                        return self._create_reply("group", user_id, group_id, 
+                            f"{msg_base}\n📢 已发送语音")
                 else:
-                    return self._create_reply("group", user_id, group_id, 
-                        f"{msg_base}\n📢 已发送语音消息，点击可直接播放")
+                    await self.websocket.send(json.dumps({
+                        "action": "upload_group_file",
+                        "params": {
+                            "group_id": int(group_id),
+                            "file": filepath,
+                            "name": f"{song_name}.m4a"
+                        }
+                    }))
+                    
+                    if cover_url:
+                        return {
+                            "action": "send_msg",
+                            "params": {
+                                "message_type": "group",
+                                "group_id": int(group_id),
+                                "message": f"[CQ:image,file={cover_url}]\n{msg_base}\n📁 已上传群文件"
+                            }
+                        }
+                    else:
+                        return self._create_reply("group", user_id, group_id, 
+                            f"{msg_base}\n📁 已上传群文件")
             else:
-                # 转换失败，上传群文件
-                print(f"[点歌] 转换失败，上传群文件")
-                await self.websocket.send(json.dumps({
-                    "action": "upload_group_file",
-                    "params": {
-                        "group_id": int(group_id),
-                        "file": filepath,
-                        "name": f"{song_name}.m4a"
-                    }
-                }))
+                return self._create_reply("group", user_id, group_id, msg_base)
                 
-                if cover_url:
-                    return {
-                        "action": "send_msg",
-                        "params": {
-                            "message_type": "group",
-                            "group_id": int(group_id),
-                            "message": f"[CQ:image,file={cover_url}]\n{msg_base}\n📁 文件已上传群文件"
-                        }
-                    }
-                else:
-                    return self._create_reply("group", user_id, group_id, 
-                        f"{msg_base}\n📁 文件已上传群文件")
-        else:
-            # 下载失败，只发链接
-            return self._create_reply("group", user_id, group_id, msg_base)
-
+        except Exception as e:
+            print(f"[点歌] 错误: {e}")
+            return self._create_reply("group", user_id, group_id, f"❌ 点歌失败: {e}")
+    
     async def _set_group_card(self, group_id: int, target_id: str, new_name: str, operator_id: str) -> Dict:
         """修改群成员群名片"""
         try:
