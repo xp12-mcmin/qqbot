@@ -1,4 +1,3 @@
-```markdown
 
 # 🤖 QQ机器人 - XP12
 
