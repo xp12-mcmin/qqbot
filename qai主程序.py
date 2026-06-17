@@ -2921,9 +2921,10 @@ class OllamaAI:
         # ========== 纯文本模型优先级列表 ==========
         self.text_models_priority = [
             "gemma4:31b-cloud",# 第一优先
-            "minimax-m3:cloud",    # 第二优先       
-            "glm-4.7:cloud",        # 第三优先
-            "nemotron-3-super:cloud",  #第四优先
+            "glm-4.7:cloud",# 第二优先 
+            "qwen3-coder:480b-cloud",# 第三优先          
+            "nemotron-3-super:cloud",#第四优先        
+            "minimax-m3:cloud",  
         ]
         
         # 图像识别专用模型
