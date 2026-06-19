@@ -5133,7 +5133,43 @@ class MessageHandler:
                             return self._create_reply(message_type, user_id, group_id, f"群{target_group}没有缓存记录")
                     else:
                         return self._create_reply(message_type, user_id, group_id, "❌ 群号必须是数字")
-                return self._create_reply(message_type, user_id, group_id, "格式: !防撤回清空 <群号>")        
+                return self._create_reply(message_type, user_id, group_id, "格式: !防撤回清空 <群号>")
+                # ========== 保护账号 ==========
+            # 添加保护账号
+            if text_lower.startswith(("!保护账号添加", "！保护账号添加", "!保护账号 添加", "！保护账号 添加")):
+                parts = text.split()
+                if len(parts) >= 2:
+                    target = parts[-1].strip()  # 取最后一个参数
+                    if target.isdigit():
+                        if self.anti_recall.add_protected_account(target):
+                            return self._create_reply(message_type, user_id, group_id, f"✅ 已添加保护账号：{target}")
+                        else:
+                            return self._create_reply(message_type, user_id, group_id, f"账号 {target} 已在保护列表中")
+                    else:
+                        return self._create_reply(message_type, user_id, group_id, "❌ 账号必须是数字")
+                return self._create_reply(message_type, user_id, group_id, "格式: !保护账号添加 <QQ号>")
+            
+            # 移除保护账号
+            if text_lower.startswith(("!保护账号移除", "！保护账号移除", "!保护账号 移除", "！保护账号 移除")):
+                parts = text.split()
+                if len(parts) >= 2:
+                    target = parts[-1].strip()
+                    if target.isdigit():
+                        if self.anti_recall.remove_protected_account(target):
+                            return self._create_reply(message_type, user_id, group_id, f"✅ 已移除保护账号：{target}")
+                        else:
+                            return self._create_reply(message_type, user_id, group_id, f"账号 {target} 不在保护列表中")
+                    else:
+                        return self._create_reply(message_type, user_id, group_id, "❌ 账号必须是数字")
+                return self._create_reply(message_type, user_id, group_id, "格式: !保护账号移除 <QQ号>")
+            
+            # 查看保护账号列表
+            if text_lower.startswith(("!保护账号列表", "！保护账号列表", "!保护账号 列表", "！保护账号 列表")):
+                accounts = self.anti_recall.get_protected_accounts()
+                if accounts:
+                    return self._create_reply(message_type, user_id, group_id, f"🛡️ 保护账号列表：\n" + "\n".join([f"  {i+1}. {acc}" for i, acc in enumerate(accounts)]))
+                else:
+                    return self._create_reply(message_type, user_id, group_id, "📭 暂无保护账号")
         # ---------- 13.4 刷屏 ----------
         if text_lower.startswith("!刷屏"):
             return await self._handle_spam_command(text, user_id, message_type, group_id, is_admin)
