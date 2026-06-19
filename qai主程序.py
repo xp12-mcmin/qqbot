@@ -4704,27 +4704,34 @@ class MessageHandler:
                 status = self.ai.personality_mgr.get_group_status(group_id)
                 return self._create_reply(message_type, user_id, group_id, status)
             mode = parts[1].lower()
-            if mode in ["猫娘", "catgirl", "喵"]:
-                success, msg = self.ai.personality_mgr.set_group_personality(group_id, "catgirl")
-                return self._create_reply(message_type, user_id, group_id, msg)
-            elif mode in ["默认", "default", "普通"]:
-                success, msg = self.ai.personality_mgr.set_group_personality(group_id, "default")
+            
+            # 从 personalities 字典中查找匹配
+            available = list(self.ai.personality_mgr.personalities.keys())
+            matched = None
+            for pid in available:
+                if mode == pid.lower() or mode == self.ai.personality_mgr.get_personality_name(pid).lower():
+                    matched = pid
+                    break
+            
+            if matched:
+                success, msg = self.ai.personality_mgr.set_group_personality(group_id, matched)
                 return self._create_reply(message_type, user_id, group_id, msg)
             else:
-                return self._create_reply(message_type, user_id, group_id, f"❌ 未知模式: {mode}\n可用: 猫娘, 默认")
-        
-        if text_lower in ["!本群恢复", "！本群恢复"]:
-            if message_type != "group":
-                return self._create_reply(message_type, user_id, group_id, "❌ 该命令只能在群聊中使用")
-            success, msg = self.ai.personality_mgr.clear_group_personality(group_id)
-            return self._create_reply(message_type, user_id, group_id, msg)
-        
+                names = [self.ai.personality_mgr.get_personality_name(pid) for pid in available]
+                return self._create_reply(message_type, user_id, group_id, f"❌ 未知模式: {mode}\n可用: {', '.join(names)}")
+        # ========== 9.5 查看本群性格 ==========
         if text_lower in ["!本群性格", "！本群性格"]:
             if message_type != "group":
                 return self._create_reply(message_type, user_id, group_id, "❌ 该命令只能在群聊中使用")
             status = self.ai.personality_mgr.get_group_status(group_id)
             return self._create_reply(message_type, user_id, group_id, status)
 
+        # ========== 本群恢复 ==========
+        if text_lower in ["!本群恢复", "！本群恢复"]:
+            if message_type != "group":
+                return self._create_reply(message_type, user_id, group_id, "❌ 该命令只能在群聊中使用")
+            success, msg = self.ai.personality_mgr.clear_group_personality(group_id)
+            return self._create_reply(message_type, user_id, group_id, msg)
         # ========== 10. 记忆命令 ==========
         if text_lower in ["!记忆状态", "！记忆状态"]:
             if hasattr(self.ai, 'memory_module'):
@@ -4895,32 +4902,23 @@ class MessageHandler:
             }))
             
             return self._create_reply(message_type, user_id, group_id, f"✅ 已将机器人名字改为：{new_name}")
-        # ========== 远程切换性格（AI管理员专用）==========
-        if text_lower.startswith(("!远程性格", "！远程性格")):
-            if not self.admin_manager.is_admin(user_id):
-                return self._create_reply(message_type, user_id, group_id, "❌ 权限不足，仅AI管理员可使用")
-            
+        # ---------- 13.12 全局性格 ----------
+        if text_lower.startswith(("!全局切换", "！全局切换")):
             parts = text.split()
-            if len(parts) < 3:
-                return self._create_reply(message_type, user_id, group_id, 
-                    "📝 格式: !远程性格 <群号> <猫娘/默认>\n示例: !远程性格 1095292788 猫娘")
-            
-            target_group = parts[1]
-            mode = parts[2].lower()
-            
-            # 检查群号是否有效
-            if not target_group.isdigit():
-                return self._create_reply(message_type, user_id, group_id, "❌ 群号必须是数字")
-            
-            # 切换性格
-            if mode in ["猫娘", "catgirl", "喵"]:
-                success, msg = self.ai.personality_mgr.set_group_personality(target_group, "catgirl")
-            elif mode in ["默认", "default", "普通"]:
-                success, msg = self.ai.personality_mgr.set_group_personality(target_group, "default")
-            else:
-                return self._create_reply(message_type, user_id, group_id, f"❌ 未知模式: {mode}\n可用: 猫娘, 默认")
-            
-            return self._create_reply(message_type, user_id, group_id, f"✅ 已远程设置群{target_group}\n{msg}")
+            if len(parts) >= 2:
+                mode = parts[1].lower()
+                available = list(self.ai.personality_mgr.personalities.keys())
+                matched = None
+                for pid in available:
+                    if mode == pid.lower() or mode == self.ai.personality_mgr.get_personality_name(pid).lower():
+                        matched = pid
+                        break
+                if matched:
+                    success, msg = self.ai.personality_mgr.set_global_default(matched)
+                    return self._create_reply(message_type, user_id, group_id, msg)
+                else:
+                    names = [self.ai.personality_mgr.get_personality_name(pid) for pid in available]
+                    return self._create_reply(message_type, user_id, group_id, f"❌ 未知模式: {mode}\n可用: {', '.join(names)}")
         if text_lower.startswith(("!设置欢迎", "！设置欢迎", "!开启欢迎", "！开启欢迎", "!关闭欢迎", "！关闭欢迎", "!欢迎开关", "！欢迎开关")):
             
             # 权限检查（仅限群聊）
