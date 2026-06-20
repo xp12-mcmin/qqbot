@@ -4253,7 +4253,7 @@ class MessageHandler:
                     return self._create_reply(message_type, user_id, group_id, reply)
       
             # 长文本检查
-            if len(text) > 300:
+            if len(text) > 500:
                 skip_msg = "检测到长文本，已取消调用"
                 if message_type == "group":
                     skip_msg = f"[CQ:at,qq={user_id}] {skip_msg}"
