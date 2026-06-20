@@ -126,6 +126,51 @@ class HelpImageGenerator:
         draw.text((20, y+30), "💡 输入「!帮助」返回主菜单", fill='#aaaaaa', font=self.font_normal)
         
         return img
+    def create_draw_help_page(self, is_admin: bool = False) -> Image.Image:
+        """创建AI绘画帮助页面"""
+        width = 550
+        height = 380
+        line_height = 35
+        
+        img = Image.new('RGB', (width, height), color='#1a1a2e')
+        draw = ImageDraw.Draw(img)
+        
+        # 标题
+        draw.text((20, 20), "【🎨 AI绘画】", fill='#00ff88', font=self.font_title)
+        draw.line((20, 55, width-20, 55), fill='#333333', width=1)
+        
+        y = 80
+        commands = [
+            ("画图 <关键词>", "AI生成图片"),
+            ("!画图 <关键词>", "同上"),
+            ("", ""),
+            ("--- 示例 ---", ""),
+            ("画图 猫娘", "生成猫娘图片"),
+            ("画图 赛博朋克", "生成赛博朋克风格"),
+            ("画图 星空", "生成星空夜景"),
+            ("", ""),
+            ("--- 说明 ---", ""),
+            ("🎨 基于百度文心AI", "自动优化关键词"),
+            ("⏱️ 生成约10-30秒", "请耐心等待"),
+            ("💡 如果失败", "换个关键词试试"),
+        ]
+        
+        for cmd, desc in commands:
+            if cmd.startswith("---"):
+                draw.text((20, y), cmd, fill='#ffaa44', font=self.font_normal)
+            elif cmd == "":
+                pass
+            elif desc == "":
+                draw.text((20, y), cmd, fill='#00ccff', font=self.font_normal)
+            else:
+                draw.text((20, y), cmd, fill='#00ccff', font=self.font_normal)
+                draw.text((180, y), desc, fill='#ffffff', font=self.font_normal)
+            y += line_height
+        
+        draw.line((20, y+10, width-20, y+10), fill='#333333', width=1)
+        draw.text((20, y+30), "💡 输入「!帮助」返回主菜单", fill='#aaaaaa', font=self.font_normal)
+        
+        return img
     def create_music_help_page(self, is_admin: bool = False) -> Image.Image:
         """创建点歌帮助页面"""
         width = 550
@@ -442,7 +487,7 @@ class HelpImageGenerator:
     def create_main_menu(self, is_admin: bool = False) -> Image.Image:
         """创建主菜单图片"""
         width = 550
-        height = 620 if is_admin else 560  # 增加高度
+        height = 660 if is_admin else 630  # 增加高度
         
         img = Image.new('RGB', (width, height), color='#1a1a2e')
         draw = ImageDraw.Draw(img)
@@ -454,7 +499,7 @@ class HelpImageGenerator:
         # 分割线
         draw.line((20, 80, width-20, 80), fill='#ffaa44', width=1)
         
-        # 菜单项
+        # 菜单项（所有项都包含）
         y = 105
         items = [
             ("1", "基础功能", "AI聊天、记忆"),
@@ -469,12 +514,13 @@ class HelpImageGenerator:
             ("10", "入群欢迎", "欢迎语设置、开关"),
             ("11", "婚姻系统", "今日老婆、结婚、离婚"),
             ("12", "改名功能", "修改群名片"),
-            ("13", "点歌功能", "搜索、下载歌曲"),  # 新增
+            ("13", "点歌功能", "搜索、下载歌曲"),
+            ("14", "AI绘画", "关键词生成图片"),  # 所有人可见
         ]
 
         if is_admin:
-            items.append(("14", "管理员命令", "好感度设置、禁言、封禁"))
-            items.append(("15", "其他功能", "刷屏、重进、解禁"))
+            items.append(("15", "管理员命令", "好感度设置、禁言、封禁"))
+            items.append(("16", "其他功能", "刷屏、重进、解禁"))
         
         for num, name, desc in items:
             draw.text((20, y), f"{num}", fill='#ffaa00', font=self.font_normal)
@@ -484,10 +530,12 @@ class HelpImageGenerator:
         
         # 底部提示
         draw.line((20, y+10, width-20, y+10), fill='#333333', width=1)
-        draw.text((20, y+30), "💡 示例: !帮助 13   查看点歌功能", fill='#aaaaaa', font=self.font_normal)
+        draw.text((20, y+30), "💡 示例: !帮助 14   查看AI绘画", fill='#aaaaaa', font=self.font_normal)
         draw.text((20, y+55), "📝 发送「!帮助 全部」查看完整命令", fill='#aaaaaa', font=self.font_normal)
         
-        return img        
+        return img
+        
+      
     def create_full_help(self, is_admin: bool = False) -> Image.Image:
         """创建完整帮助图片"""
         width = 600

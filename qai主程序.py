@@ -3,7 +3,7 @@ import sys
 from music import get_music_service
 # 强制切换到脚本所在目录
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
-
+from ai_draw import get_ai_draw
 # 打印调试信息到文件
 with open("startup_debug.txt", "w", encoding="utf-8") as f:
     f.write(f"工作目录: {os.getcwd()}\n")
@@ -4614,7 +4614,45 @@ class MessageHandler:
                 return self._create_reply(message_type, user_id, group_id, "❌ 好感度系统未初始化")
             success, msg, bonus = await self.favorability.daily_sign(user_id)
             return self._create_reply(message_type, user_id, group_id, msg)
-        
+
+        # 在 _process_commands 中添加
+        if text_lower.startswith(("!画图", "！画图", "画图")):
+            if message_type != "group":
+                return self._create_reply(message_type, user_id, group_id, "❌ 该命令只能在群聊中使用")
+            
+            keyword = text.replace("画图", "").replace("!画图", "").replace("！画图", "").strip()
+            if not keyword:
+                return self._create_reply(message_type, user_id, group_id, "❌ 请指定关键词\n示例: 画图 猫娘")
+            
+            return await self._ai_draw(group_id, user_id, keyword)
+
+        # 添加 _ai_draw 方法
+        async def _ai_draw(self, group_id: int, user_id: str, keyword: str) -> Dict:
+            """AI 绘画"""
+            await self.websocket.send(json.dumps({
+                "action": "send_msg",
+                "params": {
+                    "message_type": "group",
+                    "group_id": int(group_id),
+                    "message": f"[CQ:at,qq={user_id}] 🎨 正在生成图片：{keyword}，请稍候..."
+                }
+            }))
+            
+            draw = get_ai_draw()
+            success, result = await draw.draw(keyword)
+            
+            if success:
+                return {
+                    "action": "send_msg",
+                    "params": {
+                        "message_type": "group",
+                        "group_id": int(group_id),
+                        "message": f"[CQ:image,file=file:///{os.path.abspath(result)}]"
+                    }
+                }
+            else:
+                return self._create_reply("group", user_id, group_id, f"❌ 绘画失败：{result}")
+    
         # ========== 4. 好感度查看 ==========
         # ========== 4. 好感度查看（修复版：支持@用户 + 显示昵称）==========
         if text_lower in ["!好感度", "！好感度", "!好感", "！好感"]:
@@ -5722,6 +5760,34 @@ class MessageHandler:
         except Exception as e:
             print(f"[改名片] 错误: {e}")
             return self._create_reply("group", operator_id, group_id, f"❌ 修改失败: {e}")
+    async def _ai_draw(self, group_id: int, user_id: str, keyword: str) -> Dict:
+        """AI 绘画"""
+        from ai_draw import get_ai_draw
+        
+        # 发送提示
+        await self.websocket.send(json.dumps({
+            "action": "send_msg",
+            "params": {
+                "message_type": "group",
+                "group_id": int(group_id),
+                "message": f"[CQ:at,qq={user_id}] 🎨 正在生成图片：{keyword}，请稍候..."
+            }
+        }))
+        
+        draw = get_ai_draw()
+        success, result = await draw.draw(keyword)
+        
+        if success:
+            return {
+                "action": "send_msg",
+                "params": {
+                    "message_type": "group",
+                    "group_id": int(group_id),
+                    "message": f"[CQ:image,file=file:///{os.path.abspath(result)}]"
+                }
+            }
+        else:
+            return self._create_reply("group", user_id, group_id, f"❌ 绘画失败：{result}")
     async def _get_member_name(self, group_id: int, user_id: str) -> str:
         """获取群成员昵称（优先返回群名片）"""
         try:
@@ -6443,7 +6509,7 @@ class MessageHandler:
             return self._send_help_image(message_type, user_id, group_id, img_base64)
         
         # 14. 管理员命令
-        if category_str in ["14", "管理", "管理员"] and is_admin:
+        if category_str in ["16", "管理", "管理员"] and is_admin:
             commands = [
                 ("--- 管理员申请 ---", ""),
                 ("!批准申请 <QQ>", "批准管理员申请"),
@@ -6486,7 +6552,7 @@ class MessageHandler:
             return self._send_help_image(message_type, user_id, group_id, img_base64)
         
         # 15. 其他功能
-        if category_str in ["15", "其他"]:
+        if category_str in ["16", "其他"]:
             commands = [
                 ("--- 绿茶反击 ---", ""),
                 ("!绿茶开关 开/关", "全局开关"),
@@ -6523,7 +6589,13 @@ class MessageHandler:
             img = generator.create_help_page("其他功能", "【🔧 其他功能】", commands, is_admin)
             img_base64 = generator.image_to_base64(img)
             return self._send_help_image(message_type, user_id, group_id, img_base64)
-        
+
+        # 16. AI绘画
+        if category_str in ["14", "绘画", "ai绘画", "画图"]:
+            img = generator.create_draw_help_page(is_admin)
+            img_base64 = generator.image_to_base64(img)
+            return self._send_help_image(message_type, user_id, group_id, img_base64)
+
         # 全部命令
         if category_str in ["全部", "all"]:
             return self._get_full_help(user_id, message_type, group_id, is_admin, generator)
