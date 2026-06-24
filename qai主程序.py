@@ -3479,6 +3479,8 @@ class MessageHandler:
         
         # 骂人模块总开关（默认关闭）
         # 骂人模块总开关（默认关闭）
+        # 树洞 API
+        self.treehole_api = "http://qwq.nki.pw/API/Fun/TreeHole/index.php"
         self.scolding_enabled = False  # 默认关闭，需要管理员手动开启
         self.scolding_config_file = "data/scolding_config.json"
         # 防御性调用：防止方法没定义时崩溃
@@ -4253,7 +4255,7 @@ class MessageHandler:
                     return self._create_reply(message_type, user_id, group_id, reply)
       
             # 长文本检查
-            if len(text) > 500:
+            if len(text) > 1000:
                 skip_msg = "检测到长文本，已取消调用"
                 if message_type == "group":
                     skip_msg = f"[CQ:at,qq={user_id}] {skip_msg}"
@@ -4514,7 +4516,19 @@ class MessageHandler:
             if message_type != "group":
                 return self._create_reply(message_type, user_id, group_id, "❌ 该命令只能在群聊中使用")
             return await self._today_wife(group_id, user_id)
-        
+        # ========== 树洞命令 ==========
+        # ========== 树洞命令 ==========
+        # ========== 树洞命令 ==========
+        if text_lower in ["树洞", "！树洞", "!树洞", "来条树洞", "！来条树洞", "!来条树洞"]:
+            if message_type != "group":
+                return self._create_reply(message_type, user_id, group_id, "❌ 该命令只能在群聊中使用")
+            
+            treehole_msg = await self._get_treehole()
+            return self._create_reply(message_type, user_id, group_id, treehole_msg)
+
+        # ========== 结婚 ==========
+
+            # ... 结婚代码继续 ...
         # ========== 结婚 ==========
         # 结婚命令
         if text_lower.startswith(("!结婚", "！结婚", "结婚")):
@@ -5616,6 +5630,57 @@ class MessageHandler:
                 # 没有匹配到任何命令
         return None
     # ==================== 辅助方法 ====================
+    async def _get_treehole(self) -> str:
+        """获取树洞内容"""
+        try:
+            import aiohttp
+            import json
+            
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Accept": "application/json, text/plain, */*"
+            }
+            
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
+                async with session.get(self.treehole_api, headers=headers) as resp:
+                    if resp.status != 200:
+                        return f"🌳 树洞暂时睡着了（HTTP {resp.status}），稍后再试试吧~"
+                    
+                    # 强制获取文本内容，然后手动解析 JSON
+                    text = await resp.text()
+                    
+                    # 尝试提取 JSON 部分（如果返回了 HTML，尝试从中提取）
+                    if text.strip().startswith('{'):
+                        # 直接是 JSON
+                        data = json.loads(text)
+                    else:
+                        # 可能返回了 HTML，尝试从 HTML 中提取 JSON
+                        import re
+                        json_match = re.search(r'\{[^{}]*"code"[^{}]*\}', text)
+                        if json_match:
+                            data = json.loads(json_match.group())
+                        else:
+                            return "🌳 树洞 API 返回了异常数据，请稍后再试~"
+                    
+                    if data.get("code") != 200:
+                        return f"🌳 树洞有点害羞：{data.get('msg', '未知错误')}"
+                    
+                    hole_data = data.get("data", {})
+                    content = hole_data.get("content", "这条树洞是空的…")
+                    time_str = hole_data.get("time", "未知时间")
+                    from_str = hole_data.get("from", "匿名")
+                    
+                    # 格式化输出
+                    return f"📖 树洞悄悄话（{time_str}）：\n{content}\n\n—— {from_str}"
+                    
+        except json.JSONDecodeError as e:
+            print(f"[树洞错误] JSON解析失败: {e}")
+            return "🌳 树洞数据格式异常，请稍后再试~"
+        except asyncio.TimeoutError:
+            return "🌳 树洞响应超时了，可能太挤了……"
+        except Exception as e:
+            print(f"[树洞错误] {e}")
+            return "🌳 树洞今天打烊了，明天再来吧~"
     async def _music(self, group_id: int, user_id: str, keyword: str) -> Dict:
         """点歌 - 下载并发送QQ语音"""
         
@@ -5762,18 +5827,33 @@ class MessageHandler:
             return self._create_reply("group", operator_id, group_id, f"❌ 修改失败: {e}")
     async def _ai_draw(self, group_id: int, user_id: str, keyword: str) -> Dict:
         """AI 绘画"""
+        import time
+        
+        # 防重复执行锁
+        lock_key = f"ai_draw_{group_id}"
+        now = time.time()
+        
+        if not hasattr(self, '_ai_draw_locks'):
+            self._ai_draw_locks = {}
+        
+        if lock_key in self._ai_draw_locks:
+            if now - self._ai_draw_locks[lock_key] < 5:
+                print(f"[AI绘画] 群{group_id} 触发冷却，跳过")
+                return None
+        self._ai_draw_locks[lock_key] = now
+        
         from ai_draw import get_ai_draw
         
-        # 发送提示
+        # 只发一次提示
         await self.websocket.send(json.dumps({
             "action": "send_msg",
             "params": {
                 "message_type": "group",
                 "group_id": int(group_id),
-                "message": f"[CQ:at,qq={user_id}] 🎨 正在生成图片：{keyword}，请稍候..."
+                "message": f"[CQ:at,qq={user_id}] 正在生成图片,请稍候..."
             }
         }))
-        
+        d=keyword
         draw = get_ai_draw()
         success, result = await draw.draw(keyword)
         
@@ -5787,7 +5867,7 @@ class MessageHandler:
                 }
             }
         else:
-            return self._create_reply("group", user_id, group_id, f"❌ 绘画失败：{result}")
+            return self._create_reply("group", user_id, group_id, f"? 绘画失败：{result}")
     async def _get_member_name(self, group_id: int, user_id: str) -> str:
         """获取群成员昵称（优先返回群名片）"""
         try:

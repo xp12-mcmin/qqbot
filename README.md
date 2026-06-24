@@ -7,9 +7,9 @@
 
 
 
-[!\[GitHub stars](https://img.shields.io/github/stars/xp12-mcmin/qq-robot)](https://github.com/xp12-mcmin/qq-robot/stargazers)
+![GitHub stars](https://img.shields.io/github/stars/xp12-mcmin/qq-robot)](https://github.com/xp12-mcmin/qq-robot/stargazers)
 
-\[!\[GitHub license](https://img.shields.io/github/license/xp12-mcmin/qq-robot)](https://github.com/xp12-mcmin/qq-robot/blob/main/LICENSE)
+![GitHub license](https://img.shields.io/github/license/xp12-mcmin/qq-robot)](https://github.com/xp12-mcmin/qq-robot/blob/main/LICENSE)
 
 
 

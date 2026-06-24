@@ -7,7 +7,7 @@ from datetime import datetime
 
 app = Flask(__name__)
 
-LLBOT_API = "http://127.0.0.1:3000"
+LLBOT_API = "http://127.0.0.1:3000"  # 改回 3000 端口
 
 # 消息缓存文件
 CACHE_FILE = "msg_cache.json"
@@ -415,7 +415,6 @@ HTML = '''
     }
     
     // 轮询新消息
-    let lastMsgCount = {};
     setInterval(async () => {
         if (currentId) {
             try {
@@ -494,7 +493,12 @@ HTML = '''
 
 def clean_message(content):
     if isinstance(content, list):
-        texts = [seg.get("data", {}).get("text", "") for seg in content if seg.get("type") == "text"]
+        texts = []
+        for seg in content:
+            if seg.get("type") == "text":
+                texts.append(seg.get("data", {}).get("text", ""))
+            elif seg.get("type") == "image":
+                texts.append("[图片]")
         return "".join(texts)
     if isinstance(content, str):
         return re.sub(r'\[CQ:[^\]]+\]', '', content).strip()
@@ -509,10 +513,8 @@ def add_msg(target, role, content, nickname=""):
         "time": datetime.now().strftime("%H:%M"),
         "nickname": nickname
     })
-    # 限制每个目标最多500条消息
     if len(msg_cache[target]) > MAX_MSG_PER_TARGET:
         msg_cache[target] = msg_cache[target][-MAX_MSG_PER_TARGET:]
-    # 保存到文件
     save_cache(msg_cache)
 
 @app.route("/")
@@ -555,7 +557,6 @@ def messages():
     start = page * page_size
     end = start + page_size
     
-    # 倒序取消息（最新的在最后）
     if start >= len(msgs):
         paginated = []
         has_more = False
@@ -586,22 +587,32 @@ def send():
 
 @app.route("/api/receive", methods=["POST"])
 def receive():
+    """接收 LLOneBot 上报的消息 - WebHook"""
     try:
         data = request.json
+        print(f"[WebHook] 收到消息: {data}")  # 调试日志
+        
         if data.get("post_type") == "message":
             msg_type = data.get("message_type")
-            content = clean_message(data.get("message", ""))
+            content = data.get("message", "")
             sender = data.get("sender", {})
+            
             if msg_type == "group":
                 target = str(data.get("group_id"))
                 nickname = sender.get("card") or sender.get("nickname", "未知")
             else:
                 target = str(data.get("user_id"))
                 nickname = sender.get("nickname", "未知")
-            if content:
-                add_msg(target, "received", content, nickname)
+            
+            # 提取纯文本内容
+            clean_content = clean_message(content)
+            if clean_content:
+                add_msg(target, "received", clean_content, nickname)
+                print(f"[WebHook] 收到消息: {nickname} -> {clean_content[:50]}")
+        
         return "OK"
-    except Exception:
+    except Exception as e:
+        print(f"[WebHook] 错误: {e}")
         return "OK"
 
 if __name__ == "__main__":

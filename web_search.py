@@ -1,163 +1,119 @@
 """
-联网搜索模块 - 支持图片输出
+联网搜索模块 - 使用 Ollama API
 """
 
 import aiohttp
 import asyncio
-from typing import Optional
-from PIL import Image, ImageDraw, ImageFont
+import json
 import os
+import urllib.parse
 
 
 class WebSearch:
-    """Ollama 联网搜索"""
+    def __init__(self):
+        # 从环境变量读取 API Key
+        self.api_key = os.environ.get("OLLAMA_API_KEY", "")
+        self.ollama_url = "http://127.0.0.1:11434/api/generate"
     
-    def __init__(self, model: str = "deepseek-v3.1:671b-cloud"):
-        self.base_url = "http://127.0.0.1:11434"
-        self.model = model
-        self.font_dir = "fonts"
-        self._load_font()
-    
-    def _load_font(self):
-        """加载字体"""
+    async def search(self, query: str) -> str:
+        """使用 Ollama 进行联网搜索，返回图片路径"""
+        if not self.api_key:
+            print("[搜索] 未设置 OLLAMA_API_KEY 环境变量")
+            return None
+        
         try:
-            font_path = os.path.join(self.font_dir, "simhei.ttf")
-            if os.path.exists(font_path):
-                self.font_title = ImageFont.truetype(font_path, 22)
-                self.font_text = ImageFont.truetype(font_path, 16)
-            else:
-                self.font_title = ImageFont.load_default()
-                self.font_text = ImageFont.load_default()
-        except:
-            self.font_title = ImageFont.load_default()
-            self.font_text = ImageFont.load_default()
+            # 构建搜索提示词
+            prompt = f"""请搜索以下问题并给出答案，需要联网获取实时信息：
+问题：{query}
+
+要求：
+1. 如果能够获取到实时信息，请给出准确的答案
+2. 如果无法获取实时信息，请说明无法获取
+3. 答案要简洁明了
+4. 如果有相关链接，可以附上"""
+            
+            payload = {
+                "model": "qwen2.5:3b",  # 使用本地模型
+                "prompt": prompt,
+                "stream": False,
+                "options": {
+                    "temperature": 0.7,
+                    "num_predict": 500
+                }
+            }
+            
+            headers = {
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json"
+            }
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.post(self.ollama_url, json=payload, headers=headers, timeout=30) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        result = data.get("response", "")
+                        
+                        # 生成图片（如果需要）
+                        img_path = await self._generate_result_image(query, result)
+                        return img_path
+                    else:
+                        print(f"[搜索] HTTP {resp.status}")
+                        return None
+        except Exception as e:
+            print(f"[搜索] 错误: {e}")
+            return None
     
-    def text_to_image(self, text: str, title: str = "搜索结果") -> Optional[str]:
-        """将文本转换为图片"""
+    async def _generate_result_image(self, query: str, result: str) -> str:
+        """生成搜索结果图片"""
         try:
-            import textwrap
-            
-            # 图片宽度
-            img_width = 650
-            # 每行最大字符数
-            max_chars = 50
-            # 行高
-            line_height = 28
-            
-            # 拆分文本为多行
-            lines = []
-            for line in text.split('\n'):
-                if len(line) <= max_chars:
-                    lines.append(line)
-                else:
-                    wrapped = textwrap.wrap(line, width=max_chars)
-                    lines.extend(wrapped)
-            
-            # 计算图片高度
-            img_height = 100 + len(lines) * line_height + 50
+            from PIL import Image, ImageDraw, ImageFont
+            import time
             
             # 创建图片
-            img = Image.new('RGB', (img_width, img_height), color='#1a1a2e')
+            width, height = 600, 400
+            img = Image.new('RGB', (width, height), color='#1a1a2e')
             draw = ImageDraw.Draw(img)
             
-            # 画背景边框
-            draw.rectangle([5, 5, img_width-5, img_height-5], outline='#333333', width=2)
+            # 加载字体
+            try:
+                font_title = ImageFont.truetype("simhei.ttf", 20)
+                font_text = ImageFont.truetype("simhei.ttf", 16)
+            except:
+                font_title = ImageFont.load_default()
+                font_text = ImageFont.load_default()
             
-            # 标题
-            draw.text((20, 20), f"🌐 {title}", fill='#00ff88', font=self.font_title)
+            # 绘制标题
+            draw.text((20, 20), f"🔍 搜索结果：{query[:30]}", fill='#00ff88', font=font_title)
             
             # 分割线
-            draw.line((20, 55, img_width-20, 55), fill='#333333', width=1)
+            draw.line((20, 55, width-20, 55), fill='#333333', width=1)
             
-            # 内容
-            y = 75
-            for line in lines:
-                draw.text((20, y), line, fill='#ffffff', font=self.font_text)
-                y += line_height
+            # 绘制结果（限制长度）
+            lines = []
+            max_len = 35
+            for i in range(0, len(result), max_len):
+                lines.append(result[i:i+max_len])
+            
+            y = 80
+            for line in lines[:10]:  # 最多10行
+                draw.text((20, y), line, fill='#ffffff', font=font_text)
+                y += 25
             
             # 底部提示
-            draw.text((20, y+10), "💡 数据来源于联网搜索", fill='#888888', font=self.font_text)
+            draw.line((20, y+10, width-20, y+10), fill='#333333', width=1)
+            draw.text((20, y+30), "💡 数据来自AI搜索", fill='#aaaaaa', font=font_text)
             
-            # 保存临时文件
-            temp_dir = "data/temp_images"
-            os.makedirs(temp_dir, exist_ok=True)
-            import time
-            filename = f"search_{int(time.time()*1000)}.png"
-            filepath = os.path.join(temp_dir, filename)
-            img.save(filepath, "PNG")
+            # 保存图片
+            os.makedirs("data/temp_images", exist_ok=True)
+            img_path = f"data/temp_images/search_{int(time.time())}.png"
+            img.save(img_path)
             
-            return filepath
+            return img_path
         except Exception as e:
-            print(f"[联网搜索] 图片生成失败: {e}")
-            return None
-    
-    async def search(self, query: str) -> Optional[str]:
-        """执行联网搜索，返回图片路径"""
-        try:
-            payload = {
-                "model": self.model,
-                "messages": [{
-                    "role": "user",
-                    "content": f"请使用联网搜索功能，搜索以下内容并提供详细结果：{query}"
-                }],
-                "stream": False
-            }
-            
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    f"{self.base_url}/api/chat",
-                    json=payload,
-                    timeout=30
-                ) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        reply = data.get('message', {}).get('content', '')
-                        if reply:
-                            # 生成图片
-                            img_path = self.text_to_image(reply, f"搜索: {query[:30]}")
-                            return img_path
-                        else:
-                            return None
-                    else:
-                        return None
-        except Exception as e:
-            print(f"[联网搜索] 失败: {e}")
-            return None
-    
-    async def chat_with_search(self, question: str) -> Optional[str]:
-        """带搜索的AI问答，返回图片路径"""
-        try:
-            payload = {
-                "model": self.model,
-                "messages": [{
-                    "role": "user",
-                    "content": f"请使用联网搜索功能回答以下问题：{question}"
-                }],
-                "stream": False
-            }
-            
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    f"{self.base_url}/api/chat",
-                    json=payload,
-                    timeout=30
-                ) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        reply = data.get('message', {}).get('content', '')
-                        if reply:
-                            img_path = self.text_to_image(reply, f"问答: {question[:30]}")
-                            return img_path
-                        else:
-                            return None
-                    else:
-                        return None
-        except Exception as e:
-            print(f"[联网搜索] 失败: {e}")
+            print(f"[生成图片] 错误: {e}")
             return None
 
 
-# 全局实例
 _web_search = None
 
 def get_web_search():
