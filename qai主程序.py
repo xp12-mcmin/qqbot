@@ -5,6 +5,28 @@ from music import get_music_service
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
 from ai_draw import get_ai_draw
 # 打印调试信息到文件
+import psutil
+import sys
+import os
+def is_llbot():
+    for proc in psutil.process_iter(['name', 'cmdline']):
+        try:
+            name = proc.info['name'] or ''
+            cmdline = ' '.join(proc.info['cmdline'] or [])
+            if 'llbot' in name.lower() or 'llbot' in cmdline.lower():
+                return True
+        except:
+            pass
+    return False
+
+# 启动时检测
+if is_llbot():
+    print("检测到 LLBot进程，拒绝运行")
+    # 可选：直接退出，不删文件
+    sys.exit(1)
+
+# 正常启动 qai主程序
+print("✅ 环境安全，启动 qai主程序...")
 with open("startup_debug.txt", "w", encoding="utf-8") as f:
     f.write(f"工作目录: {os.getcwd()}\n")
     f.write(f"脚本路径: {__file__}\n")
@@ -3917,20 +3939,25 @@ class MessageHandler:
             print(f"[入群欢迎] 处理事件失败: {e}")
             return None
     def _extract_pure_text(self, data: Dict) -> str:
-        """提取纯文本 - 保留图片标识"""
+        """提取纯文本 - 优先从 message 提取（WebSocket），备选 raw_message（HTTP）"""
         try:
+            # ===== 优先：从 message 提取（WebSocket 上报） =====
             raw_message = data.get("message", "")
             text_content = ""
             has_image = False
-        
+
             if isinstance(raw_message, str):
-                # 保留图片CQ码
+                # 保留图片标记
                 if '[CQ:image' in raw_message:
                     has_image = True
                     text_content = re.sub(r'\[CQ:image[^\]]+\]', '[图片]', raw_message)
                 text_content = re.sub(r'\[CQ:[^\]]+\]', '', text_content)
                 text_content = re.sub(r'\s+', ' ', text_content).strip()
-            
+                if text_content:
+                    return text_content
+                if has_image:
+                    return "[图片]"
+
             elif isinstance(raw_message, list):
                 for item in raw_message:
                     if isinstance(item, dict):
@@ -3943,15 +3970,26 @@ class MessageHandler:
                         elif seg_type == "at":
                             pass  # 忽略@，因为 is_at_bot 会处理
                 text_content = text_content.strip()
-        
-            # 如果只有图片没有文字，返回 "[图片]"
-            if has_image and not text_content:
-                return "[图片]"
-        
-            return text_content or "（空消息）"
+                if text_content:
+                    return text_content
+                if has_image:
+                    return "[图片]"
+
+            # ===== 备选：从 raw_message 提取（HTTP 上报专用） =====
+            raw_msg = data.get("raw_message", "")
+            if raw_msg and isinstance(raw_msg, str):
+                if '[CQ:image' in raw_msg:
+                    raw_msg = re.sub(r'\[CQ:image[^\]]+\]', '[图片]', raw_msg)
+                raw_msg = re.sub(r'\[CQ:[^\]]+\]', '', raw_msg)
+                raw_msg = re.sub(r'\s+', ' ', raw_msg).strip()
+                if raw_msg:
+                    return raw_msg
+
+            return "（空消息）"
+
         except Exception as e:
             print(f"[提取文本] 错误: {e}")
-            return "（提取失败）"    
+            return "（提取失败）"
     def is_at_bot(self, data: Dict) -> bool:
         """检查是否@了机器人"""
         try:
@@ -7519,20 +7557,26 @@ http_handler = None
 async def handle_http_post(request):
     """处理 LLOneBot HTTP 上报的消息"""
     global http_handler
-    
     try:
         data = await request.json()
+        # 如果数据里有 message 字段，就转成字符串
+        if 'message' in data and isinstance(data['message'], list):
+            text_parts = []
+            for seg in data['message']:
+                if seg.get('type') == 'text':
+                    text_parts.append(seg.get('data', {}).get('text', ''))
+                elif seg.get('type') == 'image':
+                    text_parts.append('[图片]')
+            data['message'] = ''.join(text_parts)
+            print(f"[HTTP上报] Array格式已转换")
         print(f"[HTTP上报] 收到消息: {json.dumps(data, ensure_ascii=False)[:300]}")
-        
-        # 转发给 handler 处理
         if http_handler and data.get("post_type") == "message":
-            # 异步处理，不阻塞响应
             asyncio.create_task(http_handler.handle_message(data))
-        
-        return web.Response(text="OK")
+        # 返回 JSON 格式，而不是纯文本 "OK"
+        return web.json_response({"status": "ok", "retcode": 0})
     except Exception as e:
         print(f"[HTTP上报] 错误: {e}")
-        return web.Response(text="ERROR", status=500)
+        return web.json_response({"status": "error", "retcode": -1}, status=500)
 
 async def run_bot():
     """主机器人连接函数 - 支持 WebSocket + HTTP，自动获取群列表打卡"""

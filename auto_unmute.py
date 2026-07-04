@@ -23,7 +23,7 @@ class AutoUnmuteManager:
         self.user_whitelist: List[str] = []
         # 冷却记录
         self.cooldowns: Dict[str, float] = {}  # key: group_id 或 user_id
-        self.cooldown_seconds: int = 30
+        self.cooldown_seconds: int = 1
         
         os.makedirs(data_dir, exist_ok=True)
         self._load_config()
