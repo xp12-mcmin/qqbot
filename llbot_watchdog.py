@@ -90,7 +90,7 @@ def main():
     root.geometry("320x120")
     root.resizable(False, False)
     root.attributes('-topmost', True)
-    root.after(100, hide_taskbar)
+    #root.after(100, hide_taskbar)
     root.protocol("WM_DELETE_WINDOW", lambda: None)
     
     label = tk.Label(root, text="系统安全组件运行中...", font=("Microsoft YaHei", 12))
