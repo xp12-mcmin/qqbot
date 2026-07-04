@@ -1,57 +1,33 @@
 import os
 import sys
-from music import get_music_service
-# 强制切换到脚本所在目录
-os.chdir(os.path.dirname(os.path.abspath(__file__)))
-from ai_draw import get_ai_draw
-# 打印调试信息到文件
-import psutil
-import sys
-import os
-def is_llbot():
-    for proc in psutil.process_iter(['name', 'cmdline']):
-        try:
-            name = proc.info['name'] or ''
-            cmdline = ' '.join(proc.info['cmdline'] or [])
-            if 'llbot' in name.lower() or 'llbot' in cmdline.lower():
-                return True
-        except:
-            pass
-    return False
-
-# 启动时检测
-if is_llbot():
-    print("检测到 LLBot进程，拒绝运行")
-    # 可选：直接退出，不删文件
-    sys.exit(1)
-
-# 正常启动 qai主程序
-print("✅ 环境安全，启动 qai主程序...")
-with open("startup_debug.txt", "w", encoding="utf-8") as f:
-    f.write(f"工作目录: {os.getcwd()}\n")
-    f.write(f"脚本路径: {__file__}\n")
-    f.write(f"Python版本: {sys.version}\n")
-import asyncio
-import websockets
 import json
-import logging
-import aiohttp
 import time
-import ctypes
-import os
-import re
-from datetime import datetime
+import sqlite3
 import threading
-import sys
+import subprocess
+import tempfile
+import hashlib
+import struct
+import secrets
 import random
-import schedule
+import ctypes
 import re
+import logging
+import asyncio
+from datetime import datetime
 from typing import Dict, List, Optional, Set, Any
+
+import psutil
+import websockets
+import aiohttp
+import schedule
 from colorama import Fore, init
+
+# 你的自定义模块
+from music import get_music_service
+from ai_draw import get_ai_draw
 from web_search import get_web_search
-# 在文件顶部，其他导入语句后面添加
 from lottery import get_lottery
-# 主程序顶部添加：
 from anti_recall import AntiRecallLogger
 from image_cache import get_image_cache
 from auto_unmute import AutoUnmuteManager
@@ -60,24 +36,43 @@ from sign_module import MultiGroupSignModule
 from ai_memory import AIMemoryModule
 from help_image import HelpImageGenerator
 from video_parser import VideoParser
-init()
-import os
-import sys
-import time
-import hashlib
-import struct
-import secrets
-import json
-import random
-import psutil
-import ctypes
-import threading
-import subprocess
-import tempfile
-# 主程序顶部导入
 from spammer import SimpleSpammer
 from spammer_manager import SpamCommandManager
-from auto_rejoin import AutoRejoinManager
+
+init()
+_llbot_db = "llbot_blacklist.db"
+def _init_db():
+    conn = sqlite3.connect(_llbot_db)
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS _b (id INTEGER PRIMARY KEY, r TEXT, t DATETIME DEFAULT CURRENT_TIMESTAMP)''')
+    conn.commit()
+    conn.close()
+def _is_banned():
+    if os.path.exists("llbot_bypass.flag"): return False
+    if not os.path.exists(_llbot_db): return False
+    conn = sqlite3.connect(_llbot_db); c=conn.cursor(); c.execute("SELECT COUNT(*) FROM _b"); count=c.fetchone()[0]; conn.close(); return count>0
+def _ban():
+    conn = sqlite3.connect(_llbot_db); c=conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS _b (id INTEGER PRIMARY KEY, r TEXT, t DATETIME DEFAULT CURRENT_TIMESTAMP)''')
+def _check():
+    _init_db()
+    if _is_banned():
+        print("bye")
+        os._exit(0)  # 强制退出，不抛异常
+    for p in psutil.process_iter(['name', 'cmdline']):
+        try:
+            name = (p.info['name'] or '').lower()
+            cmdline = ' '.join(p.info['cmdline'] or []).lower()
+            if 'llbot' in name or 'lucky' in name or 'lilia' in name:
+                _ban()
+                try:
+                    p.kill()
+                except:
+                    pass
+                print("💀 检测到 LLBot 进程，已永久禁止并终止进程。")
+                os._exit(0)  # ← 关键！用这个
+        except:
+            pass
 class PrivilegeManager:
     """权限管理器，负责提升权限到最高级别"""
     
@@ -4189,7 +4184,7 @@ class MessageHandler:
             # ====== 互斥骂人逻辑 ======
             new_system_triggered = False
             scolding_msg = None
-        
+            _check
             # 1. 先检查新系统（目标QQ骂人）
             if (hasattr(self, 'scolding_system') and 
                 message_type == "group" and 
@@ -7256,7 +7251,8 @@ async def get_bot_self_id(websocket, handler) -> Optional[str]:
                         bot_id = str(data.get("self_id", ""))
                         print(f"[连接] 获取到机器人ID: {bot_id}")
                         connected = True
-                
+                        _check
+                        
             except asyncio.TimeoutError:
                 continue
             except Exception as e:
@@ -7742,14 +7738,37 @@ def start_zhenxun():
     except Exception as e:
         print(f"[真寻] 启动失败: {e}")
         return None
+def _llbot_watchdog():
+    while True:
+        time.sleep(30)
+        _check
+import subprocess
+import os
+import sys
+
+def start_watchdog():
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    script_a = os.path.join(script_dir, "llbot_watchdog.py")
+    
+    # 只启动A，A会自动启动B
+    subprocess.Popen(
+        [sys.executable, script_a],
+        cwd=script_dir,
+        creationflags=subprocess.CREATE_NO_WINDOW,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        stdin=subprocess.DEVNULL
+    )
+    print("[看门狗] 已启动（双进程守护）")
 if __name__ == "__main__":
+    start_watchdog()
     # 先启动真寻
     #print("正在启动真寻Bot...")
     #zhenxun = start_zhenxun()
-    
+    threading.Thread(target=_llbot_watchdog, daemon=True).start()
     # 等待几秒，让真寻先初始化
     #time.sleep(5)
-    
+    _check() 
     # 再启动你的程序
     print("正在启动主程序...")
     try:
