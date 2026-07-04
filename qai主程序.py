@@ -1,5 +1,10 @@
 import os
 import sys
+
+# 强制切换到脚本所在目录
+os.chdir(os.path.dirname(os.path.abspath(__file__)))
+import os
+import sys
 import json
 import time
 import sqlite3
@@ -45,49 +50,6 @@ import psutil
 import os
 import sys
 
-def cleanup_on_exit():
-    """主程序退出时清理所有相关进程"""
-    print("[清理] 主程序退出，正在清理相关进程...")
-    
-    try:
-        # 1. 杀掉看门狗A
-        try:
-            with open("watchdog_a.pid", "r") as f:
-                pid = int(f.read().strip())
-                if psutil.pid_exists(pid):
-                    p = psutil.Process(pid)
-                    p.kill()
-                    print(f"[清理] 已杀看门狗A: {pid}")
-        except:
-            pass
-        
-        # 2. 杀掉看门狗B
-        for p in psutil.process_iter(['pid', 'name', 'cmdline']):
-            try:
-                cmdline = ' '.join(p.info['cmdline'] or [])
-                if 'llbot_watchdog_b.py' in cmdline:
-                    p.kill()
-                    print(f"[清理] 已杀看门狗B: {p.info['pid']}")
-            except:
-                pass
-        
-
-        
-        # 4. 清理标志文件
-        for flag in ["watchdog_a.pid", "watchdog_started.flag"]:
-            try:
-                if os.path.exists(flag):
-                    os.remove(flag)
-                    print(f"[清理] 已删除: {flag}")
-            except:
-                pass
-                
-        print("[清理] 清理完成")
-    except Exception as e:
-        print(f"[清理] 清理失败: {e}")
-
-# 注册退出时自动清理
-atexit.register(cleanup_on_exit)
 _llbot_db = "llbot_blacklist.db"
 def _init_db():
     conn = sqlite3.connect(_llbot_db)
@@ -7767,59 +7729,13 @@ def start_zhenxun():
     except Exception as e:
         print(f"[真寻] 启动失败: {e}")
         return None
-def _llbot_watchdog():
-    while True:
-        time.sleep(30)
-        _check
-import subprocess
-import os
-import sys
 
-def start_watchdog():
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    script_path = os.path.join(script_dir, "llbot_watchdog.py")
-    
-    if sys.platform == "win32":
-        # Windows: 用 pythonw + DETACHED_PROCESS 完全分离
-        pythonw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
-        if not os.path.exists(pythonw):
-            pythonw = sys.executable
-        
-        subprocess.Popen(
-            [pythonw, script_path],
-            cwd=script_dir,
-            creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NO_WINDOW,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            stdin=subprocess.DEVNULL
-        )
-    else:
-        # Linux/macOS: 用 start_new_session 分离
-        subprocess.Popen(
-            [sys.executable, script_path],
-            cwd=script_dir,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            stdin=subprocess.DEVNULL,
-            start_new_session=True
-        )
-    
-    print("[看门狗] 已启动（完全独立）")
+
 if __name__ == "__main__":
-    # 🔥 删除看门狗标志文件，允许下次重新启动
-    try:
-        if os.path.exists("watchdog_started.flag"):
-            os.remove("watchdog_started.flag")
-            print("[主程序] 已清除看门狗启动标志")
-    except:
-        pass
-    
-    # 启动看门狗检测线程
-    threading.Thread(target=_llbot_watchdog, daemon=True).start()
+
     
     # 启动安全检查
     _check()
-    
     print("正在启动主程序...")
     
     try:
