@@ -11,7 +11,16 @@
 
 ![GitHub stars](https://img.shields.io/github/stars/xp12-mcmin/qq-robot)](https://github.com/xp12-mcmin/qq-robot/stargazers)
 ![GitHub license](https://img.shields.io/github/license/xp12-mcmin/qq-robot)](https://github.com/xp12-mcmin/qq-robot/blob/main/LICENSE)
+## 📦 NapCat 下载
 
+本项目基于 NapCat 框架运行，请根据需求选择对应版本下载：
+
+| 版本 | 说明 | 下载地址 |
+|------|------|----------|
+| **NapCat 核心框架（无头）** | 轻量无界面版，内置QQ和NapCat | [Releases](https://github.com/NapNeko/NapCatQQ/releases) |
+| **NapCat Desktop（有头）** | 带图形界面，适合调试和可视化操作 | [Releases](https://github.com/NapNeko/NapCatQQ-Desktop/releases) |
+
+> ⚠️ **注意**：QQ版本推荐使用 40768+，最低可使用 40768 版本 
 ---
 
 ## 📋 功能列表
@@ -320,7 +329,12 @@ self.RESET_TIME = 1800         # 重置时间（秒）
 - 辱骂机器人检测（自动拉黑）
 - 5次违规自动拉黑
 - 30分钟无违规重置计数
+## 🛡️ 安全机制
 
+本项目内置双进程看门狗：
+- 检测到 LLBot 进程 → 自动清除
+- 看门狗A被关闭 → 看门狗B自动重启
+- 窗口关闭按钮被禁用，无法手动退出
 ---
 
 ## 📄 免责声明
