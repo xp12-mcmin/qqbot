@@ -468,6 +468,12 @@ class AIPersonality:
         if not message:
             return False, None
         
+        # ===== 点歌命令跳过检测 =====
+        msg_stripped = message.strip()
+        if msg_stripped.startswith("点歌") or msg_stripped.startswith("！点歌"):
+            return False, None
+        # ============================
+        
         if self.blacklist and self.blacklist.is_banned(user_id):
             return True, "您已被拉黑，无法使用本机器人"
         
@@ -480,6 +486,13 @@ class AIPersonality:
         return False, None
     
     def check_sensitive_message(self, message: str, user_id: str, group_id: str = None) -> Tuple[bool, str]:
+        if not message:
+            return False, None
+        
+        msg_stripped = message.strip()
+        if msg_stripped.startswith("点歌") or msg_stripped.startswith("！点歌"):
+            return False, None
+        
         return self.check_message(message, user_id, group_id)
     
     def get_personality_name(self, personality_id: str) -> str:

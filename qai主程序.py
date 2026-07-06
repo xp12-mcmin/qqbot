@@ -5706,7 +5706,7 @@ class MessageHandler:
             print(f"[树洞错误] {e}")
             return "🌳 树洞今天打烊了，明天再来吧~"
     async def _music(self, group_id: int, user_id: str, keyword: str) -> Dict:
-        """点歌 - 下载并发送QQ语音(SILK格式)"""
+        """点歌 - 下载并发送QQ语音(AMR + SILK双格式)"""
         
         # ========== 计数去重 ==========
         if not hasattr(self, '_music_count'):
@@ -5765,26 +5765,39 @@ class MessageHandler:
             msg_base = f"🎵 《{song_name}》- {artist}\n🔗 {music_url}"
             
             if filepath and os.path.exists(filepath):
-                # 转换为SILK
+                # 转换 AMR 和 SILK
+                amr_path = await self._convert_to_amr(filepath)
                 silk_path = await self._convert_to_silk(filepath)
                 
-                if silk_path and os.path.exists(silk_path):
-                    # ===== 先发结果消息 =====
-                    result_msg = f"🎵 《{song_name}》- {artist}"
-                    if cover_url:
-                        result_msg = f"[CQ:image,file={cover_url}]\n{result_msg}"
-                    result_msg += "\n🎵 正在发送语音..."
-                    
+                # ===== 先发结果消息 =====
+                result_msg = f"🎵 《{song_name}》- {artist}"
+                if cover_url:
+                    result_msg = f"[CQ:image,file={cover_url}]\n{result_msg}"
+                result_msg += "\n🎵 正在发送语音..."
+                
+                await self.websocket.send(json.dumps({
+                    "action": "send_msg",
+                    "params": {
+                        "message_type": "group",
+                        "group_id": int(group_id),
+                        "message": result_msg
+                    }
+                }))
+                
+                # ===== 再发 AMR（手机兼容性最好） =====
+                if amr_path and os.path.exists(amr_path):
                     await self.websocket.send(json.dumps({
                         "action": "send_msg",
                         "params": {
                             "message_type": "group",
                             "group_id": int(group_id),
-                            "message": result_msg
+                            "message": f"[CQ:record,file=file:///{os.path.abspath(amr_path)}]"
                         }
                     }))
-                    
-                    # ===== 再发语音 =====
+                    print(f"[点歌] 已发送AMR语音: {amr_path}")
+                
+                # ===== 最后发 SILK（电脑端备用） =====
+                if silk_path and os.path.exists(silk_path):
                     await self.websocket.send(json.dumps({
                         "action": "send_msg",
                         "params": {
@@ -5793,45 +5806,73 @@ class MessageHandler:
                             "message": f"[CQ:record,file=file:///{os.path.abspath(silk_path)}]"
                         }
                     }))
-                    print(f"[点歌] 已发送语音: {silk_path}")
-                    
-                    return None
-                else:
-                    # SILK转换失败，回退到上传文件
-                    await self.websocket.send(json.dumps({
-                        "action": "upload_group_file",
-                        "params": {
-                            "group_id": int(group_id),
-                            "file": filepath,
-                            "name": f"{song_name}.m4a"
-                        }
-                    }))
-                    
-                    if cover_url:
-                        return {
-                            "action": "send_msg",
-                            "params": {
-                                "message_type": "group",
-                                "group_id": int(group_id),
-                                "message": f"[CQ:image,file={cover_url}]\n{msg_base}\n📁 已上传群文件"
-                            }
-                        }
-                    else:
-                        return self._create_reply("group", user_id, group_id, 
-                            f"{msg_base}\n📁 已上传群文件")
+                    print(f"[点歌] 已发送SILK语音: {silk_path}")
+                
+                return None
             else:
                 return self._create_reply("group", user_id, group_id, msg_base)
                 
         except Exception as e:
             print(f"[点歌] 错误: {e}")
             return self._create_reply("group", user_id, group_id, f"❌ 点歌失败: {e}")
-    async def _convert_to_silk(self, input_path: str) -> str:
-        """转换为SILK格式（完整版，不截取）"""
+
+
+    async def _convert_to_amr(self, input_path: str) -> str:
+        """转AMR格式（手机QQ兼容性最好）"""
         import asyncio
         import os
         import sys
         
-        # 获取程序目录
+        if getattr(sys, 'frozen', False):
+            base_dir = os.path.dirname(sys.executable)
+        else:
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+        
+        ffmpeg_path = os.path.join(base_dir, "ffmpeg.exe")
+        
+        if not os.path.exists(ffmpeg_path):
+            print(f"[AMR转换] ffmpeg.exe 不存在: {ffmpeg_path}")
+            return None
+        
+        base_name = os.path.splitext(input_path)[0]
+        amr_path = f"{base_name}.amr"
+        
+        try:
+            print(f"[AMR转换] 开始转换...")
+            cmd = [
+                ffmpeg_path, "-y", "-i", input_path,
+                "-vn", "-ar", "8000", "-ac", "1", "-ab", "12.2k",
+                amr_path  # ← 去掉了 -t 60
+            ]
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await proc.communicate()
+            
+            if proc.returncode != 0:
+                print(f"[AMR转换] ffmpeg错误: {stderr.decode()}")
+                return None
+            
+            if os.path.exists(amr_path):
+                print(f"[AMR转换] 成功: {amr_path}")
+                return amr_path
+            else:
+                print(f"[AMR转换] AMR文件未生成")
+                return None
+                
+        except Exception as e:
+            print(f"[AMR转换] 错误: {e}")
+            return None
+
+
+    async def _convert_to_silk(self, input_path: str) -> str:
+        """转SILK格式（电脑端备用）"""
+        import asyncio
+        import os
+        import sys
+        
         if getattr(sys, 'frozen', False):
             base_dir = os.path.dirname(sys.executable)
         else:
@@ -5852,8 +5893,9 @@ class MessageHandler:
         silk_path = f"{base_name}.silk"
         
         try:
-            # 1. 转PCM（完整版，不加 -t）
-            print(f"[SILK转换] 转PCM（完整版）...")
+            print(f"[SILK转换] 开始转换...")
+            
+            # 转PCM（完整版，不加 -t）
             cmd_ffmpeg = [
                 ffmpeg_path, "-y", "-i", input_path,
                 "-vn", "-ar", "24000", "-ac", "1", "-f", "s16le", pcm_path  # ← 去掉了 -t 60
@@ -5875,7 +5917,7 @@ class MessageHandler:
             
             print(f"[SILK转换] PCM生成成功，开始转SILK...")
             
-            # 2. PCM -> SILK
+            # PCM -> SILK
             cmd_silk = [
                 silk_encoder_path, pcm_path, silk_path,
                 "-Fs_API", "24000", "-rate", "24000"
@@ -5891,7 +5933,7 @@ class MessageHandler:
                 print(f"[SILK转换] silk编码器错误: {stderr.decode()}")
                 return None
             
-            # 3. 清理PCM
+            # 清理PCM
             if os.path.exists(pcm_path):
                 os.remove(pcm_path)
                 print(f"[SILK转换] 已清理PCM: {pcm_path}")
