@@ -5706,7 +5706,7 @@ class MessageHandler:
             print(f"[树洞错误] {e}")
             return "🌳 树洞今天打烊了，明天再来吧~"
     async def _music(self, group_id: int, user_id: str, keyword: str) -> Dict:
-        """点歌 - 下载并发送QQ语音"""
+        """点歌 - 下载并发送QQ语音(SILK格式)"""
         
         # ========== 计数去重 ==========
         if not hasattr(self, '_music_count'):
@@ -5719,15 +5719,12 @@ class MessageHandler:
         count = self._music_count.get(command_hash, 0)
         
         if count >= 1:
-            # 重复请求：发送提示消息，然后返回（不继续处理）
             print(f"[点歌] 重复命令，已忽略: {command_key}")
             return self._create_reply("group", user_id, group_id, 
                 "⏰ 点歌命令已收到，正在处理中，请勿重复发送~")
         
-        # 第一次：计数+1，发送"正在处理"提示
         self._music_count[command_hash] = count + 1
         
-        # 发送"正在处理"提示
         await self.websocket.send(json.dumps({
             "action": "send_msg",
             "params": {
@@ -5737,7 +5734,6 @@ class MessageHandler:
             }
         }))
         
-        # 延迟清理计数
         async def cleanup():
             await asyncio.sleep(5)
             if command_hash in self._music_count:
@@ -5769,32 +5765,39 @@ class MessageHandler:
             msg_base = f"🎵 《{song_name}》- {artist}\n🔗 {music_url}"
             
             if filepath and os.path.exists(filepath):
-                amr_path = await music.convert_to_amr(filepath)
+                # 转换为SILK
+                silk_path = await self._convert_to_silk(filepath)
                 
-                if amr_path and os.path.exists(amr_path):
+                if silk_path and os.path.exists(silk_path):
+                    # ===== 先发结果消息 =====
+                    result_msg = f"🎵 《{song_name}》- {artist}"
+                    if cover_url:
+                        result_msg = f"[CQ:image,file={cover_url}]\n{result_msg}"
+                    result_msg += "\n🎵 正在发送语音..."
+                    
                     await self.websocket.send(json.dumps({
                         "action": "send_msg",
                         "params": {
                             "message_type": "group",
                             "group_id": int(group_id),
-                            "message": f"[CQ:record,file=file:///{os.path.abspath(amr_path)}]"
+                            "message": result_msg
                         }
                     }))
-                    print(f"[点歌] 已发送语音消息: {amr_path}")
                     
-                    if cover_url:
-                        return {
-                            "action": "send_msg",
-                            "params": {
-                                "message_type": "group",
-                                "group_id": int(group_id),
-                                "message": f"[CQ:image,file={cover_url}]\n{msg_base}\n📢 已发送语音"
-                            }
+                    # ===== 再发语音 =====
+                    await self.websocket.send(json.dumps({
+                        "action": "send_msg",
+                        "params": {
+                            "message_type": "group",
+                            "group_id": int(group_id),
+                            "message": f"[CQ:record,file=file:///{os.path.abspath(silk_path)}]"
                         }
-                    else:
-                        return self._create_reply("group", user_id, group_id, 
-                            f"{msg_base}\n📢 已发送语音")
+                    }))
+                    print(f"[点歌] 已发送语音: {silk_path}")
+                    
+                    return None
                 else:
+                    # SILK转换失败，回退到上传文件
                     await self.websocket.send(json.dumps({
                         "action": "upload_group_file",
                         "params": {
@@ -5822,33 +5825,90 @@ class MessageHandler:
         except Exception as e:
             print(f"[点歌] 错误: {e}")
             return self._create_reply("group", user_id, group_id, f"❌ 点歌失败: {e}")
-    
-    async def _set_group_card(self, group_id: int, target_id: str, new_name: str, operator_id: str) -> Dict:
-        """修改群成员群名片"""
+    async def _convert_to_silk(self, input_path: str) -> str:
+        """转换为SILK格式（完整版，不截取）"""
+        import asyncio
+        import os
+        import sys
+        
+        # 获取程序目录
+        if getattr(sys, 'frozen', False):
+            base_dir = os.path.dirname(sys.executable)
+        else:
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+        
+        ffmpeg_path = os.path.join(base_dir, "ffmpeg.exe")
+        silk_encoder_path = os.path.join(base_dir, "silk_v3_encoder.exe")
+        
+        if not os.path.exists(ffmpeg_path):
+            print(f"[SILK转换] ffmpeg.exe 不存在: {ffmpeg_path}")
+            return None
+        if not os.path.exists(silk_encoder_path):
+            print(f"[SILK转换] silk_v3_encoder.exe 不存在: {silk_encoder_path}")
+            return None
+        
+        base_name = os.path.splitext(input_path)[0]
+        pcm_path = f"{base_name}.pcm"
+        silk_path = f"{base_name}.silk"
+        
         try:
-            print(f"[改名片] 群{group_id}, 目标{target_id}, 新名:{new_name}, 操作者:{operator_id}")
+            # 1. 转PCM（完整版，不加 -t）
+            print(f"[SILK转换] 转PCM（完整版）...")
+            cmd_ffmpeg = [
+                ffmpeg_path, "-y", "-i", input_path,
+                "-vn", "-ar", "24000", "-ac", "1", "-f", "s16le", pcm_path  # ← 去掉了 -t 60
+            ]
+            proc = await asyncio.create_subprocess_exec(
+                *cmd_ffmpeg,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await proc.communicate()
             
-            # 发送修改群名片请求
-            await self.websocket.send(json.dumps({
-                "action": "set_group_card",
-                "params": {
-                    "group_id": int(group_id),
-                    "user_id": int(target_id),
-                    "card": new_name
-                },
-                "echo": f"set_card_{target_id}_{int(time.time()*1000)}"
-            }))
+            if proc.returncode != 0:
+                print(f"[SILK转换] ffmpeg错误: {stderr.decode()}")
+                return None
             
-            # 获取操作者和目标的名字（用于回复）
-            operator_name = await self._get_member_name(group_id, operator_id)
-            target_name = await self._get_member_name(group_id, target_id)
+            if not os.path.exists(pcm_path):
+                print(f"[SILK转换] PCM生成失败")
+                return None
             
-            return self._create_reply("group", operator_id, group_id,
-                f"✅ {operator_name} 已将 {target_name} 的群名片修改为：{new_name}")
+            print(f"[SILK转换] PCM生成成功，开始转SILK...")
             
+            # 2. PCM -> SILK
+            cmd_silk = [
+                silk_encoder_path, pcm_path, silk_path,
+                "-Fs_API", "24000", "-rate", "24000"
+            ]
+            proc = await asyncio.create_subprocess_exec(
+                *cmd_silk,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await proc.communicate()
+            
+            if proc.returncode != 0:
+                print(f"[SILK转换] silk编码器错误: {stderr.decode()}")
+                return None
+            
+            # 3. 清理PCM
+            if os.path.exists(pcm_path):
+                os.remove(pcm_path)
+                print(f"[SILK转换] 已清理PCM: {pcm_path}")
+            
+            if os.path.exists(silk_path):
+                print(f"[SILK转换] SILK生成成功: {silk_path}")
+                return silk_path
+            else:
+                print(f"[SILK转换] SILK文件未生成")
+                return None
+                
         except Exception as e:
-            print(f"[改名片] 错误: {e}")
-            return self._create_reply("group", operator_id, group_id, f"❌ 修改失败: {e}")
+            print(f"[SILK转换] 错误: {e}")
+            if os.path.exists(pcm_path):
+                try: os.remove(pcm_path)
+                except: pass
+            return None
     async def _ai_draw(self, group_id: int, user_id: str, keyword: str) -> Dict:
         """AI 绘画"""
         import time
