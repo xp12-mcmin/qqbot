@@ -467,22 +467,25 @@ class AIPersonality:
     def check_message(self, message: str, user_id: str, group_id: str = None) -> Tuple[bool, str]:
         if not message:
             return False, None
-        
-        # ===== 点歌命令跳过检测 =====
+
         msg_stripped = message.strip()
-        if msg_stripped.startswith("点歌") or msg_stripped.startswith("！点歌"):
-            return False, None
+
+        # ===== 跳过硬编码指令 =====
+        skip_commands = ["点歌", "！点歌", "画图", "！画图", "!画图", "!点歌"]
+        for cmd in skip_commands:
+            if msg_stripped.startswith(cmd):
+                return False, None
         # ============================
-        
+
         if self.blacklist and self.blacklist.is_banned(user_id):
             return True, "您已被拉黑，无法使用本机器人"
-        
+
         if self.is_sensitive(message):
             return self.record_violation(user_id, group_id, "sensitive")
-        
+
         if self.is_insult(message):
             return self.record_violation(user_id, group_id, "insult")
-        
+
         return False, None
     
     def check_sensitive_message(self, message: str, user_id: str, group_id: str = None) -> Tuple[bool, str]:
@@ -490,10 +493,31 @@ class AIPersonality:
             return False, None
         
         msg_stripped = message.strip()
-        if msg_stripped.startswith("点歌") or msg_stripped.startswith("！点歌"):
-            return False, None
         
-        return self.check_message(message, user_id, group_id)
+        # === 修复后的跳过硬编码指令 ===
+        skip_commands = ["点歌", "！点歌", "画图", "！画图", "!画图"]
+        if any(msg_stripped.startswith(cmd) for cmd in skip_commands):
+            return False, None
+        # ============================
+        
+        # === 额外补充：提取纯指令部分 ===
+        # 如果是以这些指令开头，直接按空格或换行切分，取第一部分作为最终检测内容
+        # 防止 "画图 xxx" 里的 "xxx" 包含敏感词导致误判
+        first_word = msg_stripped.split()[0] if msg_stripped.split() else msg_stripped
+        
+        if self.blacklist and self.blacklist.is_banned(user_id):
+            return True, "您已被拉黑，无法使用本机器人"
+        
+        # 这里传入 first_word，而不是完整的 message
+        if self.is_sensitive(first_word):
+            return self.record_violation(user_id, group_id, "sensitive")
+        
+        if self.is_insult(first_word):
+            return self.record_violation(user_id, group_id, "insult")
+        
+        return False, None
+        
+
     
     def get_personality_name(self, personality_id: str) -> str:
         return self.personalities.get(personality_id, {}).get('name', '未知')

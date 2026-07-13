@@ -5707,24 +5707,24 @@ class MessageHandler:
             return "🌳 树洞今天打烊了，明天再来吧~"
     async def _music(self, group_id: int, user_id: str, keyword: str) -> Dict:
         """点歌 - 下载并发送QQ语音(AMR + SILK双格式)"""
-        
+
         # ========== 计数去重 ==========
         if not hasattr(self, '_music_count'):
             self._music_count = {}
-        
+
         import hashlib
         command_key = f"music_{group_id}_{user_id}_{keyword}"
         command_hash = hashlib.md5(command_key.encode()).hexdigest()
-        
+
         count = self._music_count.get(command_hash, 0)
-        
+
         if count >= 1:
             print(f"[点歌] 重复命令，已忽略: {command_key}")
-            return self._create_reply("group", user_id, group_id, 
+            return self._create_reply("group", user_id, group_id,
                 "⏰ 点歌命令已收到，正在处理中，请勿重复发送~")
-        
+
         self._music_count[command_hash] = count + 1
-        
+
         await self.websocket.send(json.dumps({
             "action": "send_msg",
             "params": {
@@ -5733,88 +5733,107 @@ class MessageHandler:
                 "message": f"[CQ:at,qq={user_id}] 🎵 正在搜索《{keyword}》，请稍候..."
             }
         }))
-        
+
         async def cleanup():
             await asyncio.sleep(5)
             if command_hash in self._music_count:
                 del self._music_count[command_hash]
                 print(f"[点歌] 已清理计数: {command_hash}")
-        
+
         asyncio.create_task(cleanup())
-        
+
         # ========== 点歌逻辑 ==========
         try:
             from music import get_music_service
             music = get_music_service()
             result = await music.search(keyword)
-            
+
             if not result.get("success"):
-                return self._create_reply("group", user_id, group_id, 
+                return self._create_reply("group", user_id, group_id,
                     f"❌ 点歌失败：{result.get('msg')}")
-            
+
             song_name = result.get('name')
             artist = result.get('artist')
             music_url = result.get('url')
             cover_url = result.get('cover')
-            
+            download_url = result.get('download_url')  # 如果 API 返回了
+
             import re
             safe_name = re.sub(r'[\\/*?:"<>|]', '', song_name)
             filename = f"{safe_name}.m4a"
-            
+
             filepath = await music.download_music(music_url, filename)
-            msg_base = f"🎵 《{song_name}》- {artist}\n🔗 {music_url}"
-            
+
+            # ===== 1. 先发歌曲信息 + 下载链接 =====
+            info_msg = f"🎵 《{song_name}》- {artist}"
+            if cover_url:
+                info_msg = f"[CQ:image,file={cover_url}]\n{info_msg}"
+
+            # 如果有下载链接就加上
+            if download_url:
+                info_msg += f"\n📥 下载链接：{download_url}"
+            elif music_url:
+                info_msg += f"\n🔗 下载链接：{music_url}"
+
+            # 如果有本地文件，提示正在发送语音
+            if filepath and os.path.exists(filepath):
+                info_msg += "\n🎤 正在发送语音..."
+
+            await self.websocket.send(json.dumps({
+                "action": "send_msg",
+                "params": {
+                    "message_type": "group",
+                    "group_id": int(group_id),
+                    "message": info_msg
+                }
+            }))
+
+            # ===== 2. 发送语音 =====
             if filepath and os.path.exists(filepath):
                 # 转换 AMR 和 SILK
                 amr_path = await self._convert_to_amr(filepath)
                 silk_path = await self._convert_to_silk(filepath)
-                
-                # ===== 先发结果消息 =====
-                result_msg = f"🎵 《{song_name}》- {artist}"
-                if cover_url:
-                    result_msg = f"[CQ:image,file={cover_url}]\n{result_msg}"
-                result_msg += "\n🎵 正在发送语音..."
-                
-                await self.websocket.send(json.dumps({
-                    "action": "send_msg",
-                    "params": {
-                        "message_type": "group",
-                        "group_id": int(group_id),
-                        "message": result_msg
-                    }
-                }))
-                
-                # ===== 再发 AMR（手机兼容性最好） =====
+
+                # ===== 发 AMR（手机兼容性最好） =====
                 if amr_path and os.path.exists(amr_path):
+                    # 确保路径用正斜杠并 URL 编码
+                    amr_abs = os.path.abspath(amr_path)
                     await self.websocket.send(json.dumps({
                         "action": "send_msg",
                         "params": {
                             "message_type": "group",
                             "group_id": int(group_id),
-                            "message": f"[CQ:record,file=file:///{os.path.abspath(amr_path)}]"
+                            "message": f"[CQ:record,file=file:///{amr_abs.replace('\\', '/')}]"
                         }
                     }))
                     print(f"[点歌] 已发送AMR语音: {amr_path}")
-                
-                # ===== 最后发 SILK（电脑端备用） =====
+
+                # ===== 发 SILK（电脑端备用） =====
                 if silk_path and os.path.exists(silk_path):
+                    silk_abs = os.path.abspath(silk_path)
                     await self.websocket.send(json.dumps({
                         "action": "send_msg",
                         "params": {
                             "message_type": "group",
                             "group_id": int(group_id),
-                            "message": f"[CQ:record,file=file:///{os.path.abspath(silk_path)}]"
+                            "message": f"[CQ:record,file=file:///{silk_abs.replace('\\', '/')}]"
                         }
                     }))
                     print(f"[点歌] 已发送SILK语音: {silk_path}")
-                
+
+                # 如果都没成功，发个提示
+                if not amr_path and not silk_path:
+                    return self._create_reply("group", user_id, group_id,
+                        f"✅ 已下载《{song_name}》，但语音转换失败\n📥 下载链接：{music_url}")
+
                 return None
             else:
-                return self._create_reply("group", user_id, group_id, msg_base)
-                
+                # 没有下载到文件，只发了信息
+                return None
+
         except Exception as e:
             print(f"[点歌] 错误: {e}")
-            return self._create_reply("group", user_id, group_id, f"❌ 点歌失败: {e}")
+            return self._create_reply("group", user_id, group_id, f"❌ 点歌失败：{str(e)}")
 
 
     async def _convert_to_amr(self, input_path: str) -> str:
