@@ -2644,11 +2644,15 @@ class YinYangDB:
         return f"已将QQ {qq} 从【{'阴库' if current_lib == 'yin' else '阳库'}】切换到【{'阴库' if target_lib == 'yin' else '阳库'}】"
 
 # ==================== 黑名单管理 ====================
+# ==================== 黑名单管理 ====================
 class SimpleBlacklist:
     def __init__(self, file_path="data/blacklist.json"):
         self.file_path = file_path
-        self.blacklist = set()
-        self.reasons = {}
+        self.blacklist = set()      # 被屏蔽用户集合
+        self.reasons = {}           # 屏蔽原因
+        self.times = {}             # 屏蔽时间
+        self.expires = {}           # 过期时间戳（新增）
+        self.durations = {}         # 封禁时长（秒）（新增）
         self.load()
     
     def load(self):
@@ -2658,6 +2662,9 @@ class SimpleBlacklist:
                     data = json.load(f)
                     self.blacklist = set(data.get("users", []))
                     self.reasons = data.get("reasons", {})
+                    self.times = data.get("times", {})
+                    self.expires = data.get("expires", {})      # 新增
+                    self.durations = data.get("durations", {})  # 新增
                     print(f"[调试] 黑名单加载成功 - 共{len(self.blacklist)}个用户")
             else:
                 self.save()
@@ -2666,10 +2673,20 @@ class SimpleBlacklist:
             print(f"[调试] 黑名单加载失败: {e}")
             self.blacklist = set()
             self.reasons = {}
+            self.times = {}
+            self.expires = {}
+            self.durations = {}
     
     def save(self):
         try:
-            data = {"users": list(self.blacklist), "reasons": self.reasons}
+            data = {
+                "users": list(self.blacklist),
+                "reasons": self.reasons,
+                "times": self.times,
+                "expires": self.expires,        # 新增
+                "durations": self.durations,    # 新增
+                "last_update": time.strftime("%Y-%m-%d %H:%M:%S")
+            }
             os.makedirs(os.path.dirname(self.file_path), exist_ok=True)
             with open(self.file_path, 'w', encoding='utf-8') as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
@@ -2678,14 +2695,30 @@ class SimpleBlacklist:
             print(f"[调试] 黑名单保存失败: {e}")
     
     def is_banned(self, user_id):
+        """检查用户是否被屏蔽（自动处理过期）"""
         user_id_str = str(user_id)
-        banned = user_id_str in self.blacklist
-        if banned:
-            reason = self.reasons.get(user_id_str, "无")
-            print(f"[调试] 黑名单检测 - 用户{user_id_str}（已封禁，原因：{reason}）")
-        return banned
+        
+        if user_id_str not in self.blacklist:
+            return False
+        
+        # 检查是否过期
+        if user_id_str in self.expires:
+            expire_time = self.expires[user_id_str]
+            if time.time() >= expire_time:
+                # 自动解封
+                self.unban_user(user_id_str)
+                print(f"[调试] 用户 {user_id_str} 已自动解封（封禁到期）")
+                return False
+        
+        return True
     
-    def add_user(self, user_id, reason="管理员封禁"):
+    def ban_user(self, user_id, reason="管理员封禁", duration=0):
+        """
+        封禁用户
+        :param user_id: 用户QQ号
+        :param reason: 封禁原因
+        :param duration: 封禁时长（秒），0表示永久
+        """
         try:
             user_id_str = str(user_id)
             if user_id_str in self.blacklist:
@@ -2694,14 +2727,24 @@ class SimpleBlacklist:
             
             self.blacklist.add(user_id_str)
             self.reasons[user_id_str] = reason
+            
+            if duration > 0:
+                self.expires[user_id_str] = time.time() + duration
+                self.durations[user_id_str] = duration
+                duration_desc = self._format_duration(duration)
+                print(f"[调试] 黑名单添加成功 - 用户{user_id_str}（时长：{duration_desc}，原因：{reason}）")
+            else:
+                self.expires.pop(user_id_str, None)
+                self.durations.pop(user_id_str, None)
+                print(f"[调试] 黑名单添加成功 - 用户{user_id_str}（永久，原因：{reason}）")
+            
             self.save()
-            print(f"[调试] 黑名单添加成功 - 用户{user_id_str}（原因：{reason}）")
             return True
         except Exception as e:
             print(f"[调试] 黑名单添加失败: {e}")
             return False
     
-    def remove_user(self, user_id):
+    def unban_user(self, user_id):
         try:
             user_id_str = str(user_id)
             if user_id_str not in self.blacklist:
@@ -2711,6 +2754,12 @@ class SimpleBlacklist:
             self.blacklist.remove(user_id_str)
             if user_id_str in self.reasons:
                 del self.reasons[user_id_str]
+            if user_id_str in self.times:
+                del self.times[user_id_str]
+            if user_id_str in self.expires:
+                del self.expires[user_id_str]
+            if user_id_str in self.durations:
+                del self.durations[user_id_str]
             self.save()
             print(f"[调试] 黑名单移除成功 - 用户{user_id_str}")
             return True
@@ -2718,19 +2767,78 @@ class SimpleBlacklist:
             print(f"[调试] 黑名单移除失败: {e}")
             return False
     
+    def clean_expired(self):
+        """清理所有已过期的封禁，返回清理数量"""
+        expired_users = []
+        for user_id in list(self.blacklist):
+            if user_id in self.expires:
+                if time.time() >= self.expires[user_id]:
+                    expired_users.append(user_id)
+        
+        for user_id in expired_users:
+            self.unban_user(user_id)
+        
+        if expired_users:
+            print(f"[调试] 清理了 {len(expired_users)} 个已过期封禁")
+        return len(expired_users)
+    
+    def _format_duration(self, seconds):
+        """格式化时长显示"""
+        if seconds <= 0:
+            return "永久"
+        
+        units = [
+            (31536000, "年"),
+            (2592000, "个月"),
+            (604800, "周"),
+            (86400, "天"),
+            (3600, "小时"),
+            (60, "分钟"),
+            (1, "秒")
+        ]
+        
+        parts = []
+        remaining = seconds
+        for unit_sec, unit_name in units:
+            if remaining >= unit_sec:
+                count = remaining // unit_sec
+                remaining %= unit_sec
+                parts.append(f"{int(count)}{unit_name}")
+        
+        return "".join(parts) if parts else "0秒"
+    
+    def list_users(self, limit=20):
+        """获取用户列表（用于显示），自动过滤已过期的"""
+        # 先清理已过期的
+        self.clean_expired()
+        
+        result = []
+        for user_id in sorted(self.blacklist):
+            reason = self.reasons.get(user_id, "未知原因")
+            
+            if user_id in self.expires:
+                remain = self.expires[user_id] - time.time()
+                if remain > 0:
+                    remain_str = self._format_duration(int(remain))
+                    result.append(f"{user_id} (剩余: {remain_str}) - {reason}")
+                else:
+                    continue  # 已过期，跳过
+            else:
+                result.append(f"{user_id} (永久) - {reason}")
+            
+            if len(result) >= limit:
+                break
+        
+        return result
+    
     def get_count(self):
+        """获取黑名单用户数量（自动清理过期）"""
+        self.clean_expired()
         return len(self.blacklist)
     
     def get_reason(self, user_id):
         user_id_str = str(user_id)
         return self.reasons.get(user_id_str, "无")
-    
-    def list_users(self):
-        result = []
-        for user_id in self.blacklist:
-            reason = self.reasons.get(user_id, "无")
-            result.append(f"{user_id} (原因: {reason})")
-        return result
 
 # ==================== 管理员管理 ====================
 class AdminManager:
@@ -2949,9 +3057,9 @@ class OllamaAI:
         self.text_models_priority = [
             "gemma4:31b-cloud",# 第一优先
             "glm-4.7:cloud",# 第二优先 
-            "qwen3-coder:480b-cloud",# 第三优先          
-            "nemotron-3-super:cloud",#第四优先        
-            "minimax-m3:cloud",  
+            "nemotron-3-super:cloud",# 第三优先          
+            "minimax-m3:cloud",#第四优先        
+              
         ]
         
         # 图像识别专用模型
@@ -3400,38 +3508,83 @@ class OllamaAI:
             print(f"[图片处理] 失败: {e}")
             return None
 #，================== 禁言检测模块 ====================
+# ================== 禁言检测模块（修复版） ====================
 class LLBotMuteDetector:
-    def __init__(self, blacklist):
+    def __init__(self, blacklist, admin_manager=None):
         self.blacklist = blacklist
+        self.admin_manager = admin_manager  # 传入管理员管理器
+        self.cooldowns = {}  # 冷却记录
+        self.cooldown_time = 60  # 60秒冷却，防止重复触发
+        self.self_id = None  # 机器人自身ID
         print("[调试] 禁言检测模块初始化完成")
     
+    def set_self_id(self, self_id):
+        """设置机器人自身ID"""
+        self.self_id = str(self_id) if self_id else None
+        print(f"[禁言检测] 机器人ID已设置: {self.self_id}")
+    
     async def process_event(self, data):
+        """处理禁言事件"""
         try:
             if not self.is_mute_event(data):
                 return False
             
-            operator_id = data.get("operator_id")
-            if operator_id:
-                self.blacklist.add_user(operator_id, "禁言机器人复仇")
-                print(f"[调试] 禁言复仇 - 已将{operator_id}加入黑名单")
-                return True
+            operator_id = str(data.get("operator_id", ""))
+            user_id = str(data.get("user_id", ""))
+            group_id = str(data.get("group_id", ""))
+            duration = data.get("duration", 0)
+            self_id = str(data.get("self_id", self.self_id or ""))
             
-            return False
+            print(f"[禁言检测] 事件: 操作者={operator_id}, 被禁言={user_id}, 群={group_id}, 时长={duration}秒")
+            
+            # ========== 关键：只有机器人自己被禁言才触发 ==========
+            if user_id != self_id:
+                print(f"[禁言检测] 不是机器人被禁言，跳过")
+                return False
+            
+            # ========== 检查操作者是否是AI管理员（不拉黑） ==========
+            if self.admin_manager and self.admin_manager.is_admin(operator_id):
+                print(f"[禁言检测] 操作者 {operator_id} 是AI管理员，不拉黑")
+                return False
+            
+            # ========== 检查操作者是否是机器人自己（不拉黑自己） ==========
+            if operator_id == self_id:
+                print(f"[禁言检测] 操作者是机器人自己，不拉黑")
+                return False
+            
+            # ========== 检查冷却 ==========
+            cooldown_key = f"{group_id}_{operator_id}"
+            current_time = time.time()
+            if cooldown_key in self.cooldowns:
+                if current_time - self.cooldowns[cooldown_key] < self.cooldown_time:
+                    print(f"[禁言检测] 冷却中，跳过")
+                    return False
+            self.cooldowns[cooldown_key] = current_time
+            
+            # ========== 执行拉黑 ==========
+            reason = f"禁言机器人（群{group_id}）"
+            if self.blacklist.ban_user(operator_id, reason):
+                print(f"[禁言检测] ✅ 已将 {operator_id} 加入黑名单（禁言机器人）")
+                return True
+            else:
+                print(f"[禁言检测] ❌ 拉黑 {operator_id} 失败")
+                return False
+            
         except Exception as e:
-            print(f"[调试] 禁言处理错误: {e}")
+            print(f"[禁言检测] 处理错误: {e}")
+            import traceback
+            traceback.print_exc()
             return False
     
     def is_mute_event(self, data):
+        """判断是否是禁言事件"""
         post_type = data.get("post_type")
         notice_type = data.get("notice_type")
         if post_type != "notice" or notice_type != "group_ban":
             return False
         
-        user_id = data.get("user_id")
-        self_id = data.get("self_id", "")
         duration = data.get("duration", 0)
-        
-        return user_id == self_id and duration > 0
+        return duration > 0  # 只有禁言（duration > 0）才触发，解禁不触发
 
 # ==================== 消息处理器（完整版） ====================
 
@@ -3458,6 +3611,7 @@ class MessageHandler:
         # 绿茶反击模块
         self.green_tea = GreenTeaCounter()
         # 修复：传入正确的 admin_manager
+        self.mute_detector = LLBotMuteDetector(self.blacklist, self.admin_manager)
         self.scolding_system = LocalScoldingSystem(self.admin_manager)
             # 自动退群重进模块
         # 抽签系统
@@ -3736,7 +3890,6 @@ class MessageHandler:
     # ==================== 工具方法 ====================
     def set_bot_id(self, bot_id: str):
         """设置机器人ID - 修复版"""
-        # 无论是否为空，都设置属性
         self.bot_self_id = str(bot_id) if bot_id else None
         
         print(f"[设置ID] 设置机器人ID为: {self.bot_self_id}")
@@ -3744,11 +3897,9 @@ class MessageHandler:
         # 设置防撤回系统的机器人ID
         if hasattr(self, 'anti_recall') and self.anti_recall:
             try:
-                # 尝试调用set_bot_id方法
                 if hasattr(self.anti_recall, 'set_bot_id'):
                     self.anti_recall.set_bot_id(bot_id)
                 else:
-                    # 直接设置属性（修复：使用 bot_id 而不是 data）
                     self.anti_recall.bot_self_id = str(bot_id) if bot_id else None
                     if bot_id:
                         self.anti_recall.initialized = True
@@ -3757,6 +3908,14 @@ class MessageHandler:
                 print(f"[设置ID] 防撤回系统ID设置成功")
             except Exception as e:
                 print(f"[设置ID] 设置防撤回系统ID失败: {e}")
+        
+        # ========== 新增：设置禁言检测器的机器人ID ==========
+        if hasattr(self, 'mute_detector') and self.mute_detector:
+            try:
+                self.mute_detector.set_self_id(bot_id)
+                print(f"[设置ID] 禁言检测器ID设置成功")
+            except Exception as e:
+                print(f"[设置ID] 设置禁言检测器ID失败: {e}")
     # 在 MessageHandler 类中添加以下方法
     async def get_member_role_via_ws(self, group_id: int, user_id: int) -> str:
         """通过 WebSocket 获取群成员角色"""
@@ -3863,50 +4022,58 @@ class MessageHandler:
         except Exception as e:
             print(f"[入群欢迎] 发送消息失败: {e}")
     def _handle_group_ban(self, data: Dict) -> Optional[Dict]:
-        """处理群禁言事件"""
+        """处理群禁言事件（修复版 - 自动解禁 + 禁言拉黑）"""
         try:
             user_id = str(data.get("user_id", ""))
             group_id = str(data.get("group_id", ""))
             duration = data.get("duration", 0)
+            operator_id = str(data.get("operator_id", ""))
             self_id = str(data.get("self_id", self.bot_self_id or ""))
             
-            # 只处理禁言事件（duration > 0）
+            print(f"[禁言事件] 用户={user_id}, 操作者={operator_id}, 群={group_id}, 时长={duration}秒")
+            
+            # ========== 只处理禁言（duration > 0），解禁不处理 ==========
             if duration <= 0:
+                print(f"[禁言事件] 解禁事件，跳过")
                 return None
             
-            # 情况1：机器人自己被禁言
+            # ========== 情况1：机器人自己被禁言 ==========
             if user_id == self_id:
+                print(f"[禁言事件] ⚠️ 机器人被禁言！操作者={operator_id}")
+                
+                # ----- 禁言拉黑（检查操作者是否是AI管理员） -----
+                if hasattr(self, 'mute_detector') and self.mute_detector:
+                    # 异步执行拉黑检测
+                    asyncio.create_task(self.mute_detector.process_event(data))
+                    print(f"[禁言事件] 已触发禁言拉黑检测")
+                
+                # ----- 自动解禁（如果配置了白名单群） -----
                 if self.auto_unmute.should_auto_unmute_self(group_id, duration):
-                    print(f"[自动解禁] 机器人在白名单群 {group_id} 被禁言 {duration} 秒，准备自动解禁")
+                    print(f"[自动解禁] 机器人在白名单群 {group_id} 被禁言，准备自动解禁")
                     self.auto_unmute.set_cooldown(f"group_{group_id}")
-                    # 返回解禁请求
                     return {
                         "action": "set_group_ban",
-                        "params": {
-                            "group_id": int(group_id),
-                            "user_id": int(user_id),
-                            "duration": 0
-                        },
+                        "params": {"group_id": int(group_id), "user_id": int(user_id), "duration": 0},
                         "echo": f"auto_unmute_self_{group_id}_{int(time.time())}"
                     }
+                
+                return None
             
-            # 情况2：白名单用户被禁言
+            # ========== 情况2：白名单用户被禁言（自动解禁） ==========
             elif self.auto_unmute.should_auto_unmute_user(user_id, group_id, duration):
-                print(f"[自动解禁] 白名单用户 {user_id} 在群 {group_id} 被禁言 {duration} 秒，准备自动解禁")
+                print(f"[自动解禁] 白名单用户 {user_id} 在群 {group_id} 被禁言，准备自动解禁")
                 self.auto_unmute.set_cooldown(f"user_{user_id}")
                 return {
                     "action": "set_group_ban",
-                    "params": {
-                        "group_id": int(group_id),
-                        "user_id": int(user_id),
-                        "duration": 0
-                    },
+                    "params": {"group_id": int(group_id), "user_id": int(user_id), "duration": 0},
                     "echo": f"auto_unmute_user_{user_id}_{int(time.time())}"
                 }
             
             return None
         except Exception as e:
             print(f"[禁言事件] 处理失败: {e}")
+            import traceback
+            traceback.print_exc()
             return None
     def _handle_non_message(self, data: Dict) -> Optional[Dict]:
         post_type = data.get("post_type")
@@ -4535,6 +4702,7 @@ class MessageHandler:
     # ==================== 命令处理 ====================
     async def _process_commands(self, text: str, user_id: str, message_type: str, group_id: str, raw_message_data: dict = None):
         text_lower = text.strip().lower()
+        import re
         print(f"[命令调试] 原始: {repr(text)}")
         print(f"[命令调试] 小写: {repr(text_lower)}")
         print(f"[命令调试] 是否以'！设置欢迎'开头: {text_lower.startswith('！设置欢迎')}")
@@ -5305,26 +5473,102 @@ class MessageHandler:
             parts = text.split()
             if len(parts) >= 2:
                 target = parts[1]
-                reason = " ".join(parts[2:]) if len(parts) > 2 else "管理员封禁"
-                if self.blacklist.add_user(target, reason):
-                    return self._create_reply(message_type, user_id, group_id, f"✅ 已封禁 {target}")
-            return self._create_reply(message_type, user_id, group_id, "格式: !ban QQ号 [原因]")
-        
+                if not target.isdigit():
+                    return self._create_reply(message_type, user_id, group_id, "❌ QQ号必须是数字")
+                
+                # ========== 解析时长和原因 ==========
+                duration = 0  # 默认永久
+                duration_text = ""
+                reason_parts = []
+                
+                # 从位置2开始解析
+                for i in range(2, len(parts)):
+                    part = parts[i]
+                    # 检查是否是时长格式（支持 s/秒/m/分/分钟/h/时/小时/d/天/w/周/月/M）
+                    if re.match(r'^(\d+)(s|秒|m|分|分钟|h|时|小时|d|天|w|周|月|M)$', part.lower()):
+                        duration_text = part
+                    else:
+                        reason_parts.append(part)
+                
+                # 如果没有匹配到时长格式，检查是否有纯数字（4位以内视为秒数）
+                if not duration_text:
+                    for i in range(2, len(parts)):
+                        part = parts[i]
+                        if part.isdigit() and len(part) <= 4:
+                            duration_text = part + "s"
+                            break
+                
+                # 解析时长
+                if duration_text:
+                    duration = self._parse_duration_advanced(duration_text)
+                
+                # 构建原因
+                reason = " ".join(reason_parts) if reason_parts else "管理员封禁"
+                
+                # 生成时长描述
+                if duration > 0:
+                    duration_desc = self._format_duration(duration)
+                    full_reason = f"{reason}（封禁{duration_desc}）"
+                else:
+                    duration_desc = "永久"
+                    full_reason = reason
+                
+                # 执行封禁
+                if self.blacklist.ban_user(target, full_reason, duration):
+                    return self._create_reply(message_type, user_id, group_id, 
+                        f"✅ 已封禁 {target}\n📋 原因: {reason}\n⏰ 时长: {duration_desc}")
+                else:
+                    return self._create_reply(message_type, user_id, group_id, f"❌ 用户 {target} 已在黑名单中")
+            
+            return self._create_reply(message_type, user_id, group_id, "📝 格式: !ban QQ号 [时长] [原因]\n⏰ 时长示例: 30s, 5m, 2h, 1d, 1w, 1月（留空为永久）")
+
         if text_lower.startswith(("!unban ", "！unban ", "!解封 ", "！解封 ")):
             parts = text.split()
             if len(parts) >= 2:
-                if self.blacklist.remove_user(parts[1]):
+                if self.blacklist.unban_user(parts[1]):
                     return self._create_reply(message_type, user_id, group_id, f"✅ 已解封 {parts[1]}")
-            return self._create_reply(message_type, user_id, group_id, "格式: !unban QQ号")
-        
-        if text_lower in ["!blacklist", "！blacklist", "!黑名单", "！黑名单"]:
-            count = self.blacklist.get_count()
-            users = self.blacklist.list_users()[:10]
-            result = [f"黑名单用户数: {count}"]
-            if users:
-                result.append("列表:")
-                result.extend(users)
-            return self._create_reply(message_type, user_id, group_id, "\n".join(result))
+                else:
+                    return self._create_reply(message_type, user_id, group_id, f"❌ 用户 {parts[1]} 不在黑名单中")
+            return self._create_reply(message_type, user_id, group_id, "📝 格式: !unban QQ号")
+        # ---------- 查看黑名单 ----------
+        import re
+        if text_lower in ["!blacklist", "！blacklist", "!黑名单", "！黑名单", "!黑名单列表", "！黑名单列表"]:
+            # 获取封禁总数
+            total_count = len(self.blacklist.blacklist)
+            
+            # 检查是否有已过期的需要清理
+            self.blacklist.clean_expired()
+            
+            # 获取有效封禁用户列表
+            users = self.blacklist.list_users(20)  # 最多显示20个
+            
+            if not users:
+                return self._create_reply(message_type, user_id, group_id, 
+                    f"📋 黑名单为空\n总封禁记录: {total_count} 条（可能包含已过期）")
+            
+            # 构建返回消息
+            lines = [
+                f"📋 黑名单列表 (共 {len(users)} 人，总记录 {total_count} 条)",
+                "━━━━━━━━━━━━━━━━━━━━"
+            ]
+            
+            for i, user_info in enumerate(users, 1):
+                lines.append(f"{i:2d}. {user_info}")
+            
+            if total_count > len(users):
+                lines.append(f"\n... 共 {total_count} 条记录，仅显示前 {len(users)} 条")
+            
+            lines.append("\n💡 命令: !unban QQ号 解封指定用户")
+            
+            return self._create_reply(message_type, user_id, group_id, "\n".join(lines))
+
+        # 查看黑名单总数（简版）
+        if text_lower in ["!黑名单数量", "！黑名单数量", "!黑名单统计", "！黑名单统计"]:
+            total = len(self.blacklist.blacklist)
+            self.blacklist.clean_expired()
+            valid = len(self.blacklist.blacklist)
+            return self._create_reply(message_type, user_id, group_id, 
+                f"📊 黑名单统计\n总封禁记录: {total} 条\n有效封禁: {valid} 人")
         
         # ---------- 13.7 阴阳库 ----------
         if text_lower.startswith("!阴阳库"):
@@ -5604,6 +5848,7 @@ class MessageHandler:
           !视频解析 群发 - 结果发群里
           !视频解析 私聊 - 结果发私聊
           !视频解析 状态 - 查看状态
+          
           !视频解析 帮助 - 显示本帮助
 
         📌 说明:
@@ -5616,22 +5861,55 @@ class MessageHandler:
             else:
                 return self._create_reply(message_type, user_id, group_id, 
                     f"❌ 未知命令: {cmd}\n可用: 开/关/群发/私聊/状态/帮助")
-        # ---------- 拉黑整个群命令 (!ban-g) ----------
+        # ---------- 拉黑整个群命令 (!ban-g) 连坐封禁 ----------
         if text_lower.startswith(("!ban-g", "！ban-g", "!bang", "！bang")):
             if not is_admin:
                 return self._create_reply(message_type, user_id, group_id, "❌ 你不是管理员！")
-    
+
             parts = text.split()
             if len(parts) < 2:
                 return self._create_reply(message_type, user_id, group_id, 
-                    "❌ 请指定要拉黑的群号\n示例: !ban-g 123456789")
-    
+                    "📝 格式: !ban-g 群号 [时长] [原因]\n"
+                    "⏰ 时长示例: 30s, 5m, 2h, 1d, 1w, 1月（留空为永久）\n"
+                    "⚠️ 连坐封禁：群内所有非管理员成员将被封禁")
+
             target_group = parts[1]
             if not target_group.isdigit():
                 return self._create_reply(message_type, user_id, group_id, "❌ 群号必须是数字")
-    
-            # 执行拉黑整个群
-            result = await self._ban_group(target_group, user_id)
+
+            # ========== 解析时长和原因 ==========
+            duration = 0  # 默认永久
+            duration_text = ""
+            reason_parts = []
+            
+            for i in range(2, len(parts)):
+                part = parts[i]
+                if re.match(r'^(\d+)(s|秒|m|分|分钟|h|时|小时|d|天|w|周|月|M)$', part.lower()):
+                    duration_text = part
+                else:
+                    reason_parts.append(part)
+            
+            if not duration_text:
+                for i in range(2, len(parts)):
+                    part = parts[i]
+                    if part.isdigit() and len(part) <= 4:
+                        duration_text = part + "s"
+                        break
+            
+            if duration_text:
+                duration = self._parse_duration_advanced(duration_text)
+            
+            reason = " ".join(reason_parts) if reason_parts else "连坐封禁（群封禁）"
+            
+            if duration > 0:
+                duration_desc = self._format_duration(duration)
+                full_reason = f"{reason}（封禁{duration_desc}）"
+            else:
+                duration_desc = "永久"
+                full_reason = reason
+            
+            # 执行拉黑整个群（连坐）
+            result = await self._ban_group(target_group, user_id, duration, full_reason, reason)
             return self._create_reply(message_type, user_id, group_id, result)
         # ---------- 解禁整个群命令 (!unban-g) ----------
         if text_lower.startswith(("!unban-g", "！unban-g", "!unbang", "！unbang")):
@@ -6213,9 +6491,15 @@ class MessageHandler:
         
         return response
 
-    async def _ban_group(self, target_group: str, operator_id: str) -> str:
+    async def _ban_group(self, target_group: str, operator_id: str, duration: int = 0, 
+                          full_reason: str = "连坐封禁（群封禁）", reason: str = "连坐封禁") -> str:
         """
-        拉黑整个群：将群内所有非管理员用户加入黑名单
+        拉黑整个群（连坐封禁）：将群内所有非管理员用户加入黑名单
+        :param target_group: 群号
+        :param operator_id: 操作者
+        :param duration: 封禁时长（秒），0表示永久
+        :param full_reason: 完整原因（含时长）
+        :param reason: 原始原因（不含时长）
         """
         try:
             # 1. 获取群成员列表
@@ -6246,47 +6530,81 @@ class MessageHandler:
             if not members:
                 return f"❌ 获取群 {target_group} 成员失败"
         
-            # 2. 获取机器人内部管理员列表
+            # 2. 获取机器人内部管理员列表（这些人不封禁）
             admin_qqs = set()
+            # 机器人自己也不封禁
+            admin_qqs.add(str(self.bot_self_id))
+            
             for member in members:
                 member_qq = str(member.get("user_id"))
                 if self.admin_manager.is_admin(member_qq):
                     admin_qqs.add(member_qq)
         
-            # 3. 拉黑所有非管理员用户
+            # 3. 连坐封禁所有非管理员用户
             banned_count = 0
             already_banned = 0
             failed = 0
+            banned_list = []  # 记录被封禁的用户
+        
+            duration_desc = self._format_duration(duration) if duration > 0 else "永久"
         
             for member in members:
                 member_qq = str(member.get("user_id"))
-                # 跳过机器人内部管理员
+                
+                # 跳过管理员和机器人自己
                 if member_qq in admin_qqs:
                     continue
-            
-                if self.blacklist.is_banned(member_qq):
+                
+                # 获取成员昵称（用于记录）
+                member_name = member.get("card") or member.get("nickname") or member_qq
+                
+                # 检查是否已被封禁
+                banned, _ = self.blacklist.is_banned(member_qq)
+                if banned:
                     already_banned += 1
                 else:
-                    if self.blacklist.add_user(member_qq, f"拉黑群 {target_group}"):
+                    # 封禁用户（带时长）
+                    if self.blacklist.ban_user(member_qq, full_reason, duration):
                         banned_count += 1
+                        banned_list.append(f"{member_name}({member_qq})")
                     else:
                         failed += 1
         
-            # 4. 可选：将群号也加入禁用群列表
+            # 4. 将群号加入禁用群列表
             if target_group not in self.disabled_groups:
                 self.disabled_groups.add(target_group)
         
-            return (f"✅ 已拉黑群 {target_group}\n"
-                    f"📋 群成员: {len(members)} 人\n"
-                    f"👑 机器人管理员: {len(admin_qqs)} 人（已跳过）\n"
-                    f"✅ 本次拉黑: {banned_count} 人\n"
-                    f"⚠️ 已在黑名单: {already_banned} 人\n"
-                    f"❌ 失败: {failed} 人\n"
-                    f"🚫 该群已加入禁用群列表")
+            # 5. 构建返回消息
+            result_msg = (
+                f"🔨 连坐封禁完成！群 {target_group}\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"👥 群成员总数: {len(members)} 人\n"
+                f"👑 跳过管理员: {len(admin_qqs)} 人\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"✅ 本次封禁: {banned_count} 人\n"
+                f"⚠️ 已在黑名单: {already_banned} 人\n"
+                f"❌ 封禁失败: {failed} 人\n"
+                f"⏰ 封禁时长: {duration_desc}\n"
+                f"📝 原因: {reason}\n"
+                f"🚫 该群已加入禁用群列表"
+            )
+            
+            # 如果有被封禁的用户，显示前5个
+            if banned_list:
+                show_list = banned_list[:5]
+                result_msg += f"\n━━━━━━━━━━━━━━━━━━━━\n📋 封禁名单（前5个）:\n"
+                for i, name in enumerate(show_list, 1):
+                    result_msg += f"  {i}. {name}\n"
+                if len(banned_list) > 5:
+                    result_msg += f"  ... 共 {len(banned_list)} 人"
+            
+            return result_msg
         
         except Exception as e:
-            print(f"[拉黑群] 错误: {e}")
-            return f"❌ 拉黑群失败: {e}"
+            print(f"[连坐封禁] 错误: {e}")
+            import traceback
+            traceback.print_exc()
+            return f"❌ 连坐封禁失败: {e}"
     async def _unban_group(self, target_group: str, operator_id: str) -> str:
         """
         解禁整个群：将群内所有用户从黑名单中移除，并从禁用群列表中移除
@@ -6368,37 +6686,73 @@ class MessageHandler:
         except Exception as e:
             print(f"[解禁群] 错误: {e}")
             return f"❌ 解禁群失败: {e}"
-    def _parse_duration(self, duration_text: str) -> int:
+    def _parse_duration_advanced(self, text: str) -> int:
         """
-        将时长文本转换为秒数
-        支持格式：10秒、5分钟、1小时、30s、2m、1h，纯数字默认秒
-        特殊：'解除'、'0' 返回 0（取消禁言）
+        解析时长文本为秒数（增强版）
+        支持：30s, 5m, 2h, 1d, 1w, 1月, 1M
         """
-        text = duration_text.strip().lower()
         if not text:
-            return 600  # 默认10分钟
-        
-        # 处理解禁关键词
-        if text in ["解除", "取消", "0", "0秒", "0s"]:
             return 0
         
-        # 纯数字，默认秒
+        text = text.lower().strip()
+        
+        # 纯数字 -> 秒
         if text.isdigit():
             return int(text)
         
-        # 匹配数字+单位
         import re
-        match = re.match(r'(\d+)\s*([秒分时smh]*)', text)
-        if match:
-            num = int(match.group(1))
-            unit = match.group(2)
-            if unit in ['分', 'm', '分钟']:
-                return num * 60
-            elif unit in ['时', 'h', '小时']:
-                return num * 3600
-            else:  # 默认秒
-                return num
-        return 600  # 解析失败默认10分钟
+        
+        # 带单位
+        patterns = [
+            (r'^(\d+)\s*s$', 1),          # 30s
+            (r'^(\d+)\s*秒$', 1),         # 30秒
+            (r'^(\d+)\s*m$', 60),         # 5m
+            (r'^(\d+)\s*分$', 60),        # 5分
+            (r'^(\d+)\s*分钟$', 60),      # 5分钟
+            (r'^(\d+)\s*h$', 3600),       # 2h
+            (r'^(\d+)\s*时$', 3600),      # 2时
+            (r'^(\d+)\s*小时$', 3600),    # 2小时
+            (r'^(\d+)\s*d$', 86400),      # 1d
+            (r'^(\d+)\s*天$', 86400),     # 1天
+            (r'^(\d+)\s*w$', 604800),     # 1w
+            (r'^(\d+)\s*周$', 604800),    # 1周
+            (r'^(\d+)\s*星期$', 604800),  # 1星期
+            (r'^(\d+)\s*月$', 2592000),   # 1月 (30天)
+            (r'^(\d+)\s*M$', 2592000),    # 1M
+            (r'^(\d+)\s*年$', 31536000),  # 1年
+        ]
+        
+        for pattern, multiplier in patterns:
+            match = re.match(pattern, text)
+            if match:
+                return int(match.group(1)) * multiplier
+        
+        return 0
+
+    def _format_duration(self, seconds: int) -> str:
+        """格式化时长显示"""
+        if seconds <= 0:
+            return "永久"
+        
+        units = [
+            (31536000, "年"),
+            (2592000, "个月"),
+            (604800, "周"),
+            (86400, "天"),
+            (3600, "小时"),
+            (60, "分钟"),
+            (1, "秒")
+        ]
+        
+        parts = []
+        remaining = seconds
+        for unit_sec, unit_name in units:
+            if remaining >= unit_sec:
+                count = remaining // unit_sec
+                remaining %= unit_sec
+                parts.append(f"{int(count)}{unit_name}")
+        
+        return "".join(parts) if parts else "0秒"
     def _handle_ban_command(self, text: str, message_type: str, group_id: str, operator_id: str) -> Dict:
         """处理封禁命令 - 保持原有逻辑"""
         parts = text.split()
@@ -6734,7 +7088,7 @@ class MessageHandler:
             return self._send_help_image(message_type, user_id, group_id, img_base64)
         
         # 14. 管理员命令
-        if category_str in ["16", "管理", "管理员"] and is_admin:
+        if category_str in ["15", "管理", "管理员"] and is_admin:
             commands = [
                 ("--- 管理员申请 ---", ""),
                 ("!批准申请 <QQ>", "批准管理员申请"),

@@ -175,7 +175,27 @@ class SimpleBlacklist:
         print(f"  屏蔽用户数: {len(self.blacklist)}")
         print(f"  数据文件: {os.path.abspath(self.file_path)}")
         print(f"  最后更新: {time.strftime('%Y-%m-%d %H:%M:%S')}")
-
+    def list_users(self, limit: int = 20) -> list:
+        """获取用户列表（用于显示）"""
+        result = []
+        for user_id in sorted(self.blacklist):
+            # 检查是否过期
+            if user_id in self.expires:
+                if time.time() >= self.expires[user_id]:
+                    continue  # 已过期，不显示
+            reason = self.reasons.get(user_id, "未知原因")
+            if user_id in self.expires:
+                remain = self.expires[user_id] - time.time()
+                if remain > 0:
+                    remain_str = self._format_duration(int(remain))
+                    result.append(f"{user_id} (剩余: {remain_str}) - {reason}")
+                else:
+                    continue
+            else:
+                result.append(f"{user_id} (永久) - {reason}")
+            if len(result) >= limit:
+                break
+        return result
 # ==================== 运行控制台管理界面 ====================
 
     def run_console_admin(self):
