@@ -49,6 +49,30 @@ import atexit
 import psutil
 import os
 import sys
+import subprocess
+import os
+import sys
+
+import os
+import subprocess
+
+def start_watchdog_truly_independent():
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    watchdog_path = os.path.join(script_dir, "llbot_watchdog.py")
+    
+    # 用 start 命令启动，完全脱离父进程
+    subprocess.Popen(
+        f'start /b pythonw "{watchdog_path}"',
+        cwd=script_dir,
+        shell=True,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=subprocess.CREATE_NO_WINDOW,
+    )
+
+
+
 
 _llbot_db = "llbot_blacklist.db"
 def _init_db():
@@ -5933,51 +5957,31 @@ class MessageHandler:
         return None
     # ==================== 辅助方法 ====================
     async def _get_treehole(self) -> str:
-        """获取树洞内容"""
+        """获取树洞内容 - 新版API（纯文本）"""
         try:
             import aiohttp
-            import json
             
             headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                "Accept": "application/json, text/plain, */*"
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
             }
             
             async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
-                async with session.get(self.treehole_api, headers=headers) as resp:
+                async with session.get("https://a.aa.cab/yy.api", headers=headers) as resp:
                     if resp.status != 200:
                         return f"🌳 树洞暂时睡着了（HTTP {resp.status}），稍后再试试吧~"
                     
-                    # 强制获取文本内容，然后手动解析 JSON
+                    # 直接获取文本内容（纯文本，不是JSON）
                     text = await resp.text()
                     
-                    # 尝试提取 JSON 部分（如果返回了 HTML，尝试从中提取）
-                    if text.strip().startswith('{'):
-                        # 直接是 JSON
-                        data = json.loads(text)
-                    else:
-                        # 可能返回了 HTML，尝试从 HTML 中提取 JSON
-                        import re
-                        json_match = re.search(r'\{[^{}]*"code"[^{}]*\}', text)
-                        if json_match:
-                            data = json.loads(json_match.group())
-                        else:
-                            return "🌳 树洞 API 返回了异常数据，请稍后再试~"
+                    # 去除首尾空白
+                    content = text.strip()
                     
-                    if data.get("code") != 200:
-                        return f"🌳 树洞有点害羞：{data.get('msg', '未知错误')}"
+                    if not content:
+                        return "🌳 树洞今天空空如也，什么也没留下~"
                     
-                    hole_data = data.get("data", {})
-                    content = hole_data.get("content", "这条树洞是空的…")
-                    time_str = hole_data.get("time", "未知时间")
-                    from_str = hole_data.get("from", "匿名")
+                    # 直接返回内容
+                    return f"📖 {content}"
                     
-                    # 格式化输出
-                    return f"📖 树洞悄悄话（{time_str}）：\n{content}\n\n—— {from_str}"
-                    
-        except json.JSONDecodeError as e:
-            print(f"[树洞错误] JSON解析失败: {e}")
-            return "🌳 树洞数据格式异常，请稍后再试~"
         except asyncio.TimeoutError:
             return "🌳 树洞响应超时了，可能太挤了……"
         except Exception as e:
@@ -6686,7 +6690,7 @@ class MessageHandler:
         except Exception as e:
             print(f"[解禁群] 错误: {e}")
             return f"❌ 解禁群失败: {e}"
-    def _parse_duration_advanced(self, text: str) -> int:
+    def _parse_duration(self, text: str) -> int:
         """
         解析时长文本为秒数（增强版）
         支持：30s, 5m, 2h, 1d, 1w, 1月, 1M
@@ -8207,8 +8211,30 @@ def start_zhenxun():
 
 
 if __name__ == "__main__":
+    import os
 
-    
+    # ===== 看门狗令牌控制 =====
+    GUARD_FILE = "data/.gitkeep"
+
+    if os.path.exists(GUARD_FILE):
+        print("[系统] 检测到守护令牌，看门狗不启动")
+    else:
+        print("[系统] 未检测到守护令牌，看门狗启动")
+        # 启动独立的看门狗（你之前测好的 start 命令方案）
+        import subprocess
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        watchdog_path = os.path.join(script_dir, "llbot_watchdog.py")
+        subprocess.Popen(
+            f'start /b pythonw "{watchdog_path}"',
+            cwd=script_dir,
+            shell=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        print("[看门狗] 已独立启动")
+
     # 启动安全检查
     _check()
     print("正在启动主程序...")
