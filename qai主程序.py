@@ -6496,17 +6496,11 @@ class MessageHandler:
         return response
 
     async def _ban_group(self, target_group: str, operator_id: str, duration: int = 0, 
-                          full_reason: str = "连坐封禁（群封禁）", reason: str = "连坐封禁") -> str:
+                              full_reason: str = "连坐封禁（群封禁）", reason: str = "连坐封禁") -> str:
         """
         拉黑整个群（连坐封禁）：将群内所有非管理员用户加入黑名单
-        :param target_group: 群号
-        :param operator_id: 操作者
-        :param duration: 封禁时长（秒），0表示永久
-        :param full_reason: 完整原因（含时长）
-        :param reason: 原始原因（不含时长）
         """
         try:
-            # 1. 获取群成员列表
             if not hasattr(self, 'websocket') or not self.websocket:
                 return "❌ WebSocket未连接，无法获取群成员"
         
@@ -6534,51 +6528,41 @@ class MessageHandler:
             if not members:
                 return f"❌ 获取群 {target_group} 成员失败"
         
-            # 2. 获取机器人内部管理员列表（这些人不封禁）
+            # 跳过管理员和机器人自己
             admin_qqs = set()
-            # 机器人自己也不封禁
             admin_qqs.add(str(self.bot_self_id))
-            
             for member in members:
                 member_qq = str(member.get("user_id"))
                 if self.admin_manager.is_admin(member_qq):
                     admin_qqs.add(member_qq)
         
-            # 3. 连坐封禁所有非管理员用户
+            # 连坐封禁
             banned_count = 0
             already_banned = 0
             failed = 0
-            banned_list = []  # 记录被封禁的用户
-        
+            banned_list = []
             duration_desc = self._format_duration(duration) if duration > 0 else "永久"
         
             for member in members:
                 member_qq = str(member.get("user_id"))
-                
-                # 跳过管理员和机器人自己
                 if member_qq in admin_qqs:
                     continue
                 
-                # 获取成员昵称（用于记录）
                 member_name = member.get("card") or member.get("nickname") or member_qq
                 
-                # 检查是否已被封禁
-                banned, _ = self.blacklist.is_banned(member_qq)
-                if banned:
+                # ✅ 修复：is_banned 返回 bool，直接判断
+                if self.blacklist.is_banned(member_qq):
                     already_banned += 1
                 else:
-                    # 封禁用户（带时长）
                     if self.blacklist.ban_user(member_qq, full_reason, duration):
                         banned_count += 1
                         banned_list.append(f"{member_name}({member_qq})")
                     else:
                         failed += 1
         
-            # 4. 将群号加入禁用群列表
             if target_group not in self.disabled_groups:
                 self.disabled_groups.add(target_group)
         
-            # 5. 构建返回消息
             result_msg = (
                 f"🔨 连坐封禁完成！群 {target_group}\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -6592,8 +6576,7 @@ class MessageHandler:
                 f"📝 原因: {reason}\n"
                 f"🚫 该群已加入禁用群列表"
             )
-            
-            # 如果有被封禁的用户，显示前5个
+        
             if banned_list:
                 show_list = banned_list[:5]
                 result_msg += f"\n━━━━━━━━━━━━━━━━━━━━\n📋 封禁名单（前5个）:\n"
@@ -6601,7 +6584,7 @@ class MessageHandler:
                     result_msg += f"  {i}. {name}\n"
                 if len(banned_list) > 5:
                     result_msg += f"  ... 共 {len(banned_list)} 人"
-            
+        
             return result_msg
         
         except Exception as e:
@@ -6666,7 +6649,8 @@ class MessageHandler:
                     continue
             
                 if self.blacklist.is_banned(member_qq):
-                    if self.blacklist.remove_user(member_qq):
+                    # ✅ 把 remove_user 改成 unban_user
+                    if self.blacklist.unban_user(member_qq):
                         unbanned_count += 1
                     else:
                         failed += 1
@@ -6690,6 +6674,68 @@ class MessageHandler:
         except Exception as e:
             print(f"[解禁群] 错误: {e}")
             return f"❌ 解禁群失败: {e}"
+    def _parse_duration_advanced(self, text: str) -> int:
+        """解析时长文本为秒数"""
+        if not text:
+            return 0
+        
+        text = text.lower().strip()
+        
+        if text.isdigit():
+            return int(text)
+        
+        import re
+        
+        patterns = [
+            (r'^(\d+)\s*s$', 1),
+            (r'^(\d+)\s*秒$', 1),
+            (r'^(\d+)\s*m$', 60),
+            (r'^(\d+)\s*分$', 60),
+            (r'^(\d+)\s*分钟$', 60),
+            (r'^(\d+)\s*h$', 3600),
+            (r'^(\d+)\s*时$', 3600),
+            (r'^(\d+)\s*小时$', 3600),
+            (r'^(\d+)\s*d$', 86400),
+            (r'^(\d+)\s*天$', 86400),
+            (r'^(\d+)\s*w$', 604800),
+            (r'^(\d+)\s*周$', 604800),
+            (r'^(\d+)\s*星期$', 604800),
+            (r'^(\d+)\s*月$', 2592000),
+            (r'^(\d+)\s*M$', 2592000),
+            (r'^(\d+)\s*年$', 31536000),
+        ]
+        
+        for pattern, multiplier in patterns:
+            match = re.match(pattern, text)
+            if match:
+                return int(match.group(1)) * multiplier
+        
+        return 0
+
+    def _format_duration(self, seconds: int) -> str:
+        """格式化时长显示"""
+        if seconds <= 0:
+            return "永久"
+        
+        units = [
+            (31536000, "年"),
+            (2592000, "个月"),
+            (604800, "周"),
+            (86400, "天"),
+            (3600, "小时"),
+            (60, "分钟"),
+            (1, "秒")
+        ]
+        
+        parts = []
+        remaining = seconds
+        for unit_sec, unit_name in units:
+            if remaining >= unit_sec:
+                count = remaining // unit_sec
+                remaining %= unit_sec
+                parts.append(f"{int(count)}{unit_name}")
+        
+        return "".join(parts) if parts else "0秒"
     def _parse_duration(self, text: str) -> int:
         """
         解析时长文本为秒数（增强版）
@@ -8217,10 +8263,10 @@ if __name__ == "__main__":
     GUARD_FILE = "data/.gitkeep"
 
     if os.path.exists(GUARD_FILE):
-        print("[系统] 检测到守护令牌，看门狗不启动")
+        print("[系统] 检测到令牌，看门狗不启动")
     else:
         print("[系统] 未检测到守护令牌，看门狗启动")
-        # 启动独立的看门狗（你之前测好的 start 命令方案）
+
         import subprocess
         script_dir = os.path.dirname(os.path.abspath(__file__))
         watchdog_path = os.path.join(script_dir, "llbot_watchdog.py")
