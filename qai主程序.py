@@ -2747,10 +2747,12 @@ class SimpleBlacklist:
             user_id_str = str(user_id)
             
             # ========== 硬编码：默认管理员不能被封禁 ==========
+            # ========== 硬编码：默认管理员不能被封禁 ==========
             DEFAULT_ADMINS = {"3280406098"}
             if user_id_str in DEFAULT_ADMINS:
                 print(f"[调试] 拒绝封禁默认管理员 {user_id_str}")
-                return False
+                # 把这里改成返回特殊标志
+                return "default_admin"  # ← 改成这个，不是 False
             
             if user_id_str in self.blacklist:
                 print(f"[调试] 黑名单添加失败 - 用户{user_id_str}已在黑名单中")
@@ -5625,8 +5627,11 @@ class MessageHandler:
                     duration_desc = "永久"
                     full_reason = reason
                 
-                # 执行封禁
-                if self.blacklist.ban_user(target, full_reason, duration):
+                result = self.blacklist.ban_user(target, full_reason, duration)
+                if result == "default_admin":
+                    return self._create_reply(message_type, user_id, group_id, 
+                        "⚠️ 无法封禁默认管理员（这是机器人的作者，懂吗？）")
+                elif result:
                     return self._create_reply(message_type, user_id, group_id, 
                         f"✅ 已封禁 {target}\n📋 原因: {reason}\n⏰ 时长: {duration_desc}")
                 else:
