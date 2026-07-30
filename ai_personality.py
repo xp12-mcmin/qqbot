@@ -361,7 +361,9 @@ class AIPersonality:
         print(f"[AI性格] 处罚规则: 1-2次提醒, 3次警告, 4次严重警告, 5次拉黑")
         print(f"[AI性格] 全局默认: {self.get_personality_name(self.global_default)}")
         print(f"[AI性格] 已设置独立性格的群: {len(self.group_personalities)}个")
-    
+    def check_message(self, message: str, user_id: str, group_id: str = None) -> Tuple[bool, str]:
+        """兼容主程序调用的方法，直接调用 check_sensitive_message"""
+        return self.check_sensitive_message(message, user_id, group_id)
     def _load_config(self):
         try:
             if os.path.exists(self.config_file):
