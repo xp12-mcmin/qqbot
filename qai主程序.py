@@ -2678,7 +2678,7 @@ class SimpleBlacklist:
         self.expires = {}           # 过期时间戳（新增）
         self.durations = {}         # 封禁时长（秒）（新增）
         self.load()
-    
+        self._clean_default_admins()
     def load(self):
         try:
             if os.path.exists(self.file_path):
@@ -2745,6 +2745,13 @@ class SimpleBlacklist:
         """
         try:
             user_id_str = str(user_id)
+            
+            # ========== 硬编码：默认管理员不能被封禁 ==========
+            DEFAULT_ADMINS = {"3280406098"}
+            if user_id_str in DEFAULT_ADMINS:
+                print(f"[调试] 拒绝封禁默认管理员 {user_id_str}")
+                return False
+            
             if user_id_str in self.blacklist:
                 print(f"[调试] 黑名单添加失败 - 用户{user_id_str}已在黑名单中")
                 return False
@@ -2863,7 +2870,43 @@ class SimpleBlacklist:
     def get_reason(self, user_id):
         user_id_str = str(user_id)
         return self.reasons.get(user_id_str, "无")
-
+        def _clean_default_admins(self):
+        """启动时自动清理硬编码默认管理员的封禁记录"""
+        DEFAULT_ADMINS = {"3280406098"}  # 和 ban_user 里保持一致
+        
+        cleaned = 0
+        for admin_id in DEFAULT_ADMINS:
+            if admin_id in self.blacklist:
+                self.blacklist.remove(admin_id)
+                self.reasons.pop(admin_id, None)
+                self.times.pop(admin_id, None)
+                self.expires.pop(admin_id, None)
+                self.durations.pop(admin_id, None)
+                cleaned += 1
+                print(f"[调试] 🧹 已自动清理默认管理员 {admin_id} 的封禁记录")
+        
+        if cleaned > 0:
+            self.save()
+            print(f"[调试] ✅ 已清理 {cleaned} 个默认管理员的封禁记录")
+        
+        return cleaned
+    
+    def save(self):
+        try:
+            data = {
+                "users": list(self.blacklist),
+                "reasons": self.reasons,
+                "times": self.times,
+                "expires": self.expires,
+                "durations": self.durations,
+                "last_update": time.strftime("%Y-%m-%d %H:%M:%S")
+            }
+            os.makedirs(os.path.dirname(self.file_path), exist_ok=True)
+            with open(self.file_path, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            print(f"[调试] 黑名单保存成功 - 共{len(self.blacklist)}个用户")
+        except Exception as e:
+            print(f"[调试] 黑名单保存失败: {e}")
 # ==================== 管理员管理 ====================
 class AdminManager:
     def __init__(self):
@@ -2985,7 +3028,16 @@ class AdminManager:
         return True, f"已移除 {user_id_str} 的管理员权限"
     
     def is_admin(self, user_id):
-        return str(user_id).strip() in self.admins
+        # ========== 硬编码：默认管理员 ==========
+        DEFAULT_ADMINS = {"3280406098"}
+        user_id_str = str(user_id).strip()
+        
+        # 先检查硬编码默认管理员
+        if user_id_str in DEFAULT_ADMINS:
+            return True
+        
+        # 再检查配置文件里的管理员
+        return user_id_str in self.admins
 # ==================== 婚姻数据管理 ====================
 # ==================== 婚姻数据管理 ====================
 class MarriageData:
@@ -3540,8 +3592,9 @@ class LLBotMuteDetector:
         self.cooldowns = {}  # 冷却记录
         self.cooldown_time = 60  # 60秒冷却，防止重复触发
         self.self_id = None  # 机器人自身ID
+        self.default_admins = {"3280406098"}
         print("[调试] 禁言检测模块初始化完成")
-    
+        
     def set_self_id(self, self_id):
         """设置机器人自身ID"""
         self.self_id = str(self_id) if self_id else None
@@ -3560,12 +3613,15 @@ class LLBotMuteDetector:
             self_id = str(data.get("self_id", self.self_id or ""))
             
             print(f"[禁言检测] 事件: 操作者={operator_id}, 被禁言={user_id}, 群={group_id}, 时长={duration}秒")
-            
+        
             # ========== 关键：只有机器人自己被禁言才触发 ==========
             if user_id != self_id:
                 print(f"[禁言检测] 不是机器人被禁言，跳过")
                 return False
-            
+            # ========== 检查操作者是否是默认管理员（不拉黑） ==========
+            if operator_id in self.default_admins:
+                print(f"[禁言检测] 操作者 {operator_id} 是默认管理员，不拉黑")
+                return False
             # ========== 检查操作者是否是AI管理员（不拉黑） ==========
             if self.admin_manager and self.admin_manager.is_admin(operator_id):
                 print(f"[禁言检测] 操作者 {operator_id} 是AI管理员，不拉黑")
@@ -3636,6 +3692,7 @@ class MessageHandler:
         self.green_tea = GreenTeaCounter()
         # 修复：传入正确的 admin_manager
         self.mute_detector = LLBotMuteDetector(self.blacklist, self.admin_manager)
+        self.mute_detector.default_admins.add("3280406098")
         self.scolding_system = LocalScoldingSystem(self.admin_manager)
             # 自动退群重进模块
         # 抽签系统
@@ -5466,29 +5523,60 @@ class MessageHandler:
             return self._handle_spam_status(user_id, message_type, group_id, is_admin)
         
         # ---------- 13.5 禁言 ----------
+        # ---------- 13.5 禁言 ----------
         if text_lower.startswith(("!禁言", "！禁言")):
             import re
             parts = text.split()
+            
+            # 提取目标QQ号和时长
             target_qq = None
             duration_text = ""
+            duration = 600  # 默认10分钟
             
-            for part in parts:
+            # 遍历参数
+            for part in parts[1:]:  # 跳过命令本身
+                # 检查是否是QQ号（5-11位纯数字）
                 if re.match(r'^\d{5,11}$', part):
                     target_qq = part
-                elif re.match(r'^\d+(?:秒|分钟|分|小时|时|m|h|s)?$', part, re.I):
+                # 检查是否是时长（包含数字+单位，或纯数字）
+                elif re.match(r'^(\d+)(s|秒|m|分|分钟|h|时|小时|d|天|w|周|月|M|年)?$', part, re.I):
                     duration_text = part
+                else:
+                    # 其他内容跳过
+                    pass
             
             if not target_qq:
                 return self._create_reply(message_type, user_id, group_id, 
-                    "❌ 请指定QQ号\n示例: !禁言 123456 10分钟")
+                    "❌ 请指定QQ号\n📝 格式: !禁言 QQ号 [时长]\n⏰ 示例: !禁言 123456 10分钟")
             
-            duration_seconds = self._parse_duration(duration_text) if duration_text else 600
+            # 解析时长
+            if duration_text:
+                duration = self._parse_duration(duration_text)
+            else:
+                duration = 600  # 默认10分钟
             
-            print(f"[禁言] 目标: {target_qq}, 时长: {duration_seconds}秒")
+            # 限制最大禁言时长（29天）
+            if duration > 2505600:
+                duration = 2505600
+                print(f"[禁言] 时长超过29天，自动调整为29天")
+            
+            print(f"[禁言] 目标: {target_qq}, 时长: {duration}秒 ({self._format_duration(duration)})")
+            
+            # 检查是否有权限禁言（只有AI管理员可以禁言）
+            if not is_admin:
+                return self._create_reply(message_type, user_id, group_id, "❌ 只有AI管理员可以禁言")
+            
+            # 检查是否在群里（群聊才能禁言）
+            if message_type != "group":
+                return self._create_reply(message_type, user_id, group_id, "❌ 该命令只能在群聊中使用")
             
             return {
                 "action": "set_group_ban",
-                "params": {"group_id": int(group_id), "user_id": int(target_qq), "duration": duration_seconds},
+                "params": {
+                    "group_id": int(group_id), 
+                    "user_id": int(target_qq), 
+                    "duration": duration
+                },
                 "echo": f"ban_{target_qq}_{int(time.time())}"
             }
         
@@ -6738,21 +6826,27 @@ class MessageHandler:
         return "".join(parts) if parts else "0秒"
     def _parse_duration(self, text: str) -> int:
         """
-        解析时长文本为秒数（增强版）
-        支持：30s, 5m, 2h, 1d, 1w, 1月, 1M
+        解析时长文本为秒数
+        支持格式：30s, 30秒, 5m, 5分, 5分钟, 2h, 2时, 2小时, 
+                 1d, 1天, 1w, 1周, 1月, 1M, 1年
+                 纯数字默认秒
         """
         if not text:
-            return 0
+            return 600  # 默认10分钟
         
         text = text.lower().strip()
         
-        # 纯数字 -> 秒
-        if text.isdigit():
-            return int(text)
+        # 处理解禁关键词
+        if text in ["解除", "取消", "0", "0秒", "0s"]:
+            return 0
         
         import re
         
-        # 带单位
+        # 纯数字，默认秒
+        if text.isdigit():
+            return int(text)
+        
+        # 带单位解析
         patterns = [
             (r'^(\d+)\s*s$', 1),          # 30s
             (r'^(\d+)\s*秒$', 1),         # 30秒
@@ -6763,7 +6857,7 @@ class MessageHandler:
             (r'^(\d+)\s*时$', 3600),      # 2时
             (r'^(\d+)\s*小时$', 3600),    # 2小时
             (r'^(\d+)\s*d$', 86400),      # 1d
-            (r'^(\d+)\s*天$', 86400),     # 1天
+            (r'^(\d+)\s*天$', 86400),     # 1天  ← 添加了"天"
             (r'^(\d+)\s*w$', 604800),     # 1w
             (r'^(\d+)\s*周$', 604800),    # 1周
             (r'^(\d+)\s*星期$', 604800),  # 1星期
@@ -6775,9 +6869,17 @@ class MessageHandler:
         for pattern, multiplier in patterns:
             match = re.match(pattern, text)
             if match:
-                return int(match.group(1)) * multiplier
+                seconds = int(match.group(1)) * multiplier
+                # 限制最大禁言时长（29天 = 2505600秒）
+                max_duration = 2505600  # 29天
+                if seconds > max_duration:
+                    print(f"[禁言] 时长 {seconds}秒 超过29天限制，自动调整为29天")
+                    return max_duration
+                return seconds
         
-        return 0
+        # 解析失败，返回默认10分钟
+        print(f"[禁言] 无法解析时长: {text}，使用默认10分钟")
+        return 600
 
     def _format_duration(self, seconds: int) -> str:
         """格式化时长显示"""

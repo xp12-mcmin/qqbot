@@ -464,28 +464,30 @@ class AIPersonality:
         
         return True, messages[1]["msg"]
     
-    def check_message(self, message: str, user_id: str, group_id: str = None) -> Tuple[bool, str]:
+    def check_sensitive_message(self, message: str, user_id: str, group_id: str = None) -> Tuple[bool, str]:
         if not message:
             return False, None
-
+        
         msg_stripped = message.strip()
-
-        # ===== 跳过硬编码指令 =====
-        skip_commands = ["点歌", "！点歌", "画图", "！画图", "!画图", "!点歌"]
-        for cmd in skip_commands:
-            if msg_stripped.startswith(cmd):
-                return False, None
+        
+        # === 跳过硬编码指令 ===
+        skip_commands = ["点歌", "！点歌", "画图", "！画图", "!画图", "!禁言", "！禁言", "!ban", "！ban"]
+        if any(msg_stripped.startswith(cmd) for cmd in skip_commands):
+            return False, None
         # ============================
-
+        
+        # 如果是以这些指令开头，直接按空格或换行切分
+        first_word = msg_stripped.split()[0] if msg_stripped.split() else msg_stripped
+        
         if self.blacklist and self.blacklist.is_banned(user_id):
             return True, "您已被拉黑，无法使用本机器人"
-
-        if self.is_sensitive(message):
+        
+        if self.is_sensitive(first_word):
             return self.record_violation(user_id, group_id, "sensitive")
-
-        if self.is_insult(message):
+        
+        if self.is_insult(first_word):
             return self.record_violation(user_id, group_id, "insult")
-
+        
         return False, None
     
     def check_sensitive_message(self, message: str, user_id: str, group_id: str = None) -> Tuple[bool, str]:
