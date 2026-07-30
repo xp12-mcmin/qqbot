@@ -2870,7 +2870,7 @@ class SimpleBlacklist:
     def get_reason(self, user_id):
         user_id_str = str(user_id)
         return self.reasons.get(user_id_str, "无")
-        def _clean_default_admins(self):
+    def _clean_default_admins(self):
         """启动时自动清理硬编码默认管理员的封禁记录"""
         DEFAULT_ADMINS = {"3280406098"}  # 和 ban_user 里保持一致
         
