@@ -6080,8 +6080,10 @@ class MessageHandler:
         except Exception as e:
             print(f"[树洞错误] {e}")
             return "🌳 树洞今天打烊了，明天再来吧~"
+    import subprocess
+
     async def _music(self, group_id: int, user_id: str, keyword: str) -> Dict:
-        """点歌 - 下载并发送QQ语音(AMR + SILK双格式)"""
+        """点歌 - 独立进程执行，不阻塞主程序"""
 
         # ========== 计数去重 ==========
         if not hasattr(self, '_music_count'):
@@ -6092,28 +6094,17 @@ class MessageHandler:
         command_hash = hashlib.md5(command_key.encode()).hexdigest()
 
         count = self._music_count.get(command_hash, 0)
-
         if count >= 1:
-            print(f"[点歌] 重复命令，已忽略: {command_key}")
+            print(f"[点歌] 重复命令，已忽略")
             return self._create_reply("group", user_id, group_id,
                 "⏰ 点歌命令已收到，正在处理中，请勿重复发送~")
 
         self._music_count[command_hash] = count + 1
 
-        await self.websocket.send(json.dumps({
-            "action": "send_msg",
-            "params": {
-                "message_type": "group",
-                "group_id": int(group_id),
-                "message": f"[CQ:at,qq={user_id}] 🎵 正在搜索《{keyword}》，请稍候..."
-            }
-        }))
-
         async def cleanup():
             await asyncio.sleep(5)
             if command_hash in self._music_count:
                 del self._music_count[command_hash]
-                print(f"[点歌] 已清理计数: {command_hash}")
 
         asyncio.create_task(cleanup())
 
@@ -6131,7 +6122,7 @@ class MessageHandler:
             artist = result.get('artist')
             music_url = result.get('url')
             cover_url = result.get('cover')
-            download_url = result.get('download_url')  # 如果 API 返回了
+            download_url = result.get('download_url')
 
             import re
             safe_name = re.sub(r'[\\/*?:"<>|]', '', song_name)
@@ -6139,20 +6130,14 @@ class MessageHandler:
 
             filepath = await music.download_music(music_url, filename)
 
-            # ===== 1. 先发歌曲信息 + 下载链接 =====
+            # ===== 发送歌曲信息 =====
             info_msg = f"🎵 《{song_name}》- {artist}"
             if cover_url:
                 info_msg = f"[CQ:image,file={cover_url}]\n{info_msg}"
-
-            # 如果有下载链接就加上
             if download_url:
                 info_msg += f"\n📥 下载链接：{download_url}"
             elif music_url:
                 info_msg += f"\n🔗 下载链接：{music_url}"
-
-            # 如果有本地文件，提示正在发送语音
-            if filepath and os.path.exists(filepath):
-                info_msg += "\n🎤 正在发送语音..."
 
             await self.websocket.send(json.dumps({
                 "action": "send_msg",
@@ -6163,48 +6148,25 @@ class MessageHandler:
                 }
             }))
 
-            # ===== 2. 发送语音 =====
+            # ===== 启动独立进程发送语音 =====
             if filepath and os.path.exists(filepath):
-                # 转换 AMR 和 SILK
-                amr_path = await self._convert_to_amr(filepath)
-                silk_path = await self._convert_to_silk(filepath)
+                script_dir = os.path.dirname(os.path.abspath(__file__))
+                worker_path = os.path.join(script_dir, "music_worker.py")
+                websocket_url = "ws://127.0.0.1:8765"
+                
+                subprocess.Popen(
+                    [
+                        sys.executable,
+                        worker_path,
+                        str(group_id),
+                        filepath,
+                        websocket_url
+                    ],
+                    creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+                )
+                print(f"[点歌] 已启动独立进程发送语音")
 
-                # ===== 发 AMR（手机兼容性最好） =====
-                if amr_path and os.path.exists(amr_path):
-                    # 确保路径用正斜杠并 URL 编码
-                    amr_abs = os.path.abspath(amr_path)
-                    await self.websocket.send(json.dumps({
-                        "action": "send_msg",
-                        "params": {
-                            "message_type": "group",
-                            "group_id": int(group_id),
-                            "message": f"[CQ:record,file=file:///{amr_abs.replace('\\', '/')}]"
-                        }
-                    }))
-                    print(f"[点歌] 已发送AMR语音: {amr_path}")
-
-                # ===== 发 SILK（电脑端备用） =====
-                if silk_path and os.path.exists(silk_path):
-                    silk_abs = os.path.abspath(silk_path)
-                    await self.websocket.send(json.dumps({
-                        "action": "send_msg",
-                        "params": {
-                            "message_type": "group",
-                            "group_id": int(group_id),
-                            "message": f"[CQ:record,file=file:///{silk_abs.replace('\\', '/')}]"
-                        }
-                    }))
-                    print(f"[点歌] 已发送SILK语音: {silk_path}")
-
-                # 如果都没成功，发个提示
-                if not amr_path and not silk_path:
-                    return self._create_reply("group", user_id, group_id,
-                        f"✅ 已下载《{song_name}》，但语音转换失败\n📥 下载链接：{music_url}")
-
-                return None
-            else:
-                # 没有下载到文件，只发了信息
-                return None
+            return None
 
         except Exception as e:
             print(f"[点歌] 错误: {e}")
