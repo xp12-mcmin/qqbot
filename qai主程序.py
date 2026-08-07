@@ -6083,7 +6083,7 @@ class MessageHandler:
     import subprocess
 
     async def _music(self, group_id: int, user_id: str, keyword: str) -> Dict:
-        """点歌 - 独立进程执行，不阻塞主程序"""
+        """点歌 - 独立进程优先，失败降级主程序内置发送"""
 
         # ========== 计数去重 ==========
         if not hasattr(self, '_music_count'):
@@ -6094,17 +6094,28 @@ class MessageHandler:
         command_hash = hashlib.md5(command_key.encode()).hexdigest()
 
         count = self._music_count.get(command_hash, 0)
+
         if count >= 1:
-            print(f"[点歌] 重复命令，已忽略")
+            print(f"[点歌] 重复命令，已忽略: {command_key}")
             return self._create_reply("group", user_id, group_id,
                 "⏰ 点歌命令已收到，正在处理中，请勿重复发送~")
 
         self._music_count[command_hash] = count + 1
 
+        await self.websocket.send(json.dumps({
+            "action": "send_msg",
+            "params": {
+                "message_type": "group",
+                "group_id": int(group_id),
+                "message": f"[CQ:at,qq={user_id}] 🎵 正在搜索《{keyword}》，请稍候..."
+            }
+        }))
+
         async def cleanup():
             await asyncio.sleep(5)
             if command_hash in self._music_count:
                 del self._music_count[command_hash]
+                print(f"[点歌] 已清理计数: {command_hash}")
 
         asyncio.create_task(cleanup())
 
@@ -6130,14 +6141,18 @@ class MessageHandler:
 
             filepath = await music.download_music(music_url, filename)
 
-            # ===== 发送歌曲信息 =====
+            # ===== 1. 先发歌曲信息 =====
             info_msg = f"🎵 《{song_name}》- {artist}"
             if cover_url:
                 info_msg = f"[CQ:image,file={cover_url}]\n{info_msg}"
+
             if download_url:
                 info_msg += f"\n📥 下载链接：{download_url}"
             elif music_url:
                 info_msg += f"\n🔗 下载链接：{music_url}"
+
+            if filepath and os.path.exists(filepath):
+                info_msg += "\n🎤 正在发送语音..."
 
             await self.websocket.send(json.dumps({
                 "action": "send_msg",
@@ -6148,28 +6163,81 @@ class MessageHandler:
                 }
             }))
 
-            # ===== 启动独立进程发送语音 =====
+            # ===== 2. 发送语音 =====
             if filepath and os.path.exists(filepath):
                 script_dir = os.path.dirname(os.path.abspath(__file__))
                 worker_path = os.path.join(script_dir, "music_worker.py")
-                websocket_url = "ws://127.0.0.1:8765"
+                ws_url = "ws://127.0.0.1:8765"
+                use_worker = False
                 
-                subprocess.Popen(
-                    [
-                        sys.executable,
-                        worker_path,
-                        str(group_id),
-                        filepath,
-                        websocket_url
-                    ],
-                    creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
-                )
-                print(f"[点歌] 已启动独立进程发送语音")
-
-            return None
+                # ===== 检查 music_worker.py 是否存在 =====
+                if os.path.exists(worker_path):
+                    try:
+                        subprocess.Popen(
+                            [
+                                sys.executable,
+                                worker_path,
+                                str(group_id),
+                                filepath,
+                                ws_url
+                            ],
+                            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL
+                        )
+                        print(f"[点歌] 已启动独立进程发送语音")
+                        use_worker = True
+                    except Exception as e:
+                        print(f"[点歌] 启动独立进程失败: {e}，降级到主程序内置")
+                else:
+                    print(f"[点歌] music_worker.py 不存在，使用主程序内置发送")
+                
+                # ===== 备用方案：主程序内置发送 =====
+                if not use_worker:
+                    print(f"[点歌] 使用主程序内置发送...")
+                    
+                    # 转换 AMR 和 SILK
+                    amr_path = await self._convert_to_amr(filepath)
+                    silk_path = await self._convert_to_silk(filepath)
+                    
+                    # 发 AMR
+                    if amr_path and os.path.exists(amr_path):
+                        amr_abs = os.path.abspath(amr_path)
+                        await self.websocket.send(json.dumps({
+                            "action": "send_msg",
+                            "params": {
+                                "message_type": "group",
+                                "group_id": int(group_id),
+                                "message": f"[CQ:record,file=file:///{amr_abs.replace('\\', '/')}]"
+                            }
+                        }))
+                        print(f"[点歌] 已发送AMR语音: {amr_path}")
+                    
+                    # 发 SILK
+                    if silk_path and os.path.exists(silk_path):
+                        silk_abs = os.path.abspath(silk_path)
+                        await self.websocket.send(json.dumps({
+                            "action": "send_msg",
+                            "params": {
+                                "message_type": "group",
+                                "group_id": int(group_id),
+                                "message": f"[CQ:record,file=file:///{silk_abs.replace('\\', '/')}]"
+                            }
+                        }))
+                        print(f"[点歌] 已发送SILK语音: {silk_path}")
+                    
+                    if not amr_path and not silk_path:
+                        return self._create_reply("group", user_id, group_id,
+                            f"✅ 已下载《{song_name}》，但语音发送失败\n📥 下载链接：{music_url}")
+                
+                return None
+            else:
+                return None
 
         except Exception as e:
             print(f"[点歌] 错误: {e}")
+            import traceback
+            traceback.print_exc()
             return self._create_reply("group", user_id, group_id, f"❌ 点歌失败：{str(e)}")
 
 
