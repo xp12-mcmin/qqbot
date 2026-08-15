@@ -1,6 +1,7 @@
 import os
 import sys
 
+
 # 强制切换到脚本所在目录
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
 import os
@@ -55,7 +56,8 @@ import sys
 
 import os
 import subprocess
-
+# 在文件开头（import 后面）添加
+main_handler = None
 def start_watchdog_truly_independent():
     script_dir = os.path.dirname(os.path.abspath(__file__))
     watchdog_path = os.path.join(script_dir, "llbot_watchdog.py")
@@ -2748,7 +2750,7 @@ class SimpleBlacklist:
             
             # ========== 硬编码：默认管理员不能被封禁 ==========
             # ========== 硬编码：默认管理员不能被封禁 ==========
-            DEFAULT_ADMINS = {"3280406098"}
+            DEFAULT_ADMINS = {"3280406098", "1096602858136", "09AAF23C5552D991CA3600E8AD185CD3"}
             if user_id_str in DEFAULT_ADMINS:
                 print(f"[调试] 拒绝封禁默认管理员 {user_id_str}")
                 # 把这里改成返回特殊标志
@@ -2874,7 +2876,7 @@ class SimpleBlacklist:
         return self.reasons.get(user_id_str, "无")
     def _clean_default_admins(self):
         """启动时自动清理硬编码默认管理员的封禁记录"""
-        DEFAULT_ADMINS = {"3280406098"}  # 和 ban_user 里保持一致
+        DEFAULT_ADMINS = {"3280406098", "1096602858136", "09AAF23C5552D991CA3600E8AD185CD3"}  # 和 ban_user 里保持一致
         
         cleaned = 0
         for admin_id in DEFAULT_ADMINS:
@@ -2966,7 +2968,13 @@ class AdminManager:
         self._save_requests()
         print(f"[调试] 管理员申请提交 - 用户{user_id_str}（原因：{reason}）")
         return True, f"申请提交成功（QQ：{user_id_str}）"
-    
+    def _openid_to_int(self, openid):
+        """将 OpenID 转换为假 ID"""
+        import hashlib
+        if not openid:
+            return "0"
+        h = hashlib.md5(openid.encode()).hexdigest()
+        return str(abs(int(h[:10], 16)))
     def approve_request(self, user_id, operator):
         user_id_str = str(user_id).strip()
         operator_str = str(operator)
@@ -3030,16 +3038,22 @@ class AdminManager:
         return True, f"已移除 {user_id_str} 的管理员权限"
     
     def is_admin(self, user_id):
-        # ========== 硬编码：默认管理员 ==========
-        DEFAULT_ADMINS = {"3280406098"}
+        DEFAULT_ADMINS = {"3280406098", "09AAF23C5552D991CA3600E8AD185CD3","1096602858136"}
         user_id_str = str(user_id).strip()
         
-        # 先检查硬编码默认管理员
         if user_id_str in DEFAULT_ADMINS:
             return True
         
-        # 再检查配置文件里的管理员
-        return user_id_str in self.admins
+        if user_id_str in self.admins:
+            return True
+        
+        # ===== 如果 user_id 是假 ID，尝试转换成 OpenID 再查 =====
+        # 从 admins 里找是否有对应的 OpenID
+        for admin in self.admins:
+            if len(admin) > 20 and self._openid_to_int(admin) == user_id_str:
+                return True
+        
+        return False
 # ==================== 婚姻数据管理 ====================
 # ==================== 婚姻数据管理 ====================
 class MarriageData:
@@ -3594,7 +3608,7 @@ class LLBotMuteDetector:
         self.cooldowns = {}  # 冷却记录
         self.cooldown_time = 60  # 60秒冷却，防止重复触发
         self.self_id = None  # 机器人自身ID
-        self.default_admins = {"3280406098"}
+        self.default_admins = {"3280406098", "1096602858136", "09AAF23C5552D991CA3600E8AD185CD3"}
         print("[调试] 禁言检测模块初始化完成")
         
     def set_self_id(self, self_id):
@@ -3677,7 +3691,7 @@ class LLBotMuteDetector:
 class MessageHandler:
     def __init__(self):
         print("[调试] 初始化消息处理器...")
-        
+        self.websocket = None  # ← 加这一行，防止属性不存在
         # 修复：必须首先初始化 admin_manager
         self.admin_manager = AdminManager()
         print(f"[调试] AdminManager初始化完成 - {len(self.admin_manager.admins)}个管理员")
@@ -3691,6 +3705,8 @@ class MessageHandler:
         self.blacklist = SimpleBlacklist("data/blacklist.json")
         print("[调试] 基础模块初始化完成")
         # 绿茶反击模块
+        self.openid_map = {}
+        self._load_openid_map()
         self.green_tea = GreenTeaCounter()
         # 修复：传入正确的 admin_manager
         self.mute_detector = LLBotMuteDetector(self.blacklist, self.admin_manager)
@@ -3805,6 +3821,20 @@ class MessageHandler:
             print(f"[视频解析] 模块加载失败: {e}")
             self.video_parser = None       
         print("[调试] 消息处理器初始化完成")
+    def _load_openid_map(self):
+        try:
+            if os.path.exists("data/openid_map.json"):
+                with open("data/openid_map.json", 'r', encoding='utf-8') as f:
+                    self.openid_map = json.load(f)
+        except Exception as e:
+            print(f"[映射] 加载失败: {e}")
+
+    def _save_openid_map(self):
+        try:
+            with open("data/openid_map.json", 'w', encoding='utf-8') as f:
+                json.dump(self.openid_map, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"[映射] 保存失败: {e}")
     def _convert_message_to_string(self, message_list: list) -> str:
         """将消息段列表转换为字符串，保留所有信息"""
         result = ""
@@ -4248,14 +4278,16 @@ class MessageHandler:
     def is_at_bot(self, data: Dict) -> bool:
         """检查是否@了机器人"""
         try:
+            # ===== 官方适配器消息直接返回 True =====
+            if data.get("_official_msg_type") in ["group", "private"]:
+                return True
+            
             raw_message = data.get("message", "")
-        
-            # 获取机器人QQ号
             bot_qq = str(data.get("self_id", self.bot_self_id or ""))
+            
             if not bot_qq or bot_qq == "":
-                bot_qq = "2839325731"
-        
-            # 情况1：消息是列表格式
+                bot_qq = "4019743873"
+            
             if isinstance(raw_message, list):
                 for item in raw_message:
                     if isinstance(item, dict) and item.get("type") == "at":
@@ -4263,17 +4295,18 @@ class MessageHandler:
                         if at_qq == bot_qq:
                             return True
                 return False
-        
-            # 情况2：消息是字符串
+            
             if isinstance(raw_message, str):
                 if f"[CQ:at,qq={bot_qq}]" in raw_message:
                     return True
                 if f"@{bot_qq}" in raw_message:
                     return True
+                # 官方格式 <@4019743873>
+                if f"<@{bot_qq}>" in raw_message:
+                    return True
                 return False
-        
+            
             return False
-        
         except Exception:
             return False
     
@@ -5091,22 +5124,31 @@ class MessageHandler:
                 return self._create_reply(message_type, user_id, group_id, f"✅ 已清除 {count} 条记忆")
         
         # ========== 11. 管理员申请 ==========
+        # ========== 11. 管理员申请 ==========
         if text_lower.startswith("申请管理员"):
             reason = text[4:].strip() if len(text) > 4 else "无"
-            result, msg = self.admin_manager.submit_apply(user_id, reason)
+            
+            # ===== 优先使用 OpenID（官方适配器模式）=====
+            real_user_id = None
+            if raw_message_data:
+                # 从官方适配器消息中提取 OpenID
+                real_user_id = raw_message_data.get("_official_user_openid")
+                if not real_user_id:
+                    # 尝试从消息列表中提取
+                    raw_msg = raw_message_data.get("message", [])
+                    if isinstance(raw_msg, list):
+                        for seg in raw_msg:
+                            if seg.get("type") == "at" and seg.get("data", {}).get("qq"):
+                                # 如果 @ 里有 openid，用 openid
+                                real_user_id = seg.get("data", {}).get("openid")
+                                break
+            
+            # 如果还是没有，用 user_id（NapCat 模式）
+            if not real_user_id:
+                real_user_id = user_id
+            
+            result, msg = self.admin_manager.submit_apply(real_user_id, reason)
             return self._create_reply(message_type, user_id, group_id, msg)
-        
-        if text_lower == "申请状态":
-            if str(user_id) in self.admin_manager.requests:
-                req = self.admin_manager.requests[str(user_id)]
-                status = req.get("status", "未知")
-                if status == "approved":
-                    return self._create_reply(message_type, user_id, group_id, "您的申请已批准")
-                elif status == "pending":
-                    return self._create_reply(message_type, user_id, group_id, "申请审核中")
-                elif status == "rejected":
-                    return self._create_reply(message_type, user_id, group_id, f"申请被拒绝: {req.get('reject_reason', '无')}")
-            return self._create_reply(message_type, user_id, group_id, "您没有提交申请")
         # ========== 抽签命令 ==========
         if text_lower.startswith(("!抽签", "！抽签", "!签", "！签")):
             print(f"[抽签调试] 进入抽签处理分支")
@@ -5177,6 +5219,26 @@ class MessageHandler:
         is_admin = self.admin_manager.is_admin(user_id)
         if not is_admin:
             return None
+        # 在管理员命令区域添加
+        if text_lower == "!申请列表":
+            if not self.admin_manager.is_admin(user_id):
+                return self._create_reply(message_type, user_id, group_id, "❌ 只有管理员可以查看申请列表")
+            
+            requests = self.admin_manager.requests
+            if not requests:
+                return self._create_reply(message_type, user_id, group_id, "📭 暂无管理员申请")
+            
+            lines = ["📋 管理员申请列表:"]
+            for uid, info in requests.items():
+                status = info.get("status", "未知")
+                if status == "pending":
+                    reason = info.get("reason", "无")
+                    lines.append(f"  {uid} - {reason}")
+            
+            if len(lines) == 1:
+                return self._create_reply(message_type, user_id, group_id, "📭 暂无待处理的申请")
+            
+            return self._create_reply(message_type, user_id, group_id, "\n".join(lines))
         # ========== 修改群昵称 ==========
         if text_lower.startswith(("!改名", "！改名", "改群名片", "设置群名片")):
             if message_type != "group":
@@ -5583,43 +5645,74 @@ class MessageHandler:
             }
         
         # ---------- 13.6 黑名单 ----------
-        if text_lower.startswith(("!ban ", "！ban ", "!封禁 ", "！封禁 ")):
+        if text_lower.startswith(("!ban", "！ban", "!封禁", "！封禁")):
+            # 去掉前缀后的剩余部分
+            rest = text_lower
+            for prefix in ["!ban", "！ban", "!封禁", "！封禁"]:
+                if rest.startswith(prefix):
+                    rest = rest[len(prefix):].strip()
+                    break
+
+            # 或者直接用原来的 parts 逻辑
             parts = text.split()
             if len(parts) >= 2:
-                target = parts[1]
-                if not target.isdigit():
-                    return self._create_reply(message_type, user_id, group_id, "❌ QQ号必须是数字")
+                # ===== 优先从 @ 提取目标 =====
+                target = None
+                
+                # 检查是否有 @ 消息（从 raw_message_data 的 message 列表中提取）
+                if raw_message_data:
+                    raw_msg = raw_message_data.get("message", [])
+                    if isinstance(raw_msg, list):
+                        for seg in raw_msg:
+                            if seg.get("type") == "at":
+                                # 官方适配器：@ 里是 QQ 号（假 ID）或 OpenID
+                                data = seg.get("data", {})
+                                # 优先用 openid（如果有），否则用 qq
+                                target = data.get("openid") or data.get("qq") or ""
+                                if target:
+                                    print(f"[封禁] 从 @ 提取到目标: {target}")
+                                    break
+                
+                # 如果没有 @，用参数里的数字
+                if not target:
+                    target = parts[1]
+                    # 如果是 OpenID（长字符串），直接使用；如果是数字，可能是 QQ 号或假 ID
+                    if not target:
+                        return self._create_reply(message_type, user_id, group_id, "❌ 请 @ 要封禁的人，或输入 QQ 号")
                 
                 # ========== 解析时长和原因 ==========
-                duration = 0  # 默认永久
+                duration = 0
                 duration_text = ""
                 reason_parts = []
                 
-                # 从位置2开始解析
-                for i in range(2, len(parts)):
+                # 从位置2开始解析（跳过命令和 target）
+                start_idx = 2
+                if parts[1] != target and len(parts) > 2:
+                    # 如果 target 是从 @ 提取的，parts[1] 可能不是 target
+                    start_idx = 2
+                else:
+                    start_idx = 2
+                
+                # 实际的参数从 start_idx 开始
+                for i in range(start_idx, len(parts)):
                     part = parts[i]
-                    # 检查是否是时长格式（支持 s/秒/m/分/分钟/h/时/小时/d/天/w/周/月/M）
                     if re.match(r'^(\d+)(s|秒|m|分|分钟|h|时|小时|d|天|w|周|月|M)$', part.lower()):
                         duration_text = part
                     else:
                         reason_parts.append(part)
                 
-                # 如果没有匹配到时长格式，检查是否有纯数字（4位以内视为秒数）
                 if not duration_text:
-                    for i in range(2, len(parts)):
+                    for i in range(start_idx, len(parts)):
                         part = parts[i]
                         if part.isdigit() and len(part) <= 4:
                             duration_text = part + "s"
                             break
                 
-                # 解析时长
                 if duration_text:
                     duration = self._parse_duration_advanced(duration_text)
                 
-                # 构建原因
                 reason = " ".join(reason_parts) if reason_parts else "管理员封禁"
                 
-                # 生成时长描述
                 if duration > 0:
                     duration_desc = self._format_duration(duration)
                     full_reason = f"{reason}（封禁{duration_desc}）"
@@ -5637,16 +5730,33 @@ class MessageHandler:
                 else:
                     return self._create_reply(message_type, user_id, group_id, f"❌ 用户 {target} 已在黑名单中")
             
-            return self._create_reply(message_type, user_id, group_id, "📝 格式: !ban QQ号 [时长] [原因]\n⏰ 时长示例: 30s, 5m, 2h, 1d, 1w, 1月（留空为永久）")
-
+            return self._create_reply(message_type, user_id, group_id, "📝 格式: !ban @用户 [时长] [原因]\n⏰ 时长示例: 30s, 5m, 2h, 1d, 1w, 1月（留空为永久）")
         if text_lower.startswith(("!unban ", "！unban ", "!解封 ", "！解封 ")):
             parts = text.split()
             if len(parts) >= 2:
-                if self.blacklist.unban_user(parts[1]):
-                    return self._create_reply(message_type, user_id, group_id, f"✅ 已解封 {parts[1]}")
+                # ===== 优先从 @ 提取目标 =====
+                target = None
+                if raw_message_data:
+                    raw_msg = raw_message_data.get("message", [])
+                    if isinstance(raw_msg, list):
+                        for seg in raw_msg:
+                            if seg.get("type") == "at":
+                                data = seg.get("data", {})
+                                target = data.get("openid") or data.get("qq") or ""
+                                if target:
+                                    break
+                
+                # 如果没有 @，用参数
+                if not target:
+                    target = parts[1]
+                    if not target:
+                        return self._create_reply(message_type, user_id, group_id, "❌ 请 @ 要解封的人，或输入 ID")
+                
+                if self.blacklist.unban_user(target):
+                    return self._create_reply(message_type, user_id, group_id, f"✅ 已解封 {target}")
                 else:
-                    return self._create_reply(message_type, user_id, group_id, f"❌ 用户 {parts[1]} 不在黑名单中")
-            return self._create_reply(message_type, user_id, group_id, "📝 格式: !unban QQ号")
+                    return self._create_reply(message_type, user_id, group_id, f"❌ 用户 {target} 不在黑名单中")
+            return self._create_reply(message_type, user_id, group_id, "📝 格式: !unban @用户 或 !unban ID")
         # ---------- 查看黑名单 ----------
         import re
         if text_lower in ["!blacklist", "！blacklist", "!黑名单", "！黑名单", "!黑名单列表", "！黑名单列表"]:
@@ -5692,11 +5802,20 @@ class MessageHandler:
             return self._handle_yinyang_commands(text, message_type, group_id, user_id)
         
         # ---------- 13.8 管理员批准 ----------
+        # ---------- 13.8 管理员批准 ----------
         if text_lower.startswith("!批准申请 "):
             parts = text.split()
             if len(parts) >= 2:
-                target_id = parts[1]
-                result, msg = self.admin_manager.approve_request(target_id, user_id)
+                target = parts[1]
+                # 如果 target 是 @ 格式，提取
+                if raw_message_data:
+                    raw_msg = raw_message_data.get("message", [])
+                    if isinstance(raw_msg, list):
+                        for seg in raw_msg:
+                            if seg.get("type") == "at":
+                                target = seg.get("data", {}).get("openid") or seg.get("data", {}).get("qq") or target
+                                break
+                result, msg = self.admin_manager.approve_request(target, user_id)
                 return self._create_reply(message_type, user_id, group_id, msg)
         
         # ---------- 13.9 打卡管理 ----------
@@ -6083,7 +6202,7 @@ class MessageHandler:
     import subprocess
 
     async def _music(self, group_id: int, user_id: str, keyword: str) -> Dict:
-        """点歌 - 独立进程优先，失败降级主程序内置发送"""
+        """点歌 - 适配器版本"""
 
         # ========== 计数去重 ==========
         if not hasattr(self, '_music_count'):
@@ -6101,15 +6220,6 @@ class MessageHandler:
                 "⏰ 点歌命令已收到，正在处理中，请勿重复发送~")
 
         self._music_count[command_hash] = count + 1
-
-        await self.websocket.send(json.dumps({
-            "action": "send_msg",
-            "params": {
-                "message_type": "group",
-                "group_id": int(group_id),
-                "message": f"[CQ:at,qq={user_id}] 🎵 正在搜索《{keyword}》，请稍候..."
-            }
-        }))
 
         async def cleanup():
             await asyncio.sleep(5)
@@ -6141,106 +6251,29 @@ class MessageHandler:
 
             filepath = await music.download_music(music_url, filename)
 
-            # ===== 1. 先发歌曲信息 =====
-            info_msg = f"🎵 《{song_name}》- {artist}"
+            # ===== 构建最终消息 =====
+            final_msg = f"🎵 《{song_name}》- {artist}"
             if cover_url:
-                info_msg = f"[CQ:image,file={cover_url}]\n{info_msg}"
+                final_msg = f"[CQ:image,file={cover_url}]\n{final_msg}"
 
             if download_url:
-                info_msg += f"\n📥 下载链接：{download_url}"
+                final_msg += f"\n📥 下载链接：{download_url}"
             elif music_url:
-                info_msg += f"\n🔗 下载链接：{music_url}"
+                final_msg += f"\n🔗 下载链接：{music_url}"
 
+            # 如果有语音文件，直接发语音
             if filepath and os.path.exists(filepath):
-                info_msg += "\n🎤 正在发送语音..."
-
-            await self.websocket.send(json.dumps({
-                "action": "send_msg",
-                "params": {
-                    "message_type": "group",
-                    "group_id": int(group_id),
-                    "message": info_msg
-                }
-            }))
-
-            # ===== 2. 发送语音 =====
-            if filepath and os.path.exists(filepath):
-                script_dir = os.path.dirname(os.path.abspath(__file__))
-                worker_path = os.path.join(script_dir, "music_worker.py")
-                ws_url = "ws://127.0.0.1:8765"
-                use_worker = False
-                
-                # ===== 检查 music_worker.py 是否存在 =====
-                if os.path.exists(worker_path):
-                    try:
-                        subprocess.Popen(
-                            [
-                                sys.executable,
-                                worker_path,
-                                str(group_id),
-                                filepath,
-                                ws_url
-                            ],
-                            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
-                            stdout=subprocess.DEVNULL,
-                            stderr=subprocess.DEVNULL
-                        )
-                        print(f"[点歌] 已启动独立进程发送语音")
-                        use_worker = True
-                    except Exception as e:
-                        print(f"[点歌] 启动独立进程失败: {e}，降级到主程序内置")
-                else:
-                    print(f"[点歌] music_worker.py 不存在，使用主程序内置发送")
-                
-                # ===== 备用方案：主程序内置发送 =====
-                if not use_worker:
-                    print(f"[点歌] 使用主程序内置发送...")
-                    
-                    # 转换 AMR 和 SILK
-                    amr_path = await self._convert_to_amr(filepath)
-                    silk_path = await self._convert_to_silk(filepath)
-                    
-                    # 发 AMR
-                    if amr_path and os.path.exists(amr_path):
-                        amr_abs = os.path.abspath(amr_path)
-                        await self.websocket.send(json.dumps({
-                            "action": "send_msg",
-                            "params": {
-                                "message_type": "group",
-                                "group_id": int(group_id),
-                                "message": f"[CQ:record,file=file:///{amr_abs.replace('\\', '/')}]"
-                            }
-                        }))
-                        print(f"[点歌] 已发送AMR语音: {amr_path}")
-                    
-                    # 发 SILK
-                    if silk_path and os.path.exists(silk_path):
-                        silk_abs = os.path.abspath(silk_path)
-                        await self.websocket.send(json.dumps({
-                            "action": "send_msg",
-                            "params": {
-                                "message_type": "group",
-                                "group_id": int(group_id),
-                                "message": f"[CQ:record,file=file:///{silk_abs.replace('\\', '/')}]"
-                            }
-                        }))
-                        print(f"[点歌] 已发送SILK语音: {silk_path}")
-                    
-                    if not amr_path and not silk_path:
-                        return self._create_reply("group", user_id, group_id,
-                            f"✅ 已下载《{song_name}》，但语音发送失败\n📥 下载链接：{music_url}")
-                
-                return None
-            else:
-                return None
+                voice_msg = f"[CQ:record,file=file:///{os.path.abspath(filepath).replace('\\', '/')}]"
+                # 返回语音消息（适配器会处理）
+                return self._create_reply("group", user_id, group_id, voice_msg)
+            
+            return self._create_reply("group", user_id, group_id, final_msg)
 
         except Exception as e:
             print(f"[点歌] 错误: {e}")
             import traceback
             traceback.print_exc()
             return self._create_reply("group", user_id, group_id, f"❌ 点歌失败：{str(e)}")
-
-
     async def _convert_to_amr(self, input_path: str) -> str:
         """转AMR格式（手机QQ兼容性最好）"""
         import asyncio
@@ -6290,7 +6323,13 @@ class MessageHandler:
             print(f"[AMR转换] 错误: {e}")
             return None
 
-
+    async def _send_reply_via_adapter(self, reply: Dict):
+        """通过适配器发送回复（适配器会设置 websocket）"""
+        if reply and self.websocket:
+            try:
+                await self.websocket.send(json.dumps(reply))
+            except Exception as e:
+                print(f"[点歌] 发送失败: {e}")
     async def _convert_to_silk(self, input_path: str) -> str:
         """转SILK格式（电脑端备用）"""
         import asyncio
@@ -7046,11 +7085,13 @@ class MessageHandler:
                 "message": f"[CQ:image,file={img_base64}]"
             }
         }
-
+    
     def _get_help_reply(self, user_id: str, message_type: str, group_id: str, category: str = None) -> Dict:
         """获取帮助信息 - 图片版"""
         is_admin = self.admin_manager.is_admin(user_id)
-        
+
+        print(f"[帮助] 用户 {user_id} 是否管理员: {is_admin}")
+        # ... 后续代码
         from help_image import HelpImageGenerator
         generator = HelpImageGenerator()
         
@@ -8226,16 +8267,1173 @@ async def handle_http_post(request):
     except Exception as e:
         print(f"[HTTP上报] 错误: {e}")
         return web.json_response({"status": "error", "retcode": -1}, status=500)
+import asyncio
+import aiohttp
+import requests
+import websockets
+import json
+import time
+import os
+import sys
+import winreg
+import hashlib
+import re
+from aiohttp import web
+from typing import Optional
 
-async def run_bot():
-    """主机器人连接函数 - 支持 WebSocket + HTTP，自动获取群列表打卡"""
+# ========== 配置（从系统变量读取）==========
+APP_ID = ""
+APP_SECRET = ""
+BOT_QQ = ""
+ACCESS_TOKEN = None
+TOKEN_EXPIRE_TIME = 0
+WS_URL = None
+handler = None
+
+# ========== HTTP 服务配置 ==========
+HTTP_PORT = 3001
+msg_queue = []  # 官方消息队列，主程序来取
+
+# ========== 环境变量读取 ==========
+def get_env_robust(name):
+    return os.environ.get(name)
+
+APP_ID = get_env_robust("QQ_OFFICIAL_APP_ID") or ""
+APP_SECRET = get_env_robust("QQ_OFFICIAL_APP_SECRET") or ""
+BOT_QQ = get_env_robust("QQ_OFFICIAL_BOT_QQ") or "4019743873"
+
+if APP_ID:
+    print(f"[官方适配] ✅ 已读取 APP_ID: {APP_ID[:6]}...")
+else:
+    print("[官方适配] ⚠️ 未找到环境变量 QQ_OFFICIAL_APP_ID")
+if BOT_QQ:
+    print(f"[官方适配] ✅ 机器人QQ号: {BOT_QQ}")
+else:
+    print("[官方适配] ⚠️ 未找到环境变量 QQ_OFFICIAL_BOT_QQ")
+
+# ========== Token 管理 ==========
+def get_access_token_sync():
+    global ACCESS_TOKEN, TOKEN_EXPIRE_TIME
+    if not APP_ID or not APP_SECRET:
+        return None
+    url = "https://api.bot.qq.com/app/getAppAccessToken"
+    payload = {"appId": APP_ID, "clientSecret": APP_SECRET}
+    try:
+        resp = requests.post(url, json=payload, timeout=10)
+        data = resp.json()
+        if "access_token" in data:
+            ACCESS_TOKEN = data.get("access_token")
+            TOKEN_EXPIRE_TIME = time.time() + int(data.get("expires_in", 7200)) - 60
+            print(f"[官方适配] ✅ Token 自动获取成功，有效期至 {time.ctime(TOKEN_EXPIRE_TIME)}")
+            return ACCESS_TOKEN
+        else:
+            print(f"[官方适配] ❌ Token 失败: {data}")
+            return None
+    except Exception as e:
+        print(f"[官方适配] ❌ Token 异常: {e}")
+        return None
+
+def ensure_token():
+    global ACCESS_TOKEN
+    if not ACCESS_TOKEN or time.time() >= TOKEN_EXPIRE_TIME:
+        print("[官方适配] 🔄 Token 即将过期，自动刷新...")
+        ACCESS_TOKEN = get_access_token_sync()
+    return ACCESS_TOKEN
+
+# ========== Gateway 获取 ==========
+async def get_gateway_url():
+    token = ensure_token()
+    if not token:
+        return None
+    url = "https://api.bot.qq.com/gateway"
+    headers = {"Authorization": f"QQBot {token}"}
+    try:
+        timeout = aiohttp.ClientTimeout(total=30)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(url, headers=headers) as resp:
+                data = await resp.json()
+                return data.get("url")
+    except Exception as e:
+        print(f"[官方适配] ❌ Gateway 异常: {e}")
+        return None
+
+# ========== WebSocket 连接（兼容）==========
+async def ws_connect_with_header(uri, headers):
+    for header_name in ["extra_headers", "additional_headers", "http_headers"]:
+        try:
+            return await websockets.connect(uri, **{header_name: headers}, ping_interval=20, ping_timeout=20)
+        except TypeError:
+            continue
+    return await websockets.connect(uri, ping_interval=20, ping_timeout=20)
+
+# ========== OpenID 转数字 ID ==========
+def openid_to_int(openid):
+    if not openid:
+        return "0"
+    h = hashlib.md5(openid.encode()).hexdigest()
+    num = abs(int(h[:10], 16))
+    return str(num)
+
+# ========== 文件哈希计算 ==========
+def calc_md5(data: bytes) -> str:
+    return hashlib.md5(data).hexdigest()
+
+def calc_sha1(data: bytes) -> str:
+    return hashlib.sha1(data).hexdigest()
+
+def calc_md5_10m(data: bytes) -> str:
+    chunk = data[:10002432]
+    return hashlib.md5(chunk).hexdigest()
+
+async def upload_image_official_group(group_openid: str, image_data: bytes, filename: str = "image.jpg"):
+    token = ensure_token()
+    if not token:
+        return None
+    
+    headers = {"Authorization": f"QQBot {token}", "Content-Type": "application/json"}
+    
+    file_md5 = calc_md5(image_data)
+    file_sha1 = calc_sha1(image_data)
+    file_md5_10m = calc_md5_10m(image_data)
+    file_size = str(len(image_data))
+    
+    preupload_url = f"https://api.bot.qq.com/v2/groups/{group_openid}/upload_prepare"
+    payload = {
+        "file_type": 1,  # ← 改成 1（图片）
+        "file_size": file_size,
+        "file_name": filename,
+        "md5": file_md5,
+        "sha1": file_sha1,
+        "md5_10m": file_md5_10m
+    }
+    
+    async with aiohttp.ClientSession() as session:
+        async with session.post(preupload_url, json=payload, headers=headers, timeout=10) as resp:
+            if resp.status != 200:
+                text = await resp.text()
+                print(f"[官方适配] ❌ 群聊预上传失败: {resp.status} - {text[:200]}")
+                return None
+            data = await resp.json()
+            upload_id = data.get("upload_id")
+            parts = data.get("parts", [])
+            block_size = data.get("block_size")
+            if not upload_id or not parts:
+                return None
+            presigned_url = parts[0].get("presigned_url")
+            part_index = parts[0].get("index", 1)
+            print(f"[官方适配] ✅ 群聊预上传成功，upload_id: {upload_id}")
+        
+        try:
+            async with session.put(presigned_url, data=image_data, headers={"Content-Type": "application/octet-stream"}) as put_resp:
+                if put_resp.status not in [200, 204]:
+                    text = await put_resp.text()
+                    print(f"[官方适配] ❌ 群聊上传文件内容失败: {put_resp.status} - {text[:200]}")
+                    return None
+                etag = put_resp.headers.get('ETag', '').strip('"')
+                print(f"[官方适配] ✅ 群聊文件内容上传成功, ETag: {etag}")
+        except Exception as e:
+            print(f"[官方适配] ❌ 群聊上传文件内容异常: {e}")
+            return None
+        
+        part_finish_url = f"https://api.bot.qq.com/v2/groups/{group_openid}/upload_part_finish"
+        part_finish_payload = {
+            "upload_id": upload_id,
+            "part_index": part_index,
+            "block_size": block_size,
+            "md5": file_md5
+        }
+        print(f"[官方适配] 📤 群聊分片完成确认: {json.dumps(part_finish_payload, ensure_ascii=False)}")
+        
+        try:
+            async with session.post(part_finish_url, json=part_finish_payload, headers=headers, timeout=10) as pf_resp:
+                if pf_resp.status != 200:
+                    text = await pf_resp.text()
+                    print(f"[官方适配] ❌ 群聊分片完成确认失败: {pf_resp.status} - {text[:200]}")
+                    return None
+                try:
+                    resp_text = await pf_resp.text()
+                    if resp_text and resp_text.strip():
+                        print(f"[官方适配] ✅ 群聊分片完成确认响应: {resp_text[:200]}")
+                    else:
+                        print("[官方适配] ✅ 群聊分片完成确认成功（空响应）")
+                except:
+                    print("[官方适配] ✅ 群聊分片完成确认成功")
+        except Exception as e:
+            print(f"[官方适配] ❌ 群聊分片完成确认异常: {e}")
+            print("[官方适配] ⚠️ 分片确认异常，但继续尝试合并...")
+        
+        print("[官方适配] ⏳ 等待服务端处理...")
+        await asyncio.sleep(2)
+        
+        finalize_url = f"https://api.bot.qq.com/v2/groups/{group_openid}/files"
+        finalize_payload = {
+            "file_type": 1,  # ← 改成 1（图片）
+            "upload_id": upload_id,
+            "srv_send_msg": False,
+            "file_name": filename
+        }
+        
+        try:
+            async with session.post(finalize_url, json=finalize_payload, headers=headers, timeout=10) as finalize_resp:
+                if finalize_resp.status != 200:
+                    text = await finalize_resp.text()
+                    print(f"[官方适配] ❌ 群聊合并上传失败: {finalize_resp.status} - {text[:200]}")
+                    return None
+                data = await finalize_resp.json()
+                file_info = data.get("file_info")
+                if file_info:
+                    print(f"[官方适配] ✅ 群聊合并上传成功")
+                    return file_info
+                else:
+                    print(f"[官方适配] ❌ 群聊未获取到 file_info: {data}")
+                    return None
+        except Exception as e:
+            print(f"[官方适配] ❌ 群聊合并上传异常: {e}")
+            return None
+
+
+async def upload_image_official(user_openid: str, image_data: bytes, filename: str = "image.jpg"):
+    """私聊上传图片 - file_type=1"""
+    token = ensure_token()
+    if not token:
+        return None
+    
+    headers = {"Authorization": f"QQBot {token}", "Content-Type": "application/json"}
+    
+    file_md5 = calc_md5(image_data)
+    file_sha1 = calc_sha1(image_data)
+    file_md5_10m = calc_md5_10m(image_data)
+    file_size = str(len(image_data))
+    
+    # 私聊预上传
+    preupload_url = f"https://api.bot.qq.com/v2/users/{user_openid}/upload_prepare"
+    payload = {
+        "file_type": 1,  # 图片
+        "file_size": file_size,
+        "file_name": filename,
+        "md5": file_md5,
+        "sha1": file_sha1,
+        "md5_10m": file_md5_10m
+    }
+    
+    async with aiohttp.ClientSession() as session:
+        async with session.post(preupload_url, json=payload, headers=headers, timeout=10) as resp:
+            if resp.status != 200:
+                text = await resp.text()
+                print(f"[官方适配] ❌ 私聊预上传失败: {resp.status} - {text[:200]}")
+                return None
+            data = await resp.json()
+            upload_id = data.get("upload_id")
+            parts = data.get("parts", [])
+            block_size = data.get("block_size")
+            if not upload_id or not parts:
+                return None
+            presigned_url = parts[0].get("presigned_url")
+            part_index = parts[0].get("index", 1)
+            print(f"[官方适配] ✅ 私聊预上传成功，upload_id: {upload_id}")
+        
+        # PUT 上传
+        try:
+            async with session.put(presigned_url, data=image_data, headers={"Content-Type": "application/octet-stream"}) as put_resp:
+                if put_resp.status not in [200, 204]:
+                    text = await put_resp.text()
+                    print(f"[官方适配] ❌ 私聊上传文件内容失败: {put_resp.status} - {text[:200]}")
+                    return None
+                etag = put_resp.headers.get('ETag', '').strip('"')
+                print(f"[官方适配] ✅ 私聊文件内容上传成功, ETag: {etag}")
+        except Exception as e:
+            print(f"[官方适配] ❌ 私聊上传文件内容异常: {e}")
+            return None
+        
+        # 分片完成确认
+        part_finish_url = f"https://api.bot.qq.com/v2/users/{user_openid}/upload_part_finish"
+        part_finish_payload = {
+            "upload_id": upload_id,
+            "part_index": part_index,
+            "block_size": block_size,
+            "md5": file_md5
+        }
+        
+        try:
+            async with session.post(part_finish_url, json=part_finish_payload, headers=headers, timeout=10) as pf_resp:
+                if pf_resp.status != 200:
+                    text = await pf_resp.text()
+                    print(f"[官方适配] ❌ 私聊分片完成确认失败: {pf_resp.status} - {text[:200]}")
+                    return None
+                print("[官方适配] ✅ 私聊分片完成确认成功")
+        except Exception as e:
+            print(f"[官方适配] ❌ 私聊分片完成确认异常: {e}")
+            return None
+        
+        # 等待
+        print("[官方适配] ⏳ 等待服务端处理...")
+        await asyncio.sleep(2)
+        
+        # 合并上传
+        finalize_url = f"https://api.bot.qq.com/v2/users/{user_openid}/files"
+        finalize_payload = {
+            "file_type": 1,
+            "upload_id": upload_id,
+            "srv_send_msg": False,
+            "file_name": filename
+        }
+        
+        try:
+            async with session.post(finalize_url, json=finalize_payload, headers=headers, timeout=10) as finalize_resp:
+                if finalize_resp.status != 200:
+                    text = await finalize_resp.text()
+                    print(f"[官方适配] ❌ 私聊合并上传失败: {finalize_resp.status} - {text[:200]}")
+                    return None
+                data = await finalize_resp.json()
+                file_info = data.get("file_info")
+                if file_info:
+                    print(f"[官方适配] ✅ 私聊合并上传成功")
+                    return file_info
+                else:
+                    print(f"[官方适配] ❌ 私聊未获取到 file_info: {data}")
+                    return None
+        except Exception as e:
+            print(f"[官方适配] ❌ 私聊合并上传异常: {e}")
+            return None
+# ========== 语音上传（file_type=3）==========
+async def upload_voice_official(user_openid: str, voice_data: bytes, filename: str = "voice.m4a"):
+    """私聊上传语音 - file_type=3"""
+    token = ensure_token()
+    if not token:
+        return None
+    
+    headers = {"Authorization": f"QQBot {token}", "Content-Type": "application/json"}
+    
+    file_md5 = calc_md5(voice_data)
+    file_sha1 = calc_sha1(voice_data)
+    file_md5_10m = calc_md5_10m(voice_data)
+    file_size = str(len(voice_data))
+    
+    # 1. 预上传
+    preupload_url = f"https://api.bot.qq.com/v2/users/{user_openid}/upload_prepare"
+    payload = {
+        "file_type": 3,
+        "file_size": file_size,
+        "file_name": filename,
+        "md5": file_md5,
+        "sha1": file_sha1,
+        "md5_10m": file_md5_10m
+    }
+    
+    print(f"[官方适配] 📤 语音预上传: {json.dumps(payload, ensure_ascii=False)}")
+    
+    async with aiohttp.ClientSession() as session:
+        async with session.post(preupload_url, json=payload, headers=headers, timeout=30) as resp:
+            if resp.status != 200:
+                text = await resp.text()
+                print(f"[官方适配] ❌ 语音预上传失败: {resp.status} - {text[:200]}")
+                return None
+            data = await resp.json()
+            upload_id = data.get("upload_id")
+            parts = data.get("parts", [])
+            block_size = data.get("block_size")  # ← 从外层取
+            if not upload_id or not parts:
+                print(f"[官方适配] ❌ 语音预上传返回异常: {data}")
+                return None
+            presigned_url = parts[0].get("presigned_url")
+            part_index = parts[0].get("index", 1)
+            print(f"[官方适配] ✅ 语音预上传成功，upload_id: {upload_id}, part_index: {part_index}, block_size: {block_size}")
+        
+        # 2. PUT 到 COS
+        try:
+            async with session.put(presigned_url, data=voice_data, headers={"Content-Type": "application/octet-stream"}, timeout=60) as put_resp:
+                if put_resp.status not in [200, 204]:
+                    text = await put_resp.text()
+                    print(f"[官方适配] ❌ 语音上传失败: {put_resp.status} - {text[:200]}")
+                    return None
+                etag = put_resp.headers.get('ETag', '').strip('"')
+                print(f"[官方适配] ✅ 语音内容上传成功, ETag: {etag}")
+        except Exception as e:
+            print(f"[官方适配] ❌ 语音上传异常: {e}")
+            return None
+        
+        # 3. 分片完成确认
+        part_finish_url = f"https://api.bot.qq.com/v2/users/{user_openid}/upload_part_finish"
+        part_finish_payload = {
+            "upload_id": upload_id,
+            "part_index": part_index,
+            "block_size": block_size,  # ← 用外层的 block_size
+            "md5": file_md5
+        }
+        print(f"[官方适配] 📤 语音分片完成确认: {json.dumps(part_finish_payload, ensure_ascii=False)}")
+        
+        try:
+            async with session.post(part_finish_url, json=part_finish_payload, headers=headers, timeout=30) as pf_resp:
+                if pf_resp.status != 200:
+                    text = await pf_resp.text()
+                    print(f"[官方适配] ❌ 语音分片完成确认失败: {pf_resp.status} - {text[:200]}")
+                    return None
+                print("[官方适配] ✅ 语音分片完成确认成功")
+        except Exception as e:
+            print(f"[官方适配] ❌ 语音分片完成确认异常: {e}")
+            return None
+        
+        # 4. 等待服务端处理
+        print("[官方适配] ⏳ 等待服务端处理...")
+        await asyncio.sleep(2)
+        
+        # 5. 合并上传
+        finalize_url = f"https://api.bot.qq.com/v2/users/{user_openid}/files"
+        finalize_payload = {
+            "file_type": 3,
+            "upload_id": upload_id,
+            "srv_send_msg": False,
+            "file_name": filename
+        }
+        print(f"[官方适配] 📤 语音合并上传: {json.dumps(finalize_payload, ensure_ascii=False)}")
+        
+        try:
+            async with session.post(finalize_url, json=finalize_payload, headers=headers, timeout=30) as finalize_resp:
+                if finalize_resp.status != 200:
+                    text = await finalize_resp.text()
+                    print(f"[官方适配] ❌ 语音合并失败: {finalize_resp.status} - {text[:200]}")
+                    return None
+                data = await finalize_resp.json()
+                file_info = data.get("file_info")
+                if file_info:
+                    print(f"[官方适配] ✅ 语音合并成功，file_info 长度: {len(file_info)}")
+                    return file_info
+                else:
+                    print(f"[官方适配] ❌ 未获取到 file_info: {data}")
+                    return None
+        except Exception as e:
+            print(f"[官方适配] ❌ 语音合并异常: {e}")
+            return None
+
+
+async def upload_voice_official_group(group_openid: str, voice_data: bytes, filename: str = "voice.m4a"):
+    """群聊上传语音 - 分片上传"""
+    token = ensure_token()
+    if not token:
+        return None
+    
+    headers = {"Authorization": f"QQBot {token}", "Content-Type": "application/json"}
+    
+    file_md5 = calc_md5(voice_data)
+    file_sha1 = calc_sha1(voice_data)
+    file_md5_10m = calc_md5_10m(voice_data)
+    file_size = str(len(voice_data))
+    
+    # 1. 预上传
+    preupload_url = f"https://api.bot.qq.com/v2/groups/{group_openid}/upload_prepare"
+    payload = {
+        "file_type": 3,
+        "file_size": file_size,
+        "file_name": filename,
+        "md5": file_md5,
+        "sha1": file_sha1,
+        "md5_10m": file_md5_10m
+    }
+    
+    print(f"[官方适配] 📤 群聊语音预上传: {json.dumps(payload, ensure_ascii=False)}")
+    
+    async with aiohttp.ClientSession() as session:
+        async with session.post(preupload_url, json=payload, headers=headers, timeout=60) as resp:
+            if resp.status != 200:
+                text = await resp.text()
+                print(f"[官方适配] ❌ 群聊语音预上传失败: {resp.status} - {text[:200]}")
+                return None
+            data = await resp.json()
+            upload_id = data.get("upload_id")
+            parts = data.get("parts", [])
+            if not upload_id or not parts:
+                print(f"[官方适配] ❌ 群聊语音预上传返回异常: {data}")
+                return None
+            
+            print(f"[语音调试] 分片数量: {len(parts)}")
+            
+            # 2. 逐片上传并确认
+            for part in parts:
+                part_index = part.get("index", 1)
+                presigned_url = part.get("presigned_url")
+                block_size = int(part.get("block_size", 0))
+                
+                start = (part_index - 1) * block_size
+                end = min(start + block_size, len(voice_data))
+                chunk = voice_data[start:end]
+                actual_size = len(chunk)
+                chunk_md5 = hashlib.md5(chunk).hexdigest()  # 分片 MD5
+                
+                print(f"[官方适配] 📤 上传分片 {part_index}/{len(parts)} ({actual_size} bytes)")
+                
+                # PUT 上传
+                try:
+                    async with session.put(presigned_url, data=chunk, headers={"Content-Type": "application/octet-stream"}, timeout=60) as put_resp:
+                        if put_resp.status not in [200, 204]:
+                            text = await put_resp.text()
+                            print(f"[官方适配] ❌ 分片 {part_index} 上传失败: {put_resp.status}")
+                            return None
+                        print(f"[官方适配] ✅ 分片 {part_index} 上传成功")
+                except Exception as e:
+                    print(f"[官方适配] ❌ 分片 {part_index} 上传异常: {e}")
+                    return None
+                
+                # 确认该分片（用分片 MD5）
+                part_finish_url = f"https://api.bot.qq.com/v2/groups/{group_openid}/upload_part_finish"
+                part_finish_payload = {
+                    "upload_id": upload_id,
+                    "part_index": part_index,
+                    "block_size": str(actual_size),
+                    "md5": chunk_md5  # ← 用分片 MD5
+                }
+                print(f"[官方适配] 📤 确认分片 {part_index}: 大小 {actual_size}, MD5: {chunk_md5[:8]}...")
+                
+                try:
+                    async with session.post(part_finish_url, json=part_finish_payload, headers=headers, timeout=30) as pf_resp:
+                        if pf_resp.status != 200:
+                            text = await pf_resp.text()
+                            print(f"[官方适配] ❌ 分片 {part_index} 确认失败: {pf_resp.status} - {text[:200]}")
+                            return None
+                        print(f"[官方适配] ✅ 分片 {part_index} 确认成功")
+                except Exception as e:
+                    print(f"[官方适配] ❌ 分片 {part_index} 确认异常: {e}")
+                    return None
+            
+            # 3. 所有分片确认后，等待并合并
+            print("[官方适配] ⏳ 所有分片确认完成，等待处理...")
+            await asyncio.sleep(2)
+            
+            finalize_url = f"https://api.bot.qq.com/v2/groups/{group_openid}/files"
+            finalize_payload = {
+                "file_type": 3,
+                "upload_id": upload_id,
+                "srv_send_msg": False,
+                "file_name": filename
+            }
+            print(f"[官方适配] 📤 群聊语音合并: {json.dumps(finalize_payload, ensure_ascii=False)}")
+            
+            try:
+                async with session.post(finalize_url, json=finalize_payload, headers=headers, timeout=30) as finalize_resp:
+                    if finalize_resp.status != 200:
+                        text = await finalize_resp.text()
+                        print(f"[官方适配] ❌ 群聊语音合并失败: {finalize_resp.status} - {text[:200]}")
+                        return None
+                    data = await finalize_resp.json()
+                    file_info = data.get("file_info")
+                    if file_info:
+                        print(f"[官方适配] ✅ 群聊语音合并成功")
+                        return file_info
+                    else:
+                        print(f"[官方适配] ❌ 群聊语音未获取到 file_info: {data}")
+                        return None
+            except Exception as e:
+                print(f"[官方适配] ❌ 群聊语音合并异常: {e}")
+                return None
+
+async def download_image(url: str) -> Optional[bytes]:
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=15) as resp:
+                if resp.status == 200:
+                    return await resp.read()
+                else:
+                    print(f"[官方适配] ❌ 下载图片失败: {resp.status}")
+                    return None
+    except Exception as e:
+        print(f"[官方适配] ❌ 下载图片异常: {e}")
+        return None
+
+def resolve_image_path(path: str) -> Optional[str]:
+    if not path:
+        return None
+    if path.startswith('/'):
+        path = path[1:]
+    path = path.replace('/', '\\')
+    if os.path.exists(path):
+        return path
+    alt1 = os.path.join(os.getcwd(), path)
+    if os.path.exists(alt1):
+        return alt1
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    alt2 = os.path.join(base_dir, path)
+    if os.path.exists(alt2):
+        return alt2
+    if path.startswith('C:'):
+        alt3 = path[3:]
+        if os.path.exists(alt3):
+            return alt3
+    return None
+
+# ========== 消息发送（支持纯文本 + 图片 + 语音）==========
+async def send_message_official(message: str, user_openid=None, group_openid=None, official_msg_id=None):
+    token = ensure_token()
+    if not token:
+        return False
+    
+    headers = {"Authorization": f"QQBot {token}", "Content-Type": "application/json"}
+    
+    # ===== 检测语音 CQ 码 =====
+    voice_match = re.search(r'\[CQ:record,file=([^\]]+)\]', message)
+    if voice_match:
+        file_ref = voice_match.group(1).strip()
+        
+        raw_path = file_ref
+        if raw_path.startswith('file:///'):
+            raw_path = raw_path[8:]
+        file_path = resolve_image_path(raw_path)
+        if not file_path:
+            print(f"[官方适配] ❌ 语音文件不存在: {raw_path}")
+            return False
+        
+        try:
+            with open(file_path, 'rb') as f:
+                voice_data = f.read()
+        except Exception as e:
+            print(f"[官方适配] ❌ 读取语音失败: {e}")
+            return False
+        
+        filename = os.path.basename(file_path)
+        
+        if user_openid:
+            file_info = await upload_voice_official(user_openid, voice_data, filename)
+        elif group_openid:
+            file_info = await upload_voice_official_group(group_openid, voice_data, filename)
+        else:
+            return False
+        
+        if not file_info:
+            print("[官方适配] ⚠️ 语音上传失败")
+            return False
+        
+        if group_openid:
+            url = f"https://api.bot.qq.com/v2/groups/{group_openid}/messages"
+        elif user_openid:
+            url = f"https://api.bot.qq.com/v2/users/{user_openid}/messages"
+        else:
+            return False
+        
+        payload = {
+            "msg_type": 7,
+            "media": {"file_info": file_info}
+        }
+        if official_msg_id:
+            payload["msg_id"] = official_msg_id
+        
+        print(f"[官方适配] 📤 发送语音 (msg_type=7)")
+        
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(url, json=payload, headers=headers, timeout=10) as resp:
+                    if resp.status == 200:
+                        print("[官方适配] ✅ 语音消息发送成功")
+                        return True
+                    else:
+                        text = await resp.text()
+                        print(f"[官方适配] ❌ 发送语音失败: {resp.status} - {text[:200]}")
+                        return False
+        except Exception as e:
+            print(f"[官方适配] ❌ 发送语音异常: {e}")
+            return False
+    
+    # ===== 检测图片 CQ 码 =====
+    img_match = re.search(r'\[CQ:image,file=([^\]]+)\]', message)
+    if img_match:
+        file_ref = img_match.group(1).strip()
+        
+        if file_ref.startswith('data:image'):
+            import base64
+            b64_data = file_ref.split(',', 1)[-1]
+            image_data = base64.b64decode(b64_data)
+            filename = "help.png"
+        else:
+            raw_path = file_ref
+            if raw_path.startswith('file:///'):
+                raw_path = raw_path[8:]
+            file_path = resolve_image_path(raw_path)
+            if not file_path:
+                print(f"[官方适配] ❌ 图片不存在: {raw_path}")
+                return False
+            with open(file_path, 'rb') as f:
+                image_data = f.read()
+            filename = os.path.basename(file_path)
+        
+        if user_openid:
+            file_info = await upload_image_official(user_openid, image_data, filename)
+        elif group_openid:
+            file_info = await upload_image_official_group(group_openid, image_data, filename)
+        else:
+            return False
+        
+        if not file_info:
+            print("[官方适配] ⚠️ 上传失败，降级为文字消息")
+            return await send_message_official(
+                f"📷 图片: {file_path if 'file_path' in dir() else 'unknown'}",
+                user_openid=user_openid,
+                group_openid=group_openid,
+                official_msg_id=official_msg_id
+            )
+        
+        if group_openid:
+            url = f"https://api.bot.qq.com/v2/groups/{group_openid}/messages"
+        elif user_openid:
+            url = f"https://api.bot.qq.com/v2/users/{user_openid}/messages"
+        else:
+            return False
+        
+        payload = {
+            "msg_type": 7,
+            "media": {"file_info": file_info}
+        }
+        if official_msg_id:
+            payload["msg_id"] = official_msg_id
+        
+        print(f"[官方适配] 📤 发送图片: {json.dumps(payload, ensure_ascii=False)}")
+        
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(url, json=payload, headers=headers, timeout=10) as resp:
+                    if resp.status == 200:
+                        print("[官方适配] ✅ 图片消息发送成功")
+                        return True
+                    else:
+                        text = await resp.text()
+                        print(f"[官方适配] ❌ 发送图片失败: {resp.status} - {text[:200]}")
+                        return False
+        except Exception as e:
+            print(f"[官方适配] ❌ 发送图片异常: {e}")
+            return False
+    
+    # ===== 纯文本消息 =====
+    if group_openid:
+        url = f"https://api.bot.qq.com/v2/groups/{group_openid}/messages"
+    elif user_openid:
+        url = f"https://api.bot.qq.com/v2/users/{user_openid}/messages"
+    else:
+        return False
+    
+    payload = {
+        "msg_type": 0,
+        "content": message
+    }
+    if official_msg_id:
+        payload["msg_id"] = official_msg_id
+    
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, json=payload, headers=headers, timeout=10) as resp:
+                if resp.status == 200:
+                    return True
+                else:
+                    text = await resp.text()
+                    print(f"[官方适配] ❌ 发送失败: {resp.status} - {text[:200]}")
+                    return False
+    except Exception as e:
+        print(f"[官方适配] ❌ 发送异常: {e}")
+        return False
+
+# ========== 消息转换 ==========
+# ========== 消息转换 ==========
+def convert_official_to_onebot(data, openid_map=None, save_map_callback=None):
+    """将官方消息转换为 OneBot 格式 - 使用映射表"""
+    global BOT_QQ
+    
+    op_code = data.get("op")
+    
+    if op_code == 11:
+        return None
+    
+    if op_code == 0:
+        d = data.get("d", {})
+        event_type = data.get("t", "")
+        msg_id = d.get("id", "")
+        
+        # ===== 私聊消息 =====
+        if event_type == "C2C_MESSAGE_CREATE":
+            author = d.get("author", {})
+            user_openid = author.get("user_openid", "") or author.get("id", "")
+            text = d.get("content", "")
+            if not text:
+                return None
+            
+            # ===== 用户 ID 映射 =====
+            real_user_id = None
+            if openid_map and user_openid in openid_map:
+                real_user_id = openid_map[user_openid]
+            else:
+                real_user_id = openid_to_int(user_openid)
+                if openid_map is not None:
+                    openid_map[user_openid] = real_user_id
+                    if save_map_callback:
+                        save_map_callback()
+            
+            print(f"[映射] OpenID: {user_openid} → QQ号: {real_user_id}")
+            
+            return {
+                "post_type": "message",
+                "message_type": "private",
+                "user_id": real_user_id,
+                "group_id": None,
+                "message": text,
+                "raw_message": text,
+                "self_id": BOT_QQ,
+                "sender": {
+                    "user_id": real_user_id,
+                    "nickname": author.get("username", "")
+                },
+                "_official_user_openid": user_openid,
+                "_official_msg_id": msg_id,
+                "_official_msg_type": "private"
+            }
+        
+        # ===== 群聊 @ 消息 =====
+        elif event_type == "GROUP_AT_MESSAGE_CREATE":
+            # ===== 打印原始数据 =====
+            print(f"[官方适配] 📦 原始群聊数据: {json.dumps(d, ensure_ascii=False)[:500]}")
+            
+            # ===== 修复：从 author.id 提取用户 OpenID =====
+            author = d.get("author", {})
+            user_openid = author.get("user_openid", "") or author.get("id", "") or author.get("member_openid", "")
+            print(f"[官方适配] 🔍 提取到 user_openid: '{user_openid}'")
+            
+            if not user_openid:
+                print("[官方适配] ❌ 无法提取 user_openid，跳过消息")
+                return None
+            
+            # ===== 群 OpenID =====
+            group_openid = d.get("group_openid", "") or d.get("group_id", "")
+            print(f"[官方适配] 🔍 提取到 group_openid: '{group_openid}'")
+            
+            if not group_openid:
+                print("[官方适配] ❌ 无法提取 group_openid，跳过消息")
+                return None
+            
+            raw_text = d.get("content", "")
+            if not raw_text:
+                return None
+            
+            # ===== 用户 ID 映射 =====
+            real_user_id = None
+            if openid_map and user_openid in openid_map:
+                real_user_id = openid_map[user_openid]
+            else:
+                real_user_id = openid_to_int(user_openid)
+                if openid_map is not None:
+                    openid_map[user_openid] = real_user_id
+                    if save_map_callback:
+                        save_map_callback()
+            
+            # ===== 群 ID 映射 =====
+            group_key = "group_" + group_openid
+            real_group_id = None
+            if openid_map and group_key in openid_map:
+                real_group_id = openid_map[group_key]
+            else:
+                real_group_id = openid_to_int(group_openid)
+                if openid_map is not None:
+                    openid_map[group_key] = real_group_id
+                    if save_map_callback:
+                        save_map_callback()
+            
+            print(f"[映射] 用户 OpenID: '{user_openid}' → 假QQ: '{real_user_id}'")
+            print(f"[映射] 群 OpenID: '{group_openid}' → 假群号: '{real_group_id}'")
+            
+            # 移除官方 @ 标记，转为 CQ 格式
+            import re
+            text = re.sub(r'<@([^>]+)>', r'[CQ:at,qq=\1]', raw_text).strip()
+            
+            return {
+                "post_type": "message",
+                "message_type": "group",
+                "user_id": real_user_id,
+                "group_id": real_group_id,
+                "message": text,
+                "raw_message": text,
+                "self_id": BOT_QQ,
+                "sender": {
+                    "user_id": real_user_id,
+                    "nickname": author.get("username", "")
+                },
+                "_official_user_openid": user_openid,
+                "_official_group_openid": group_openid,
+                "_official_msg_id": msg_id,
+                "_official_msg_type": "group"
+            }
+        
+        else:
+            print(f"[官方适配] ⚠️ 未知事件类型: {event_type}")
+            return None
+    
+    return None
+
+# ========== HTTP 服务（主程序通过 HTTP 通信）==========
+
+async def http_send(request):
+    """主程序发消息到这里"""
+    try:
+        data = await request.json()
+        print(f"[适配器] 📨 收到主程序消息: {json.dumps(data, ensure_ascii=False)[:100]}...")
+        
+        # 解析主程序的回复
+        params = data.get("params", {})
+        message = params.get("message", "")
+        msg_type = params.get("message_type", "")
+        
+        if not message:
+            return web.json_response({"status": "error", "msg": "no message"})
+        
+        # 获取 openid（从上下文或缓存中获取）
+        # 这里简化处理，实际需要根据 user_id/group_id 映射到 openid
+        group_openid = data.get("_official_group_openid")
+        user_openid = data.get("_official_user_openid")
+        official_msg_id = data.get("_official_msg_id")
+        
+        # 发送到官方 QQ
+        result = await send_message_official(
+            message,
+            user_openid=user_openid,
+            group_openid=group_openid,
+            official_msg_id=official_msg_id
+        )
+        
+        if result:
+            return web.json_response({"status": "ok"})
+        else:
+            return web.json_response({"status": "error", "msg": "send failed"})
+            
+    except Exception as e:
+        print(f"[适配器] ❌ 处理主程序消息异常: {e}")
+        return web.json_response({"status": "error", "msg": str(e)}, status=500)
+
+async def http_poll(request):
+    """主程序轮询获取官方消息"""
+    global msg_queue
+    if msg_queue:
+        msg = msg_queue.pop(0)
+        return web.json_response(msg)
+    return web.json_response({"status": "empty"})
+
+async def http_start():
+    """启动 HTTP 服务"""
+    app = web.Application()
+    app.router.add_post('/send', http_send)
+    app.router.add_get('/poll', http_poll)
+    
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '127.0.0.1', HTTP_PORT)
+    await site.start()
+    print(f"[适配器] ✅ HTTP 服务已启动: http://127.0.0.1:{HTTP_PORT}")
+    print("[适配器] ⏳ 等待主程序轮询...")
+    return runner
+
+async def official_bot_main(handler):
+    """官方适配器主函数"""
+    global BOT_QQ, ACCESS_TOKEN, TOKEN_EXPIRE_TIME
+    
+    # ===== 1. 初始化映射表 =====
+    openid_map = {}
+    map_file = "data/openid_map.json"
+    
+    def save_map():
+        try:
+            os.makedirs("data", exist_ok=True)
+            with open(map_file, "w", encoding="utf-8") as f:
+                json.dump(openid_map, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"[映射] ❌ 保存失败: {e}")
+    
+    # 加载已有映射
+    try:
+        if os.path.exists(map_file):
+            with open(map_file, "r", encoding="utf-8") as f:
+                openid_map = json.load(f)
+            print(f"[映射] ✅ 已加载 {len(openid_map)} 条映射")
+    except Exception as e:
+        print(f"[映射] ❌ 加载失败: {e}")
+    
+    # ===== 2. 使用外部传入的 handler =====
+    print(f"[适配器] ✅ 使用传入的 handler，ID: {id(handler)}")
+    
+    # 打印管理员数量验证
+    try:
+        admin_count = len(handler.admin_manager.admins)
+        print(f"[适配器] 管理员数量: {admin_count}")
+    except Exception as e:
+        print(f"[适配器] ⚠️ 无法读取管理员数据: {e}")
+    
+    # ===== 3. 获取 Token =====
+    token = ensure_token()
+    if not token:
+        print("[适配器] ❌ 无法获取 Token")
+        return
+    
+    # ===== 4. 获取 Gateway =====
+    gateway_url = await get_gateway_url()
+    if not gateway_url:
+        print("[适配器] ❌ 无法获取 Gateway")
+        return
+    WS_URL = gateway_url
+    print(f"[适配器] ✅ Gateway: {WS_URL}")
+    
+    headers = {"Authorization": f"QQBot {token}"}
+    
+    # ===== 5. 主循环 =====
+    while True:
+        try:
+            token = ensure_token()
+            if not token:
+                await asyncio.sleep(5)
+                continue
+            headers["Authorization"] = f"QQBot {token}"
+            
+            print("[适配器] 🔗 连接 WebSocket...")
+            ws = await ws_connect_with_header(WS_URL, headers)
+            async with ws:
+                print("[适配器] ✅ WebSocket 已连接")
+                
+                # 等待 Hello
+                hello_received = False
+                heartbeat_interval = 41250
+                
+                while not hello_received:
+                    try:
+                        raw = await asyncio.wait_for(ws.recv(), timeout=10)
+                        hello_data = json.loads(raw)
+                        if hello_data.get("op") == 10:
+                            hello_received = True
+                            heartbeat_interval = hello_data.get("d", {}).get("heartbeat_interval", 41250)
+                            print(f"[适配器] 💓 心跳间隔: {heartbeat_interval}ms")
+                            break
+                        elif hello_data.get("op") == 9:
+                            print("[适配器] ⚠️ 无效 Session，重连...")
+                            break
+                    except asyncio.TimeoutError:
+                        print("[适配器] ⚠️ 等待 Hello 超时，重连...")
+                        break
+                
+                if not hello_received:
+                    continue
+                
+                # Identify
+                identify_payload = {
+                    "op": 2,
+                    "d": {
+                        "token": f"QQBot {token}",
+                        "intents": 1 << 25,
+                        "shard": [0, 1],
+                        "properties": {
+                            "os": "Windows",
+                            "browser": "QQBot",
+                            "device": "QQBot"
+                        }
+                    }
+                }
+                await ws.send(json.dumps(identify_payload))
+                print("[适配器] 📤 已发送 identify 握手包")
+                
+                try:
+                    raw = await asyncio.wait_for(ws.recv(), timeout=5)
+                    ready_data = json.loads(raw)
+                    if ready_data.get("t") == "READY":
+                        print("[适配器] ✅ Identify 成功，准备接收消息")
+                except asyncio.TimeoutError:
+                    print("[适配器] ⚠️ Identify 响应超时")
+                
+                # 心跳任务
+                async def heartbeat_task(ws, interval):
+                    while True:
+                        await asyncio.sleep(interval / 1000)
+                        try:
+                            await ws.send(json.dumps({"op": 1, "d": None}))
+                        except:
+                            break
+                asyncio.create_task(heartbeat_task(ws, heartbeat_interval))
+                
+                # ===== 消息循环 =====
+                while True:
+                    if time.time() >= TOKEN_EXPIRE_TIME:
+                        print("[适配器] 🔄 Token 过期，重连...")
+                        break
+                    
+                    try:
+                        raw = await asyncio.wait_for(ws.recv(), timeout=30)
+                        data = json.loads(raw)
+                        op = data.get("op")
+                        
+                        if op == 11:
+                            continue
+                        elif op == 0:
+                            # ===== 转换消息时传入映射表 =====
+                            onebot = convert_official_to_onebot(data, openid_map, save_map)
+                            if onebot:
+                                print(f"[适配器] 📩 收到消息")
+                                try:
+                                    if onebot.get("self_id"):
+                                        handler.bot_self_id = onebot["self_id"]
+                                    
+                                    reply = await handler.handle_message(onebot)
+                                    if reply:
+                                        msg = reply.get("params", {}).get("message", "")
+                                        if msg:
+                                            official_msg_id = onebot.get("_official_msg_id")
+                                            user_openid = onebot.get("_official_user_openid")
+                                            group_openid = onebot.get("_official_group_openid")
+                                            
+                                            await send_message_official(
+                                                msg,
+                                                user_openid=user_openid,
+                                                group_openid=group_openid,
+                                                official_msg_id=official_msg_id
+                                            )
+                                            print("[适配器] ✅ 已回复")
+                                except Exception as e:
+                                    print(f"[适配器] ❌ handler 异常: {e}")
+                                    import traceback
+                                    traceback.print_exc()
+                        elif op == 9:
+                            print("[适配器] ⚠️ 无效 Session，重连...")
+                            break
+                        elif op == 10:
+                            heartbeat_interval = data.get("d", {}).get("heartbeat_interval", 41250)
+                    except asyncio.TimeoutError:
+                        continue
+                    except websockets.exceptions.ConnectionClosed:
+                        print("[适配器] 🔄 WebSocket 断开，重连...")
+                        break
+                        
+        except Exception as e:
+            print(f"[适配器] ❌ 连接异常: {e}")
+            await asyncio.sleep(5)
+
+# ========== 测试模式 ==========
+async def test_mode():
+    token = ensure_token()
+    if not token:
+        print("❌ 获取 Token 失败")
+        return
+    
+    user_openid = "09AAF23C5552D991CA3600E8AD185CD3"
+    test_path = r"C:\Users\xp123\Desktop\qai\data\temp_images\lottery_daily_2249528587_1785947147.png"
+    
+    if os.path.exists(test_path):
+        print(f"✅ 图片存在: {test_path}")
+        await send_message_official(
+            f"[CQ:image,file=file:///{test_path}]",
+            user_openid=user_openid
+        )
+    else:
+        print(f"❌ 图片不存在: {test_path}")
+
+# ========== 启动入口 ==========
+def start_adapter():
+    print("[适配器] 🚀 启动官方适配器 (HTTP 轮询模式)")
+    print(f"[适配器] 📡 监听端口: {HTTP_PORT}")
+    print("[适配器] 💡 主程序请选择官方适配器模式连接")
+    asyncio.run(official_bot_main())
+async def run_bot(port=8765):
+    """主机器人连接函数 - 支持指定端口"""
     global http_handler
     
     # 1. 创建处理器
     handler = MessageHandler()
     http_handler = handler
     
-    # 2. 启动 HTTP 服务器
+    # 2. 启动 HTTP 服务器（用于接收 NapCat 上报）
     app = web.Application()
     app.router.add_post('/', handle_http_post)
     app.router.add_post('/webhook', handle_http_post)
@@ -8247,116 +9445,149 @@ async def run_bot():
     print("[HTTP] 上报接收服务已启动，端口 8766")
     print("[HTTP] LLOneBot 请配置 WebHook 地址: http://127.0.0.1:8766")
     
-    # 3. WebSocket 连接
-    uri = "ws://127.0.0.1:8765"
-    
-    def convert_sets(obj):
-        if isinstance(obj, set):
-            return list(obj)
-        elif isinstance(obj, dict):
-            return {k: convert_sets(v) for k, v in obj.items()}
-        elif isinstance(obj, (list, tuple)):
-            return [convert_sets(item) for item in obj]
-        return obj
-    
-    # 记录上次打卡的日期
-    last_sign_date = None
-    # 记录上次重置老婆的日期
-    last_reset_date = None
+    # 3. 如果是官方适配器模式（端口 3001），启动轮询任务
+    if port == 3001:
+        print("[主程序] 🔄 官方适配器模式，启动轮询...")
+        asyncio.create_task(poll_adapter(handler))
+        # 保持主程序运行
+        while True:
+            await asyncio.sleep(60)
+    else:
+        # NapCat 模式：WebSocket 连接
+        uri = f"ws://127.0.0.1:{port}"
+        
+        def convert_sets(obj):
+            if isinstance(obj, set):
+                return list(obj)
+            elif isinstance(obj, dict):
+                return {k: convert_sets(v) for k, v in obj.items()}
+            elif isinstance(obj, (list, tuple)):
+                return [convert_sets(item) for item in obj]
+            return obj
+        
+        last_sign_date = None
+        last_reset_date = None
+        
+        while True:
+            try:
+                print(f"[连接] 正在连接 WebSocket: {uri}...")
+                async with websockets.connect(uri) as websocket:
+                    print("[连接] WebSocket 连接成功")
+                    
+                    handler.websocket = websocket
+                    
+                    if hasattr(handler, 'spammer') and handler.spammer:
+                        if hasattr(handler.spammer, 'set_websocket'):
+                            handler.spammer.set_websocket(websocket)
+                    
+                    if not hasattr(handler, 'pending_requests'):
+                        handler.pending_requests = {}
+                    
+                    current_bot_id = None
+                    try:
+                        hello_data = await asyncio.wait_for(websocket.recv(), timeout=5.0)
+                        hello_json = json.loads(hello_data)
+                        if hello_json.get("post_type") == "meta_event" and hello_json.get("meta_event_type") == "lifecycle":
+                            current_bot_id = str(hello_json.get("self_id", ""))
+                            print(f"[连接] 从元事件获取到机器人ID: {current_bot_id}")
+                    except Exception as e:
+                        print(f"[连接] 未能从元事件获取ID: {e}")
+                    
+                    if current_bot_id:
+                        handler.set_bot_id(current_bot_id)
+                        print(f"[连接] 系统身份已设置为: {current_bot_id}")
+                        print(f"[连接] 验证 handler.bot_self_id = {handler.bot_self_id}")
+                    
+                    last_check_time = time.time()
+                    
+                    while True:
+                        try:
+                            raw_data = await asyncio.wait_for(websocket.recv(), timeout=1.0)
+                            data = json.loads(raw_data)
+                            
+                            if "echo" in data:
+                                echo = data.get("echo")
+                                if hasattr(handler, 'pending_requests') and echo in handler.pending_requests:
+                                    handler.pending_requests[echo].set_result(data)
+                                continue
+                            
+                            reply = await handler.handle_message(data)
+                            if reply:
+                                try:
+                                    await websocket.send(json.dumps(convert_sets(reply)))
+                                except TypeError:
+                                    reply = convert_sets(reply)
+                                    await websocket.send(json.dumps(reply))
+                                    
+                        except asyncio.TimeoutError:
+                            current_time = time.time()
+                            if current_time - last_check_time > 60:
+                                last_check_time = current_time
+                                now = datetime.now()
+                                current_date = now.strftime("%Y-%m-%d")
+                                
+                                if last_sign_date != current_date and now.hour == 0 and now.minute == 0:
+                                    print(f"[定时] 触发00:00自动打卡")
+                                    await auto_sign_all_groups(websocket, handler)
+                                    last_sign_date = current_date
+                                
+                                if last_reset_date != current_date and now.hour == 0 and now.minute < 5:
+                                    if hasattr(handler, 'today_wife_record'):
+                                        handler.today_wife_record = {}
+                                        last_reset_date = current_date
+                                        print(f"[定时] 今日老婆记录已重置 ({current_date})")
+                                
+                            continue
+                            
+                        except websockets.exceptions.ConnectionClosed:
+                            print("[连接] WebSocket 连接断开，重新连接...")
+                            break
+                        except Exception as e:
+                            print(f"[错误] 消息循环异常: {e}")
+                            await asyncio.sleep(1)
+                            
+            except ConnectionRefusedError:
+                print(f"[连接] WebSocket 连接被拒绝 ({uri})，5秒后重试...")
+                await asyncio.sleep(5)
+            except Exception as e:
+                print(f"[连接] WebSocket 连接异常: {e}, 5秒后重试...")
+                await asyncio.sleep(5)
+
+
+# ========== 轮询适配器函数 ==========
+async def poll_adapter(handler):
+    """轮询适配器获取官方消息"""
+    import aiohttp
     
     while True:
         try:
-            print("[连接] 正在连接 LLOneBot WebSocket...")
-            async with websockets.connect(uri) as websocket:
-                print("[连接] WebSocket 连接成功")
-                
-                handler.websocket = websocket
-                
-                # 设置刷屏器的websocket
-                if hasattr(handler, 'spammer') and handler.spammer:
-                    if hasattr(handler.spammer, 'set_websocket'):
-                        handler.spammer.set_websocket(websocket)
-                
-                # 初始化 pending_requests（如果不存在）
-                if not hasattr(handler, 'pending_requests'):
-                    handler.pending_requests = {}
-                
-                # 获取机器人ID
-                current_bot_id = None
-                try:
-                    hello_data = await asyncio.wait_for(websocket.recv(), timeout=5.0)
-                    hello_json = json.loads(hello_data)
-                    if hello_json.get("post_type") == "meta_event" and hello_json.get("meta_event_type") == "lifecycle":
-                        current_bot_id = str(hello_json.get("self_id", ""))
-                        print(f"[连接] 从元事件获取到机器人ID: {current_bot_id}")
-                except Exception as e:
-                    print(f"[连接] 未能从元事件获取ID: {e}")
-                
-                if current_bot_id:
-                    handler.set_bot_id(current_bot_id)
-                    print(f"[连接] 系统身份已设置为: {current_bot_id}")
-                    print(f"[连接] 验证 handler.bot_self_id = {handler.bot_self_id}")
-                
-                last_check_time = time.time()
-                
-                while True:
-                    try:
-                        raw_data = await asyncio.wait_for(websocket.recv(), timeout=1.0)
-                        data = json.loads(raw_data)
-                        
-                        # 处理API响应（包括群列表响应）
-                        if "echo" in data:
-                            echo = data.get("echo")
-                            if hasattr(handler, 'pending_requests') and echo in handler.pending_requests:
-                                handler.pending_requests[echo].set_result(data)
-                            continue
-                        
-                        reply = await handler.handle_message(data)
-                        if reply:
-                            try:
-                                await websocket.send(json.dumps(convert_sets(reply)))
-                            except TypeError:
-                                reply = convert_sets(reply)
-                                await websocket.send(json.dumps(reply))
-                                
-                    except asyncio.TimeoutError:
-                        current_time = time.time()
-                        if current_time - last_check_time > 60:  # 每分钟检查一次
-                            last_check_time = current_time
-                            now = datetime.now()
-                            current_date = now.strftime("%Y-%m-%d")
-                            
-                            # ========== 每天0点执行自动打卡（自动获取群列表） ==========
-                            if last_sign_date != current_date and now.hour == 0 and now.minute == 0:
-                                print(f"[定时] 触发00:00自动打卡")
-                                await auto_sign_all_groups(websocket, handler)
-                                last_sign_date = current_date
-                            
-                            # ========== 每日重置今日老婆记录 ==========
-                            if last_reset_date != current_date and now.hour == 0 and now.minute < 5:
-                                if hasattr(handler, 'today_wife_record'):
-                                    handler.today_wife_record = {}
-                                    last_reset_date = current_date
-                                    print(f"[定时] 今日老婆记录已重置 ({current_date})")
-                            
-                            # ========== 可选：其他定时任务 ==========
-                            # 其他需要定时执行的任务可以在这里添加
-                            
-                        continue
-                        
-                    except websockets.exceptions.ConnectionClosed:
-                        print("[连接] WebSocket 连接断开，重新连接...")
-                        break
-                    except Exception as e:
-                        print(f"[错误] 消息循环异常: {e}")
-                        await asyncio.sleep(1)
-                        
-        except ConnectionRefusedError:
-            print("[连接] WebSocket 连接被拒绝，5秒后重试...")
+            async with aiohttp.ClientSession() as session:
+                async with session.get("http://127.0.0.1:3001/poll", timeout=30) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        if data.get("status") != "empty":
+                            print(f"[主程序] 📩 收到官方消息")
+                            # 处理消息
+                            reply = await handler.handle_message(data)
+                            if reply:
+                                # 发送回复到适配器
+                                try:
+                                    async with session.post("http://127.0.0.1:3001/send", json=reply) as send_resp:
+                                        if send_resp.status == 200:
+                                            print(f"[主程序] ✅ 已发送回复")
+                                        else:
+                                            print(f"[主程序] ❌ 发送回复失败: {send_resp.status}")
+                                except Exception as e:
+                                    print(f"[主程序] ❌ 发送回复异常: {e}")
+        except aiohttp.ClientConnectorError:
+            # 适配器未启动，静默等待
             await asyncio.sleep(5)
+        except asyncio.TimeoutError:
+            # 超时正常，继续轮询
+            await asyncio.sleep(1)
         except Exception as e:
-            print(f"[连接] WebSocket 连接异常: {e}, 5秒后重试...")
-            await asyncio.sleep(5)
+            print(f"[主程序] ⚠️ 轮询异常: {e}")
+            await asyncio.sleep(3)
 # ==================== 主函数 ====================
 # 在 main 函数开始前添加
 import os
@@ -8393,17 +9624,15 @@ def start_zhenxun():
         return None
 
 
-if __name__ == "__main__":
-    import os
-
+def main():
+    global main_handler
+    
     # ===== 看门狗令牌控制 =====
     GUARD_FILE = "data/.gitkeep"
-
     if os.path.exists(GUARD_FILE):
         print("[系统] 检测到令牌，看门狗不启动")
     else:
         print("[系统] 未检测到守护令牌，看门狗启动")
-
         import subprocess
         script_dir = os.path.dirname(os.path.abspath(__file__))
         watchdog_path = os.path.join(script_dir, "llbot_watchdog.py")
@@ -8417,18 +9646,44 @@ if __name__ == "__main__":
             creationflags=subprocess.CREATE_NO_WINDOW,
         )
         print("[看门狗] 已独立启动")
-
-    # 启动安全检查
+    
     _check()
-    print("正在启动主程序...")
+    
+    print("=" * 50)
+    print("🤖 XP12 机器人启动器")
+    print("=" * 50)
+    print("1. NapCat 模式 (连接本地 NapCat WebSocket)")
+    print("2. 官方适配器模式 (直连 QQ 官方机器人)")
+    print("=" * 50)
+    
+    choice = input("请选择模式 (1/2): ").strip()
     
     try:
-        asyncio.run(main())
+        if choice == "2":
+            print("🚀 启动官方适配器模式...")
+            if main_handler is None:
+                main_handler = MessageHandler()
+                print(f"[主程序] ✅ handler 已创建，ID: {id(main_handler)}")
+            asyncio.run(official_bot_main(main_handler))
+        else:
+            print("🚀 启动 NapCat 模式...")
+            asyncio.run(run_bot())
     except KeyboardInterrupt:
         print("\n[主程序] 收到退出信号")
-        cleanup_on_exit()
+        try:
+            cleanup_on_exit()
+        except NameError:
+            pass
     except Exception as e:
         print(f"\n❌ 程序崩溃: {e}")
         import traceback
         traceback.print_exc()
-        cleanup_on_exit()
+        try:
+            cleanup_on_exit()
+        except NameError:
+            pass
+    
+    input("按回车键退出...")
+
+if __name__ == "__main__":
+    main()

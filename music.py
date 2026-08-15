@@ -31,9 +31,10 @@ class MusicService:
             "qq": {
                 "name": "QQ音乐",
                 "url": "https://a.aa.cab/qq.music",
-                "params": {"msg": "", "num": 1, "n": 1, "type": 4}
+                "params": {"msg": "", "num": 1, "n": 1, "type": 2}  # ← 改成 2（普通品质）
             }
         }
+        
         self.source_order = ["qq"]
         self.download_dir = "data/temp_music"
         os.makedirs(self.download_dir, exist_ok=True)

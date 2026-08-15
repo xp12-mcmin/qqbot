@@ -22,11 +22,8 @@ class HelpImageGenerator:
         self._load_fonts()
     
     def image_to_base64(self, img: Image.Image) -> str:
-        """将图片转换为 base64 编码"""
-        buffer = BytesIO()
-        img.save(buffer, format='PNG')
-        img_base64 = base64.b64encode(buffer.getvalue()).decode('utf-8')
-        return f"base64://{img_base64}"
+        """将图片转换为文件路径（兼容旧调用）"""
+        return self.save_to_temp(img)  # 直接返回文件路径
     
     def _load_fonts(self):
         """加载字体"""
