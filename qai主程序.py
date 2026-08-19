@@ -4446,6 +4446,8 @@ class MessageHandler:
             
             message = random.choice(messages)
             return message.replace('@', f'[CQ:at,qq={user_id}]')
+
+        
     async def handle_message(self, data: Dict) -> Optional[Dict]:
         try:
             post_type = data.get("post_type", "")
@@ -4460,7 +4462,7 @@ class MessageHandler:
             except Exception as e:
                 print(f"[防撤回] 记录消息失败: {e}")
         
-            # 提取变量（移到前面）
+            # 提取变量
             message_type = data.get("message_type", "")
             user_id = str(data.get("user_id", "unknown"))
             group_id = data.get("group_id")
@@ -4477,22 +4479,17 @@ class MessageHandler:
             # ====== 互斥骂人逻辑 ======
             new_system_triggered = False
             scolding_msg = None
-            _check
-            # 1. 先检查新系统（目标QQ骂人）
             if (hasattr(self, 'scolding_system') and 
                 message_type == "group" and 
                 group_id and 
                 self.scolding_enabled and
                 self.scolding_system.should_scold(str(group_id), user_id)):
-            
                 print(f"[新系统] 触发目标{user_id}")
                 target_message = self._extract_pure_text(data)
                 scolding_msg = self.scolding_system.generate_scolding(user_id, target_message)
                 new_system_triggered = True
 
-            # 2. 如果新系统没触发，检查旧系统（关键词骂人）
             old_system_triggered = False
-
             if not new_system_triggered and hasattr(self, 'scolding_config'):
                 if self.scolding_enabled and self.scolding_config.get('enabled', False):
                     if self._should_scold(data):
@@ -4500,7 +4497,6 @@ class MessageHandler:
                         scolding_msg = self._get_scolding_message(user_id, data)
                         old_system_triggered = True
         
-            # ====== 骂人回复 ======
             if new_system_triggered or old_system_triggered:
                 print(f"[骂人] 使用{'新' if new_system_triggered else '旧'}系统回复")
                 return self._create_reply(
@@ -4510,8 +4506,7 @@ class MessageHandler:
                     message=scolding_msg
                 )
         
-            # ====== 继续原有逻辑 ======
-            # 检查禁用群
+            # ====== 检查禁用群 ======
             if message_type == "group" and str(group_id) in self.disabled_groups:
                 return None
         
@@ -4530,7 +4525,6 @@ class MessageHandler:
                     raw_text = raw_message
                 else:
                     raw_text = self._extract_pure_text(data)
-            
                 import re
                 url_match = re.search(r'https?://[^\s]+', raw_text)
                 if url_match:
@@ -4541,8 +4535,7 @@ class MessageHandler:
                         info = await self.video_parser.parse_video(url)
                         if info:
                             msg = self.video_parser.format_message(info)
-                            reply = self._create_reply(message_type, user_id, group_id, msg)
-                            return reply
+                            return self._create_reply(message_type, user_id, group_id, msg)
         
             # ========== 检查是否需要回复（@机器人）==========
             if message_type == "private":
@@ -4568,10 +4561,8 @@ class MessageHandler:
             text = self._extract_pure_text(data)
             if not text or text == "（空消息）":
                 return None
-            print(f"[调试] personality_mgr 存在: {hasattr(self, 'ai') and hasattr(self.ai, 'personality_mgr')}")
-            if hasattr(self, 'ai') and hasattr(self.ai, 'personality_mgr'):
-                print(f"[调试] personality_mgr 对象: {self.ai.personality_mgr}")
-            # ========== 安全检测（所有消息都检测，包括私聊和群聊）==========
+            
+            # ========== 安全检测 ==========
             if hasattr(self, 'ai') and hasattr(self.ai, 'personality_mgr'):
                 intercept, reply = self.ai.personality_mgr.check_message(text, user_id, str(group_id) if group_id else None)
                 if intercept:
@@ -4587,25 +4578,35 @@ class MessageHandler:
                     skip_msg = f"[CQ:at,qq={user_id}] {skip_msg}"
                 return self._create_reply(message_type, user_id, group_id, skip_msg)
         
-            # ========== 处理命令（传入原始数据）==========
+            # ========== 处理命令 ==========
             command_response = await self._process_commands(text, user_id, message_type, group_id, raw_message_data=data)
-            if command_response:
-                return command_response
-            # ========== 敏感词检测（新增）==========
-            # ========== 敏感词检测（改为 check_message）==========
+            
+            # ===== 关键修复：检查命令是否已处理 =====
+            if command_response is not None:
+                # 如果是特殊标记 _handled，说明已通过 HTTP API 发送，直接返回 None
+                if isinstance(command_response, dict) and command_response.get("_handled"):
+                    return None
+                # 如果是正常的回复 dict，直接返回
+                if isinstance(command_response, dict):
+                    return command_response
+                return None
+
+            # ========== 只有命令没匹配到，才继续执行后面的逻辑 ==========
+            
+            # 敏感词检测
             if hasattr(self, 'ai') and hasattr(self.ai, 'personality_mgr'):
                 intercept, reply = self.ai.personality_mgr.check_message(text, user_id, str(group_id) if group_id else None)
                 if intercept:
                     if message_type == "group":
                         reply = f"[CQ:at,qq={user_id}] {reply}"
                     print(f"[安全] 用户 {user_id} 触发违规拦截: {text[:50]}")
-                    return self._create_reply(message_type, user_id, group_id, reply) 
-            # ========== 联网搜索 ==========
+                    return self._create_reply(message_type, user_id, group_id, reply)
+            
+            # 联网搜索
             if text.lower().startswith(("!搜索", "！搜索", "!搜", "！搜")):
-                # ... 联网搜索代码保持不变 ...
                 pass
 
-            # ========== 绿茶反击检测 ==========
+            # 绿茶反击检测
             if hasattr(self, 'green_tea') and message_type == "group" and group_id:
                 pure_text = self._extract_pure_text(data)
                 if self.green_tea.should_counter(str(group_id), user_id, pure_text):
@@ -4627,6 +4628,9 @@ class MessageHandler:
             import traceback
             traceback.print_exc()
             return None
+
+
+    
     async def _today_wife(self, group_id: int, caller_id: str) -> Dict:
         try:
             import random
@@ -4830,12 +4834,18 @@ class MessageHandler:
         print(f"[命令] 收到: {text_lower}")
       
         # ========== 1. 帮助命令 ==========
+        # ========== 1. 帮助命令 ==========
         if text_lower in ["帮助", "help", "菜单", "功能"] or text_lower.startswith(("!帮助", "！帮助")):
             parts = text.split()
             if len(parts) >= 2:
-                return self._get_help_reply(user_id, message_type, group_id, parts[1])
+                result = await self._get_help_reply(user_id, message_type, group_id, parts[1])
             else:
-                return self._get_help_reply(user_id, message_type, group_id, None)
+                result = await self._get_help_reply(user_id, message_type, group_id, None)
+            # ===== 关键：用特殊返回值标记命令已处理 =====
+            if result is None:
+                # 返回一个特殊 dict 表示已处理
+                return {"_handled": True}
+            return result
         
         # ========== 今日老婆系统 ==========
         if text_lower in ["今日老婆", "！今日老婆", "!今日老婆", "今日女友", "！今日女友", "!今日女友", 
@@ -5150,20 +5160,22 @@ class MessageHandler:
             result, msg = self.admin_manager.submit_apply(real_user_id, reason)
             return self._create_reply(message_type, user_id, group_id, msg)
         # ========== 抽签命令 ==========
+        # ========== 抽签命令 ==========
+        # ========== 抽签命令 ==========
         if text_lower.startswith(("!抽签", "！抽签", "!签", "！签")):
             print(f"[抽签调试] 进入抽签处理分支")
             print(f"[抽签调试] text={text}, user_id={user_id}, group_id={group_id}")
-    
+
             parts = text.split()
             print(f"[抽签调试] parts={parts}")
-    
+
             if len(parts) >= 2:
                 lottery_type = parts[1].lower()
             else:
                 lottery_type = "daily"
-    
+
             print(f"[抽签调试] lottery_type={lottery_type}")
-    
+
             # 类型映射
             type_map = {
                 "daily": "daily", "每日": "daily",
@@ -5172,14 +5184,14 @@ class MessageHandler:
                 "work": "work", "事业": "work",
                 "study": "study", "学业": "study"
             }
-    
+
             lottery_type = type_map.get(lottery_type, "daily")
             print(f"[抽签调试] 映射后类型={lottery_type}")
-    
+
             # 获取用户昵称
             user_name = self._get_user_name(user_id, group_id)
             print(f"[抽签调试] user_name={user_name}")
-    
+
             try:
                 print(f"[抽签调试] 开始调用 draw_lottery_image...")
                 img_path, result_name, result_desc, score = self.lottery.draw_lottery_image(
@@ -5187,30 +5199,32 @@ class MessageHandler:
                 )
                 print(f"[抽签调试] draw_lottery_image 返回成功")
                 print(f"[抽签调试] img_path={img_path}, result_name={result_name}")
-        
+
                 # 检查图片文件是否存在
                 if not os.path.exists(img_path):
                     print(f"[抽签调试] ❌ 图片文件不存在: {img_path}")
                     return self._create_reply(message_type, user_id, group_id, f"❌ 图片生成失败")
-        
+
                 print(f"[抽签调试] ✅ 图片文件存在，准备发送")
-        
-                # 发送图片
-                return {
-                    "action": "send_msg",
-                    "params": {
-                        "message_type": message_type,
-                        "group_id": int(group_id) if message_type == "group" else None,
-                        "user_id": int(user_id) if message_type == "private" else None,
-                        "message": f"[CQ:image,file=file:///{os.path.abspath(img_path)}]"
-                    }
-                }
+
+                # ===== 关键修复：用异步发送图片 =====
+                result = await self._send_help_image_async(
+                    message_type, user_id, group_id, img_path
+                )
+                if result:
+                    return result
+                
+                # ===== 关键：返回特殊标记，表示命令已处理 =====
+                return {"_handled": True}
+
             except Exception as e:
                 print(f"[抽签调试] ❌ 异常: {e}")
                 import traceback
                 traceback.print_exc()
                 return self._create_reply(message_type, user_id, group_id, f"❌ 抽签失败: {e}")
-        # ========== 12. 绿茶语录（普通用户可用）==========
+
+
+    # ========== 12. 绿茶语录（普通用户可用）==========
         if text_lower == "!绿茶语录":
             phrase = random.choice(self.green_tea.green_tea_phrases)
             return self._create_reply(message_type, user_id, group_id, f"🍵 随机绿茶语录:\n{phrase}")
@@ -5645,68 +5659,65 @@ class MessageHandler:
             }
         
         # ---------- 13.6 黑名单 ----------
+        # ---------- 13.6 黑名单 ----------
+        # ---------- 13.6 黑名单 ----------
+        # ---------- 13.6 黑名单 ----------
+        # ---------- 13.6 黑名单 ----------
+        # ---------- 13.6 黑名单 ----------
+        # ---------- 13.6 黑名单 ----------
         if text_lower.startswith(("!ban", "！ban", "!封禁", "！封禁")):
-            # 去掉前缀后的剩余部分
-            rest = text_lower
-            for prefix in ["!ban", "！ban", "!封禁", "！封禁"]:
-                if rest.startswith(prefix):
-                    rest = rest[len(prefix):].strip()
-                    break
-
-            # 或者直接用原来的 parts 逻辑
             parts = text.split()
             if len(parts) >= 2:
-                # ===== 优先从 @ 提取目标 =====
                 target = None
                 
-                # 检查是否有 @ 消息（从 raw_message_data 的 message 列表中提取）
-                if raw_message_data:
-                    raw_msg = raw_message_data.get("message", [])
-                    if isinstance(raw_msg, list):
-                        for seg in raw_msg:
-                            if seg.get("type") == "at":
-                                # 官方适配器：@ 里是 QQ 号（假 ID）或 OpenID
-                                data = seg.get("data", {})
-                                # 优先用 openid（如果有），否则用 qq
-                                target = data.get("openid") or data.get("qq") or ""
-                                if target:
-                                    print(f"[封禁] 从 @ 提取到目标: {target}")
-                                    break
+                # ===== 从 raw_message 提取 @（排除机器人自己）=====
+                raw_msg = raw_message_data.get("raw_message", "") if raw_message_data else ""
+                print(f"[ban调试] raw_message: {raw_msg}")
                 
-                # 如果没有 @，用参数里的数字
+                if raw_msg:
+                    import re
+                    at_matches = re.findall(r'\[CQ:at,qq=(\d+)\]', raw_msg)
+                    print(f"[ban调试] 所有 @: {at_matches}")
+                    
+                    bot_id = str(self.bot_self_id)
+                    for qq in at_matches:
+                        if qq != bot_id:
+                            target = qq
+                            print(f"[ban调试] 从 @ 提取目标: {target}")
+                            break
+                
+                # ===== 如果没找到 @，取第一个数字参数（3位以上）=====
                 if not target:
-                    target = parts[1]
-                    # 如果是 OpenID（长字符串），直接使用；如果是数字，可能是 QQ 号或假 ID
-                    if not target:
-                        return self._create_reply(message_type, user_id, group_id, "❌ 请 @ 要封禁的人，或输入 QQ 号")
+                    for part in parts[1:]:
+                        # 放宽到 3-11 位（支持短号）
+                        if re.match(r'^\d{3,11}$', part):
+                            target = part
+                            print(f"[ban调试] 从参数提取目标: {target}")
+                            break
+                
+                if not target:
+                    return self._create_reply(message_type, user_id, group_id, 
+                        "❌ 请 @ 要封禁的人，或输入 QQ 号\n📝 格式: !ban @用户 [时长] [原因]")
                 
                 # ========== 解析时长和原因 ==========
                 duration = 0
                 duration_text = ""
                 reason_parts = []
                 
-                # 从位置2开始解析（跳过命令和 target）
-                start_idx = 2
-                if parts[1] != target and len(parts) > 2:
-                    # 如果 target 是从 @ 提取的，parts[1] 可能不是 target
-                    start_idx = 2
-                else:
-                    start_idx = 2
-                
-                # 实际的参数从 start_idx 开始
-                for i in range(start_idx, len(parts)):
-                    part = parts[i]
-                    if re.match(r'^(\d+)(s|秒|m|分|分钟|h|时|小时|d|天|w|周|月|M)$', part.lower()):
-                        duration_text = part
-                    else:
-                        reason_parts.append(part)
-                
-                if not duration_text:
-                    for i in range(start_idx, len(parts)):
-                        part = parts[i]
-                        if part.isdigit() and len(part) <= 4:
+                for part in parts[1:]:
+                    if part == target:
+                        continue
+                    # 检查是否是时长（数字+单位 或 纯数字作为秒）
+                    if re.match(r'^(\d+)(s|秒|m|分|分钟|h|时|小时|d|天|w|周|月|年)$', part.lower()):
+                        if not duration_text:
+                            duration_text = part
+                            continue
+                    # 纯数字且不是目标，当作秒数
+                    if re.match(r'^\d+$', part) and part != target:
+                        if not duration_text:
                             duration_text = part + "s"
-                            break
+                            continue
+                    reason_parts.append(part)
                 
                 if duration_text:
                     duration = self._parse_duration_advanced(duration_text)
@@ -5731,33 +5742,43 @@ class MessageHandler:
                     return self._create_reply(message_type, user_id, group_id, f"❌ 用户 {target} 已在黑名单中")
             
             return self._create_reply(message_type, user_id, group_id, "📝 格式: !ban @用户 [时长] [原因]\n⏰ 时长示例: 30s, 5m, 2h, 1d, 1w, 1月（留空为永久）")
-        if text_lower.startswith(("!unban ", "！unban ", "!解封 ", "！解封 ")):
+
+        # ---------- 解封命令 !unban ----------
+        # ---------- 解封命令 !unban ----------
+        if text_lower.startswith(("!unban", "！unban", "!解封", "！解封")):
             parts = text.split()
             if len(parts) >= 2:
-                # ===== 优先从 @ 提取目标 =====
                 target = None
-                if raw_message_data:
-                    raw_msg = raw_message_data.get("message", [])
-                    if isinstance(raw_msg, list):
-                        for seg in raw_msg:
-                            if seg.get("type") == "at":
-                                data = seg.get("data", {})
-                                target = data.get("openid") or data.get("qq") or ""
-                                if target:
-                                    break
                 
-                # 如果没有 @，用参数
+                # ===== 从 raw_message 提取 @ =====
+                raw_msg = raw_message_data.get("raw_message", "") if raw_message_data else ""
+                if raw_msg:
+                    import re
+                    at_matches = re.findall(r'\[CQ:at,qq=(\d+)\]', raw_msg)
+                    bot_id = str(self.bot_self_id)
+                    for qq in at_matches:
+                        if qq != bot_id:
+                            target = qq
+                            break
+                
+                # ===== 如果没找到 @，取第一个数字参数（3位以上）=====
                 if not target:
-                    target = parts[1]
-                    if not target:
-                        return self._create_reply(message_type, user_id, group_id, "❌ 请 @ 要解封的人，或输入 ID")
+                    for part in parts[1:]:
+                        if re.match(r'^\d{3,11}$', part):
+                            target = part
+                            break
+                
+                if not target:
+                    return self._create_reply(message_type, user_id, group_id, 
+                        "❌ 请 @ 要解封的人，或输入 QQ 号\n📝 格式: !unban @用户")
                 
                 if self.blacklist.unban_user(target):
                     return self._create_reply(message_type, user_id, group_id, f"✅ 已解封 {target}")
                 else:
                     return self._create_reply(message_type, user_id, group_id, f"❌ 用户 {target} 不在黑名单中")
-            return self._create_reply(message_type, user_id, group_id, "📝 格式: !unban @用户 或 !unban ID")
-        # ---------- 查看黑名单 ----------
+            
+            return self._create_reply(message_type, user_id, group_id, "📝 格式: !unban @用户")
+# ---------- 查看黑名单 ----------
         import re
         if text_lower in ["!blacklist", "！blacklist", "!黑名单", "！黑名单", "!黑名单列表", "！黑名单列表"]:
             # 获取封禁总数
@@ -6201,8 +6222,8 @@ class MessageHandler:
             return "🌳 树洞今天打烊了，明天再来吧~"
     import subprocess
     async def _music(self, group_id: int, user_id: str, keyword: str) -> Dict:
-        """点歌 - 适配器版本"""
-
+        """点歌 - 发详情 + 语音两条"""
+        
         # ========== 计数去重 ==========
         if not hasattr(self, '_music_count'):
             self._music_count = {}
@@ -6250,29 +6271,89 @@ class MessageHandler:
 
             filepath = await music.download_music(music_url, filename)
 
-            # ===== 构建最终消息 =====
-            final_msg = f"🎵 《{song_name}》- {artist}"
+            # ===== 构建详情消息 =====
+            detail_msg = f"🎵 《{song_name}》- {artist}"
             if cover_url:
-                final_msg = f"[CQ:image,file={cover_url}]\n{final_msg}"
+                detail_msg = f"[CQ:image,file={cover_url}]\n{detail_msg}"
 
             if download_url:
-                final_msg += f"\n📥 下载链接：{download_url}"
+                detail_msg += f"\n📥 下载链接：{download_url}"
             elif music_url:
-                final_msg += f"\n🔗 下载链接：{music_url}"
+                detail_msg += f"\n🔗 链接：{music_url}"
 
-            # 如果有语音文件，直接发语音
+            # ===== 如果有语音文件 =====
+            voice_msg = None
             if filepath and os.path.exists(filepath):
-                voice_msg = f"[CQ:record,file=file:///{os.path.abspath(filepath).replace('\\', '/')}]"
-                # 返回语音消息（适配器会处理）
-                return self._create_reply("group", user_id, group_id, voice_msg)
-            
-            return self._create_reply("group", user_id, group_id, final_msg)
+                abs_path = os.path.abspath(filepath)
+                print(f"[点歌] 📤 语音文件: {abs_path}")
+                voice_msg = f"[CQ:record,file={abs_path}]"
+
+            # ===== 发送两条消息 =====
+            # 判断是否是官方适配器模式
+            is_official = hasattr(self, '_official_mode') and self._official_mode
+
+            if is_official:
+                # 官方适配器：返回两条消息（用 reply 列表或依次发送）
+                # 先发详情
+                detail_reply = self._create_reply("group", user_id, group_id, detail_msg)
+                await self._send_reply_via_adapter(detail_reply)
+                
+                # 再发语音（如果有）
+                if voice_msg:
+                    voice_reply = self._create_reply("group", user_id, group_id, voice_msg)
+                    await self._send_reply_via_adapter(voice_reply)
+                
+                return None  # 已发送
+
+            else:
+                # NapCat 模式：直接用 HTTP API 发送两条
+                import aiohttp
+                url = "http://127.0.0.1:3000/send_msg"
+                
+                # 发送详情
+                payload = {
+                    "group_id": int(group_id),
+                    "message": detail_msg
+                }
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(url, json=payload, timeout=30) as resp:
+                        if resp.status == 200:
+                            print(f"[点歌] ✅ 详情发送成功")
+                        else:
+                            text = await resp.text()
+                            print(f"[点歌] ❌ 详情发送失败: {resp.status} - {text}")
+                
+                # 发送语音（如果有）
+                if voice_msg:
+                    payload = {
+                        "group_id": int(group_id),
+                        "message": voice_msg
+                    }
+                    async with aiohttp.ClientSession() as session:
+                        async with session.post(url, json=payload, timeout=30) as resp:
+                            if resp.status == 200:
+                                print(f"[点歌] ✅ 语音发送成功")
+                            else:
+                                text = await resp.text()
+                                print(f"[点歌] ❌ 语音发送失败: {resp.status} - {text}")
+                
+                return None  # 已发送
 
         except Exception as e:
             print(f"[点歌] 错误: {e}")
             import traceback
             traceback.print_exc()
             return self._create_reply("group", user_id, group_id, f"❌ 点歌失败：{str(e)}")
+
+    async def _send_reply_via_adapter(self, reply: Dict):
+        """通过适配器发送回复"""
+        if reply and self.websocket:
+            try:
+                await self.websocket.send(json.dumps(reply))
+            except Exception as e:
+                print(f"[发送] 失败: {e}")
+
+
     async def _send_group_image_official(self, group_openid: str, image_data: bytes, filename: str, msg_id: str) -> bool:
         """官方适配器：群聊发送图片"""
         import aiohttp
@@ -6934,36 +7015,42 @@ class MessageHandler:
         
         text = text.lower().strip()
         
+        # 纯数字，默认秒
         if text.isdigit():
             return int(text)
         
         import re
         
+        # 带单位解析
         patterns = [
-            (r'^(\d+)\s*s$', 1),
-            (r'^(\d+)\s*秒$', 1),
-            (r'^(\d+)\s*m$', 60),
-            (r'^(\d+)\s*分$', 60),
-            (r'^(\d+)\s*分钟$', 60),
-            (r'^(\d+)\s*h$', 3600),
-            (r'^(\d+)\s*时$', 3600),
-            (r'^(\d+)\s*小时$', 3600),
-            (r'^(\d+)\s*d$', 86400),
-            (r'^(\d+)\s*天$', 86400),
-            (r'^(\d+)\s*w$', 604800),
-            (r'^(\d+)\s*周$', 604800),
-            (r'^(\d+)\s*星期$', 604800),
-            (r'^(\d+)\s*月$', 2592000),
-            (r'^(\d+)\s*M$', 2592000),
-            (r'^(\d+)\s*年$', 31536000),
+            (r'^(\d+)\s*s$', 1),        # 5s
+            (r'^(\d+)\s*秒$', 1),       # 5秒
+            (r'^(\d+)\s*m$', 60),       # 5m
+            (r'^(\d+)\s*分$', 60),      # 5分
+            (r'^(\d+)\s*分钟$', 60),    # 5分钟
+            (r'^(\d+)\s*h$', 3600),     # 2h
+            (r'^(\d+)\s*时$', 3600),    # 2时
+            (r'^(\d+)\s*小时$', 3600),  # 2小时
+            (r'^(\d+)\s*d$', 86400),    # 1d
+            (r'^(\d+)\s*天$', 86400),   # 1天
+            (r'^(\d+)\s*w$', 604800),   # 1w
+            (r'^(\d+)\s*周$', 604800),  # 1周
+            (r'^(\d+)\s*月$', 2592000), # 1月
+            (r'^(\d+)\s*年$', 31536000),# 1年
         ]
         
         for pattern, multiplier in patterns:
             match = re.match(pattern, text)
             if match:
-                return int(match.group(1)) * multiplier
+                seconds = int(match.group(1)) * multiplier
+                max_duration = 2505600  # 29天
+                if seconds > max_duration:
+                    return max_duration
+                return seconds
         
-        return 0
+        # 解析失败，返回默认600秒（10分钟）
+        print(f"[禁言] 无法解析时长: {text}，使用默认10分钟")
+        return 600
 
     def _format_duration(self, seconds: int) -> str:
         """格式化时长显示"""
@@ -7165,48 +7252,85 @@ class MessageHandler:
         ]
         return "\n".join(lines)
     
-    def _send_help_image(self, message_type: str, user_id: str, group_id: str, img_data) -> Dict:
-        """发送帮助图片 - 支持文件路径"""
-        # 如果 img_data 是文件路径（字符串且文件存在）
-        if isinstance(img_data, str) and os.path.exists(img_data):
-            abs_path = os.path.abspath(img_data)
-            return {
-                "action": "send_msg",
-                "params": {
-                    "message_type": message_type,
-                    "group_id": int(group_id) if message_type == "group" else None,
-                    "user_id": int(user_id) if message_type == "private" else None,
-                    "message": f"[CQ:image,file=file:///{abs_path}]"
-                }
-            }
-        
-        # 如果 img_data 是 PIL Image 对象，先保存
-        from PIL import Image
-        if isinstance(img_data, Image.Image):
-            from help_image import HelpImageGenerator
-            generator = HelpImageGenerator()
-            filepath = generator.save_to_temp(img_data)
-            if filepath:
-                return self._send_help_image(message_type, user_id, group_id, filepath)
-        
-        # 如果 img_data 是 base64 字符串，尝试保存为文件
-        if isinstance(img_data, str) and img_data.startswith("base64://"):
-            import base64
-            try:
-                b64_data = img_data[9:]
-                image_bytes = base64.b64decode(b64_data)
-                temp_dir = "data/temp_images"
-                os.makedirs(temp_dir, exist_ok=True)
-                filename = f"help_{int(time.time())}_{random.randint(1000,9999)}.png"
-                filepath = os.path.join(temp_dir, filename)
-                with open(filepath, "wb") as f:
-                    f.write(image_bytes)
-                return self._send_help_image(message_type, user_id, group_id, filepath)
-            except Exception as e:
-                print(f"[帮助图片] base64解码失败: {e}")
-        
-        # 都失败，返回文本帮助
-        return self._get_text_help(message_type, user_id, group_id)
+    
+    async def _send_help_image_async(self, message_type: str, user_id: str, group_id: str, img_data) -> Optional[Dict]:
+        """发送帮助图片 - 自动适配 NapCat 和官方适配器"""
+        try:
+            from PIL import Image
+            
+            # 如果是 PIL Image 对象，先保存为文件
+            if isinstance(img_data, Image.Image):
+                from help_image import HelpImageGenerator
+                generator = HelpImageGenerator()
+                filepath = generator.save_to_temp(img_data)
+                if not filepath:
+                    return self._get_text_help(message_type, user_id, group_id)
+                img_data = filepath
+                print(f"[帮助图片] ✅ 已保存图片: {filepath}")
+            
+            if isinstance(img_data, str) and os.path.exists(img_data):
+                abs_path = os.path.abspath(img_data)
+                
+                # ===== 官方适配器：通过 WebSocket 返回 reply =====
+                if hasattr(self, '_official_mode') and self._official_mode:
+                    print(f"[帮助图片] 📤 官方适配器模式，返回 reply")
+                    return {
+                        "action": "send_msg",
+                        "params": {
+                            "message_type": message_type,
+                            "group_id": int(group_id) if message_type == "group" else None,
+                            "user_id": int(user_id) if message_type == "private" else None,
+                            "message": f"[CQ:image,file=file:///{abs_path}]"
+                        }
+                    }
+                
+                # ===== NapCat 模式：直接用 HTTP API 发送 =====
+                else:
+                    print(f"[帮助图片] 📤 NapCat 模式，通过 HTTP API 发送: {abs_path}")
+                    
+                    import aiohttp
+                    url = "http://127.0.0.1:3000/send_msg"
+                    payload = {
+                        "group_id": int(group_id) if message_type == "group" else None,
+                        "user_id": int(user_id) if message_type == "private" else None,
+                        "message": f"[CQ:image,file={abs_path}]"
+                    }
+                    payload = {k: v for k, v in payload.items() if v is not None}
+                    
+                    print(f"[帮助图片] 📤 请求: {url}, payload: {payload}")
+                    
+                    async with aiohttp.ClientSession() as session:
+                        async with session.post(url, json=payload, timeout=10) as resp:
+                            if resp.status == 200:
+                                result = await resp.json()
+                                print(f"[帮助图片] ✅ HTTP API 发送成功: {result}")
+                                return None  # 已发送，不需要返回 reply
+                            else:
+                                text = await resp.text()
+                                print(f"[帮助图片] ❌ HTTP API 发送失败: {resp.status} - {text}")
+                                # 降级：返回 reply 尝试 WebSocket 发送
+                                return {
+                                    "action": "send_msg",
+                                    "params": {
+                                        "message_type": message_type,
+                                        "group_id": int(group_id) if message_type == "group" else None,
+                                        "user_id": int(user_id) if message_type == "private" else None,
+                                        "message": f"[CQ:image,file={abs_path}]"
+                                    }
+                                }
+            
+            # 都失败，返回文本帮助
+            print(f"[帮助图片] ❌ 无法识别的图片数据: {type(img_data)}")
+            return self._get_text_help(message_type, user_id, group_id)
+            
+        except Exception as e:
+            print(f"[帮助图片] ❌ 发送失败: {e}")
+            import traceback
+            traceback.print_exc()
+            return self._get_text_help(message_type, user_id, group_id)
+
+
+    
     def _send_help_image(self, message_type: str, user_id: str, group_id: str, filepath: str) -> Dict:
         """发送帮助图片 - 使用文件路径"""
         if not filepath or not os.path.exists(filepath):
@@ -7245,7 +7369,7 @@ class MessageHandler:
     📖 例如: 帮助 好感度"""
         
         return self._create_reply(message_type, user_id, group_id, help_text)
-    def _get_help_reply(self, user_id: str, message_type: str, group_id: str, category: str = None) -> Dict:
+    async def _get_help_reply(self, user_id: str, message_type: str, group_id: str, category: str = None) -> Dict:
         """获取帮助信息 - 图片版（统一使用文件路径）"""
         is_admin = self.admin_manager.is_admin(user_id)
 
@@ -7260,7 +7384,10 @@ class MessageHandler:
                 img = generator.create_main_menu(is_admin)
                 filepath = generator.save_to_temp(img)
                 if filepath:
-                    return self._send_help_image(message_type, user_id, group_id, filepath)
+                    result = await self._send_help_image_async(message_type, user_id, group_id, filepath)
+                    if result:
+                        return result
+                    return None
                 return self._get_text_help(message_type, user_id, group_id)
             
             category_str = str(category).lower()
@@ -7279,7 +7406,10 @@ class MessageHandler:
                 img = generator.create_help_page("基础功能", "【📌 基础功能】", commands, is_admin)
                 filepath = generator.save_to_temp(img)
                 if filepath:
-                    return self._send_help_image(message_type, user_id, group_id, filepath)
+                    result = await self._send_help_image_async(message_type, user_id, group_id, filepath)
+                    if result:
+                        return result
+                    return None
                 return self._get_text_help(message_type, user_id, group_id)
             
             # ========== 2. 打卡 ==========
@@ -7292,7 +7422,10 @@ class MessageHandler:
                 img = generator.create_help_page("打卡功能", "【📅 打卡功能】", commands, is_admin)
                 filepath = generator.save_to_temp(img)
                 if filepath:
-                    return self._send_help_image(message_type, user_id, group_id, filepath)
+                    result = await self._send_help_image_async(message_type, user_id, group_id, filepath)
+                    if result:
+                        return result
+                    return None
                 return self._get_text_help(message_type, user_id, group_id)
             
             # ========== 3. 防撤回 ==========
@@ -7311,7 +7444,10 @@ class MessageHandler:
                 img = generator.create_help_page("防撤回系统", "【🛡️ 防撤回系统】", commands, is_admin)
                 filepath = generator.save_to_temp(img)
                 if filepath:
-                    return self._send_help_image(message_type, user_id, group_id, filepath)
+                    result = await self._send_help_image_async(message_type, user_id, group_id, filepath)
+                    if result:
+                        return result
+                    return None
                 return self._get_text_help(message_type, user_id, group_id)
             
             # ========== 4. 好感度 ==========
@@ -7340,7 +7476,10 @@ class MessageHandler:
                 img = generator.create_help_page("好感度系统", "【❤️ 好感度系统】", commands, is_admin)
                 filepath = generator.save_to_temp(img)
                 if filepath:
-                    return self._send_help_image(message_type, user_id, group_id, filepath)
+                    result = await self._send_help_image_async(message_type, user_id, group_id, filepath)
+                    if result:
+                        return result
+                    return None
                 return self._get_text_help(message_type, user_id, group_id)
             
             # ========== 5. AI性格 ==========
@@ -7364,7 +7503,10 @@ class MessageHandler:
                 img = generator.create_help_page("AI性格系统", "【🎭 AI性格系统】", commands, is_admin)
                 filepath = generator.save_to_temp(img)
                 if filepath:
-                    return self._send_help_image(message_type, user_id, group_id, filepath)
+                    result = await self._send_help_image_async(message_type, user_id, group_id, filepath)
+                    if result:
+                        return result
+                    return None
                 return self._get_text_help(message_type, user_id, group_id)
             
             # ========== 6. 阴阳库 ==========
@@ -7379,7 +7521,10 @@ class MessageHandler:
                 img = generator.create_help_page("阴阳库", "【🔮 阴阳库】", commands, is_admin)
                 filepath = generator.save_to_temp(img)
                 if filepath:
-                    return self._send_help_image(message_type, user_id, group_id, filepath)
+                    result = await self._send_help_image_async(message_type, user_id, group_id, filepath)
+                    if result:
+                        return result
+                    return None
                 return self._get_text_help(message_type, user_id, group_id)
             
             # ========== 7. 黑名单 ==========
@@ -7399,7 +7544,10 @@ class MessageHandler:
                 img = generator.create_help_page("黑名单管理", "【🚫 黑名单管理】", commands, is_admin)
                 filepath = generator.save_to_temp(img)
                 if filepath:
-                    return self._send_help_image(message_type, user_id, group_id, filepath)
+                    result = await self._send_help_image_async(message_type, user_id, group_id, filepath)
+                    if result:
+                        return result
+                    return None
                 return self._get_text_help(message_type, user_id, group_id)
             
             # ========== 8. 联网搜索 ==========
@@ -7414,7 +7562,10 @@ class MessageHandler:
                 img = generator.create_help_page("联网搜索", "【🌐 联网搜索】", commands, is_admin)
                 filepath = generator.save_to_temp(img)
                 if filepath:
-                    return self._send_help_image(message_type, user_id, group_id, filepath)
+                    result = await self._send_help_image_async(message_type, user_id, group_id, filepath)
+                    if result:
+                        return result
+                    return None
                 return self._get_text_help(message_type, user_id, group_id)
             
             # ========== 9. 抽签系统 ==========
@@ -7431,7 +7582,10 @@ class MessageHandler:
                 img = generator.create_help_page("抽签系统", "【🎋 抽签系统】", commands, is_admin)
                 filepath = generator.save_to_temp(img)
                 if filepath:
-                    return self._send_help_image(message_type, user_id, group_id, filepath)
+                    result = await self._send_help_image_async(message_type, user_id, group_id, filepath)
+                    if result:
+                        return result
+                    return None
                 return self._get_text_help(message_type, user_id, group_id)
             
             # ========== 10. 入群欢迎 ==========
@@ -7448,7 +7602,10 @@ class MessageHandler:
                 img = generator.create_help_page("入群欢迎", "【🎉 入群欢迎系统】", commands, is_admin)
                 filepath = generator.save_to_temp(img)
                 if filepath:
-                    return self._send_help_image(message_type, user_id, group_id, filepath)
+                    result = await self._send_help_image_async(message_type, user_id, group_id, filepath)
+                    if result:
+                        return result
+                    return None
                 return self._get_text_help(message_type, user_id, group_id)
             
             # ========== 11. 婚姻系统 ==========
@@ -7465,7 +7622,10 @@ class MessageHandler:
                 img = generator.create_help_page("婚姻系统", "【💑 婚姻系统】", commands, is_admin)
                 filepath = generator.save_to_temp(img)
                 if filepath:
-                    return self._send_help_image(message_type, user_id, group_id, filepath)
+                    result = await self._send_help_image_async(message_type, user_id, group_id, filepath)
+                    if result:
+                        return result
+                    return None
                 return self._get_text_help(message_type, user_id, group_id)
             
             # ========== 12. 改名功能 ==========
@@ -7484,7 +7644,10 @@ class MessageHandler:
                 img = generator.create_help_page("改名功能", "【✏️ 改名功能】", commands, is_admin)
                 filepath = generator.save_to_temp(img)
                 if filepath:
-                    return self._send_help_image(message_type, user_id, group_id, filepath)
+                    result = await self._send_help_image_async(message_type, user_id, group_id, filepath)
+                    if result:
+                        return result
+                    return None
                 return self._get_text_help(message_type, user_id, group_id)
             
             # ========== 13. 点歌功能 ==========
@@ -7500,7 +7663,10 @@ class MessageHandler:
                 img = generator.create_help_page("点歌功能", "【🎵 点歌功能】", commands, is_admin)
                 filepath = generator.save_to_temp(img)
                 if filepath:
-                    return self._send_help_image(message_type, user_id, group_id, filepath)
+                    result = await self._send_help_image_async(message_type, user_id, group_id, filepath)
+                    if result:
+                        return result
+                    return None
                 return self._get_text_help(message_type, user_id, group_id)
             
             # ========== 14. AI绘画 ==========
@@ -7508,7 +7674,10 @@ class MessageHandler:
                 img = generator.create_draw_help_page(is_admin)
                 filepath = generator.save_to_temp(img)
                 if filepath:
-                    return self._send_help_image(message_type, user_id, group_id, filepath)
+                    result = await self._send_help_image_async(message_type, user_id, group_id, filepath)
+                    if result:
+                        return result
+                    return None
                 return self._get_text_help(message_type, user_id, group_id)
             
             # ========== 15. 管理员命令 ==========
@@ -7553,7 +7722,10 @@ class MessageHandler:
                 img = generator.create_help_page("管理员命令", "【⚙️ 管理员命令】", commands, is_admin)
                 filepath = generator.save_to_temp(img)
                 if filepath:
-                    return self._send_help_image(message_type, user_id, group_id, filepath)
+                    result = await self._send_help_image_async(message_type, user_id, group_id, filepath)
+                    if result:
+                        return result
+                    return None
                 return self._get_text_help(message_type, user_id, group_id)
             
             # ========== 16. 其他功能 ==========
@@ -7594,7 +7766,10 @@ class MessageHandler:
                 img = generator.create_help_page("其他功能", "【🔧 其他功能】", commands, is_admin)
                 filepath = generator.save_to_temp(img)
                 if filepath:
-                    return self._send_help_image(message_type, user_id, group_id, filepath)
+                    result = await self._send_help_image_async(message_type, user_id, group_id, filepath)
+                    if result:
+                        return result
+                    return None
                 return self._get_text_help(message_type, user_id, group_id)
             
             # ========== 全部命令 ==========
@@ -7602,14 +7777,20 @@ class MessageHandler:
                 img = generator.create_full_help(is_admin)
                 filepath = generator.save_to_temp(img)
                 if filepath:
-                    return self._send_help_image(message_type, user_id, group_id, filepath)
+                    result = await self._send_help_image_async(message_type, user_id, group_id, filepath)
+                    if result:
+                        return result
+                    return None
                 return self._get_text_help(message_type, user_id, group_id)
             
             # ========== 未知分类，返回主菜单 ==========
             img = generator.create_main_menu(is_admin)
             filepath = generator.save_to_temp(img)
             if filepath:
-                return self._send_help_image(message_type, user_id, group_id, filepath)
+                result = await self._send_help_image_async(message_type, user_id, group_id, filepath)
+                if result:
+                    return result
+                return None
             return self._get_text_help(message_type, user_id, group_id)
             
         except Exception as e:
@@ -9449,7 +9630,7 @@ def convert_official_to_onebot(data, openid_map=None, save_map_callback=None):
         elif event_type == "GROUP_AT_MESSAGE_CREATE":
             # ===== 打印原始数据 =====
             print(f"[官方适配] 📦 原始群聊数据: {json.dumps(d, ensure_ascii=False)[:500]}")
-            
+            print(json.dumps(d, ensure_ascii=False, indent=2))
             # ===== 修复：从 author.id 提取用户 OpenID =====
             author = d.get("author", {})
             user_openid = author.get("user_openid", "") or author.get("id", "") or author.get("member_openid", "")
@@ -9587,6 +9768,12 @@ async def http_start():
     return runner
 
 async def official_bot_main(handler):
+    """官方适配器主函数"""
+    global BOT_QQ, ACCESS_TOKEN, TOKEN_EXPIRE_TIME
+    
+    # ===== 关键修复：设置官方适配器模式标志 =====
+    handler._official_mode = True
+    print("[适配器] ✅ 已设置官方适配器模式")
     """官方适配器主函数"""
     global BOT_QQ, ACCESS_TOKEN, TOKEN_EXPIRE_TIME
     
