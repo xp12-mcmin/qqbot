@@ -6200,7 +6200,6 @@ class MessageHandler:
             print(f"[树洞错误] {e}")
             return "🌳 树洞今天打烊了，明天再来吧~"
     import subprocess
-
     async def _music(self, group_id: int, user_id: str, keyword: str) -> Dict:
         """点歌 - 适配器版本"""
 
@@ -6274,6 +6273,98 @@ class MessageHandler:
             import traceback
             traceback.print_exc()
             return self._create_reply("group", user_id, group_id, f"❌ 点歌失败：{str(e)}")
+    async def _send_group_image_official(self, group_openid: str, image_data: bytes, filename: str, msg_id: str) -> bool:
+        """官方适配器：群聊发送图片"""
+        import aiohttp
+        import hashlib
+        
+        token = await self._get_access_token()
+        if not token:
+            return False
+        
+        headers = {
+            "Authorization": f"QQBot {token}",
+            "Content-Type": "application/json"
+        }
+        
+        file_size = len(image_data)
+        md5 = hashlib.md5(image_data).hexdigest()
+        sha1 = hashlib.sha1(image_data).hexdigest()
+        
+        async with aiohttp.ClientSession() as session:
+            # 1. 预上传
+            preupload_url = f"https://api.bot.qq.com/v2/groups/{group_openid}/upload_prepare"
+            async with session.post(preupload_url, json={
+                "file_type": 2,  # 群聊图片用 2
+                "file_size": str(file_size),
+                "file_name": filename,
+                "md5": md5,
+                "sha1": sha1,
+                "md5_10m": md5
+            }, headers=headers) as resp:
+                if resp.status != 200:
+                    print(f"[群聊图片] 预上传失败: {resp.status}")
+                    return False
+                pre_data = await resp.json()
+                upload_id = pre_data.get("upload_id")
+                parts = pre_data.get("parts", [])
+                if not upload_id or not parts:
+                    return False
+                presigned_url = parts[0].get("presigned_url")
+                if not presigned_url:
+                    return False
+            
+            # 2. 上传分片
+            async with session.put(presigned_url, data=image_data, headers={"Content-Type": "application/octet-stream"}) as put_resp:
+                if put_resp.status not in [200, 204]:
+                    print(f"[群聊图片] 分片上传失败: {put_resp.status}")
+                    return False
+            
+            # 3. 分片确认
+            finish_url = f"https://api.bot.qq.com/v2/groups/{group_openid}/upload_part_finish"
+            async with session.post(finish_url, json={
+                "upload_id": upload_id,
+                "part_index": 1,
+                "block_size": str(file_size),
+                "md5": md5
+            }, headers=headers) as resp:
+                if resp.status != 200:
+                    print(f"[群聊图片] 分片确认失败: {resp.status}")
+                    return False
+            
+            # 4. 合并上传
+            merge_url = f"https://api.bot.qq.com/v2/groups/{group_openid}/files"
+            async with session.post(merge_url, json={
+                "file_type": 2,
+                "upload_id": upload_id,
+                "srv_send_msg": False,
+                "file_name": filename
+            }, headers=headers) as resp:
+                if resp.status != 200:
+                    print(f"[群聊图片] 合并失败: {resp.status}")
+                    return False
+                merge_data = await resp.json()
+                file_info = merge_data.get("file_info")
+                if not file_info:
+                    return False
+            
+            # 5. 发送图片
+            send_url = f"https://api.bot.qq.com/v2/groups/{group_openid}/messages"
+            send_payload = {
+                "msg_type": 7,
+                "msg_id": msg_id,
+                "media": {"file_info": file_info}
+            }
+            
+            async with session.post(send_url, json=send_payload, headers=headers) as resp:
+                if resp.status == 200:
+                    print("[群聊图片] ✅ 图片发送成功")
+                    return True
+                else:
+                    text = await resp.text()
+                    print(f"[群聊图片] 发送失败: {resp.status} - {text}")
+                    return False
+
     async def _convert_to_amr(self, input_path: str) -> str:
         """转AMR格式（手机QQ兼容性最好）"""
         import asyncio
@@ -7074,341 +7165,458 @@ class MessageHandler:
         ]
         return "\n".join(lines)
     
-    def _send_help_image(self, message_type: str, user_id: str, group_id: str, img_base64: str) -> Dict:
-        """发送帮助图片的通用方法"""
+    def _send_help_image(self, message_type: str, user_id: str, group_id: str, img_data) -> Dict:
+        """发送帮助图片 - 支持文件路径"""
+        # 如果 img_data 是文件路径（字符串且文件存在）
+        if isinstance(img_data, str) and os.path.exists(img_data):
+            abs_path = os.path.abspath(img_data)
+            return {
+                "action": "send_msg",
+                "params": {
+                    "message_type": message_type,
+                    "group_id": int(group_id) if message_type == "group" else None,
+                    "user_id": int(user_id) if message_type == "private" else None,
+                    "message": f"[CQ:image,file=file:///{abs_path}]"
+                }
+            }
+        
+        # 如果 img_data 是 PIL Image 对象，先保存
+        from PIL import Image
+        if isinstance(img_data, Image.Image):
+            from help_image import HelpImageGenerator
+            generator = HelpImageGenerator()
+            filepath = generator.save_to_temp(img_data)
+            if filepath:
+                return self._send_help_image(message_type, user_id, group_id, filepath)
+        
+        # 如果 img_data 是 base64 字符串，尝试保存为文件
+        if isinstance(img_data, str) and img_data.startswith("base64://"):
+            import base64
+            try:
+                b64_data = img_data[9:]
+                image_bytes = base64.b64decode(b64_data)
+                temp_dir = "data/temp_images"
+                os.makedirs(temp_dir, exist_ok=True)
+                filename = f"help_{int(time.time())}_{random.randint(1000,9999)}.png"
+                filepath = os.path.join(temp_dir, filename)
+                with open(filepath, "wb") as f:
+                    f.write(image_bytes)
+                return self._send_help_image(message_type, user_id, group_id, filepath)
+            except Exception as e:
+                print(f"[帮助图片] base64解码失败: {e}")
+        
+        # 都失败，返回文本帮助
+        return self._get_text_help(message_type, user_id, group_id)
+    def _send_help_image(self, message_type: str, user_id: str, group_id: str, filepath: str) -> Dict:
+        """发送帮助图片 - 使用文件路径"""
+        if not filepath or not os.path.exists(filepath):
+            return self._get_text_help(message_type, user_id, group_id)
+        
+        abs_path = os.path.abspath(filepath)
         return {
             "action": "send_msg",
             "params": {
                 "message_type": message_type,
                 "group_id": int(group_id) if message_type == "group" else None,
                 "user_id": int(user_id) if message_type == "private" else None,
-                "message": f"[CQ:image,file={img_base64}]"
+                "message": f"[CQ:image,file=file:///{abs_path}]"
             }
         }
-    
+
+    def _get_text_help(self, message_type: str, user_id: str, group_id: str) -> Dict:
+        """发送文本帮助（备用方案）"""
+        is_admin = self.admin_manager.is_admin(user_id)
+        
+        help_text = """📌 XP12 机器人帮助菜单
+
+    1️⃣ 基础功能   2️⃣ 打卡系统
+    3️⃣ 防撤回系统 4️⃣ 好感度系统
+    5️⃣ AI性格系统 6️⃣ 阴阳库
+    7️⃣ 黑名单管理 8️⃣ 联网搜索
+    9️⃣ 抽签系统   1️⃣0️⃣ 入群欢迎
+    1️⃣1️⃣ 婚姻系统   1️⃣2️⃣ 改名功能
+    1️⃣3️⃣ 点歌功能   1️⃣4️⃣ AI绘画
+    """
+        if is_admin:
+            help_text += "1️⃣5️⃣ 管理员命令\n1️⃣6️⃣ 其他功能\n"
+        
+        help_text += """
+    💡 发送「帮助 分类名」查看详情
+    📖 例如: 帮助 好感度"""
+        
+        return self._create_reply(message_type, user_id, group_id, help_text)
     def _get_help_reply(self, user_id: str, message_type: str, group_id: str, category: str = None) -> Dict:
-        """获取帮助信息 - 图片版"""
+        """获取帮助信息 - 图片版（统一使用文件路径）"""
         is_admin = self.admin_manager.is_admin(user_id)
 
         print(f"[帮助] 用户 {user_id} 是否管理员: {is_admin}")
-        # ... 后续代码
-        from help_image import HelpImageGenerator
-        generator = HelpImageGenerator()
         
-        # 主菜单
-        if category is None or category == "":
-            img = generator.create_main_menu(is_admin)
-            img_base64 = generator.image_to_base64(img)
-            return self._send_help_image(message_type, user_id, group_id, img_base64)
-        
-        category_str = str(category).lower()
-        
-        # 1. 基础功能
-        if category_str in ["1", "基础", "基础功能"]:
-            commands = [
-                ("@机器人 + 消息", "AI聊天（自动记忆）"),
-                ("!记忆状态", "查看AI记忆状态"),
-                ("!清除我的记忆", "清除个人对话记忆"),
-                ("!搜索记忆 <关键词>", "搜索历史对话"),
-                ("!上一句", "查看自己刚才说的话"),
-                ("申请管理员", "申请成为AI管理员"),
-                ("申请状态", "查看申请状态"),
-            ]
-            img = generator.create_help_page("基础功能", "【📌 基础功能】", commands, is_admin)
-            img_base64 = generator.image_to_base64(img)
-            return self._send_help_image(message_type, user_id, group_id, img_base64)
-        
-        # 2. 打卡
-        if category_str in ["2", "打卡"]:
-            commands = [
-                ("!打卡", "手动打卡"),
-                ("!打卡状态", "查看打卡状态"),
-                ("", "每天00:00自动打卡(21个群)"),
-            ]
-            img = generator.create_help_page("打卡功能", "【📅 打卡功能】", commands, is_admin)
-            img_base64 = generator.image_to_base64(img)
-            return self._send_help_image(message_type, user_id, group_id, img_base64)
-        
-        # 3. 防撤回
-        if category_str in ["3", "防撤回"]:
-            commands = [
-                ("!防撤回列表", "查看目标群"),
-                ("!防撤回添加 <群号>", "添加目标群"),
-                ("!防撤回移除 <群号>", "移除目标群"),
-                ("!防撤回清空 <群号>", "清空群缓存"),
-                ("!防撤回状态", "查看系统状态"),
-                ("!防撤回开关 开/关", "开关防撤回"),
-                ("!保护账号 列表", "查看受保护账号"),
-                ("!保护账号 添加 <QQ>", "添加保护账号"),
-                ("!保护账号 移除 <QQ>", "移除保护账号"),
-            ]
-            img = generator.create_help_page("防撤回系统", "【🛡️ 防撤回系统】", commands, is_admin)
-            img_base64 = generator.image_to_base64(img)
-            return self._send_help_image(message_type, user_id, group_id, img_base64)
-        
-        # 4. 好感度
-        if category_str in ["4", "好感度", "好感"]:
-            commands = [
-                ("--- 用户命令 ---", ""),
-                ("!好感度 (@用户)", "查看好感度"),
-                ("!好感榜", "查看本群排行榜"),
-                ("!签到", "每日签到"),
-                ("!商店", "查看商店商品"),
-                ("!购买 <商品ID>", "购买商品"),
-                ("!设置称号 <称号>", "设置专属称号"),
-            ]
-            if is_admin:
-                commands.extend([
-                    ("--- 管理员命令 ---", ""),
-                    ("!好感度开关 开/关", "开关好感度系统"),
-                    ("!好感度通知 开/关", "开关变化通知"),
-                    ("!好感度AI 开/关", "开关AI分析"),
+        try:
+            from help_image import HelpImageGenerator
+            generator = HelpImageGenerator()
+            
+            # ========== 主菜单 ==========
+            if category is None or category == "":
+                img = generator.create_main_menu(is_admin)
+                filepath = generator.save_to_temp(img)
+                if filepath:
+                    return self._send_help_image(message_type, user_id, group_id, filepath)
+                return self._get_text_help(message_type, user_id, group_id)
+            
+            category_str = str(category).lower()
+            
+            # ========== 1. 基础功能 ==========
+            if category_str in ["1", "基础", "基础功能"]:
+                commands = [
+                    ("@机器人 + 消息", "AI聊天（自动记忆）"),
+                    ("!记忆状态", "查看AI记忆状态"),
+                    ("!清除我的记忆", "清除个人对话记忆"),
+                    ("!搜索记忆 <关键词>", "搜索历史对话"),
+                    ("!上一句", "查看自己刚才说的话"),
+                    ("申请管理员", "申请成为AI管理员"),
+                    ("申请状态", "查看申请状态"),
+                ]
+                img = generator.create_help_page("基础功能", "【📌 基础功能】", commands, is_admin)
+                filepath = generator.save_to_temp(img)
+                if filepath:
+                    return self._send_help_image(message_type, user_id, group_id, filepath)
+                return self._get_text_help(message_type, user_id, group_id)
+            
+            # ========== 2. 打卡 ==========
+            if category_str in ["2", "打卡"]:
+                commands = [
+                    ("!打卡", "手动打卡"),
+                    ("!打卡状态", "查看打卡状态"),
+                    ("", "每天00:00自动打卡(21个群)"),
+                ]
+                img = generator.create_help_page("打卡功能", "【📅 打卡功能】", commands, is_admin)
+                filepath = generator.save_to_temp(img)
+                if filepath:
+                    return self._send_help_image(message_type, user_id, group_id, filepath)
+                return self._get_text_help(message_type, user_id, group_id)
+            
+            # ========== 3. 防撤回 ==========
+            if category_str in ["3", "防撤回"]:
+                commands = [
+                    ("!防撤回列表", "查看目标群"),
+                    ("!防撤回添加 <群号>", "添加目标群"),
+                    ("!防撤回移除 <群号>", "移除目标群"),
+                    ("!防撤回清空 <群号>", "清空群缓存"),
+                    ("!防撤回状态", "查看系统状态"),
+                    ("!防撤回开关 开/关", "开关防撤回"),
+                    ("!保护账号 列表", "查看受保护账号"),
+                    ("!保护账号 添加 <QQ>", "添加保护账号"),
+                    ("!保护账号 移除 <QQ>", "移除保护账号"),
+                ]
+                img = generator.create_help_page("防撤回系统", "【🛡️ 防撤回系统】", commands, is_admin)
+                filepath = generator.save_to_temp(img)
+                if filepath:
+                    return self._send_help_image(message_type, user_id, group_id, filepath)
+                return self._get_text_help(message_type, user_id, group_id)
+            
+            # ========== 4. 好感度 ==========
+            if category_str in ["4", "好感度", "好感"]:
+                commands = [
+                    ("--- 用户命令 ---", ""),
+                    ("!好感度 (@用户)", "查看好感度"),
+                    ("!好感榜", "查看本群排行榜"),
+                    ("!签到", "每日签到"),
+                    ("!商店", "查看商店商品"),
+                    ("!购买 <商品ID>", "购买商品"),
+                    ("!设置称号 <称号>", "设置专属称号"),
+                ]
+                if is_admin:
+                    commands.extend([
+                        ("--- 管理员命令 ---", ""),
+                        ("!好感度开关 开/关", "开关好感度系统"),
+                        ("!好感度通知 开/关", "开关变化通知"),
+                        ("!好感度AI 开/关", "开关AI分析"),
+                        ("!好感度设置 <QQ> <数值>", "设置好感度"),
+                        ("!好感度增加 <QQ> <数值>", "增加好感度"),
+                        ("!好感度减少 <QQ> <数值>", "减少好感度"),
+                        ("!好感度重置群", "重置本群数据"),
+                        ("!好感度全榜", "查看完整排行榜"),
+                    ])
+                img = generator.create_help_page("好感度系统", "【❤️ 好感度系统】", commands, is_admin)
+                filepath = generator.save_to_temp(img)
+                if filepath:
+                    return self._send_help_image(message_type, user_id, group_id, filepath)
+                return self._get_text_help(message_type, user_id, group_id)
+            
+            # ========== 5. AI性格 ==========
+            if category_str in ["5", "性格"]:
+                commands = [
+                    ("--- 群聊命令 ---", ""),
+                    ("!本群性格", "查看本群当前性格"),
+                    ("!本群切换 猫娘/默认", "切换本群性格"),
+                    ("!本群恢复", "恢复跟随全局"),
+                    ("", ""),
+                    ("--- 私聊说明 ---", ""),
+                    ("私聊固定使用【默认助手】", "不受任何群性格影响"),
+                ]
+                if is_admin:
+                    commands.extend([
+                        ("", ""),
+                        ("--- 管理员命令 ---", ""),
+                        ("!全局切换 猫娘/默认", "设置全局默认性格"),
+                        ("!远程性格 <群号> <模式>", "远程修改任意群的性格"),
+                    ])
+                img = generator.create_help_page("AI性格系统", "【🎭 AI性格系统】", commands, is_admin)
+                filepath = generator.save_to_temp(img)
+                if filepath:
+                    return self._send_help_image(message_type, user_id, group_id, filepath)
+                return self._get_text_help(message_type, user_id, group_id)
+            
+            # ========== 6. 阴阳库 ==========
+            if category_str in ["6", "阴阳库"]:
+                commands = [
+                    ("!阴阳库添加 <QQ> <阴/阳> [备注]", "添加阴阳库"),
+                    ("!阴阳库查询 <QQ>", "查询阴阳库"),
+                    ("!阴阳库列表 <阴/阳>", "查看列表"),
+                    ("!阴阳库删除 <QQ>", "删除记录"),
+                    ("!阴阳库切换 <QQ> <阴/阳>", "切换库"),
+                ]
+                img = generator.create_help_page("阴阳库", "【🔮 阴阳库】", commands, is_admin)
+                filepath = generator.save_to_temp(img)
+                if filepath:
+                    return self._send_help_image(message_type, user_id, group_id, filepath)
+                return self._get_text_help(message_type, user_id, group_id)
+            
+            # ========== 7. 黑名单 ==========
+            if category_str in ["7", "黑名单"]:
+                commands = [
+                    ("!ban <QQ> [原因]", "拉黑用户（全局）"),
+                    ("!unban <QQ>", "解禁用户"),
+                    ("!blacklist", "查看黑名单"),
+                    ("!ban-g <群号>", "拉黑整个群（连坐）"),
+                    ("!unban-g <群号>", "解禁整个群"),
+                ]
+                if is_admin:
+                    commands.extend([
+                        ("!批准申请 <QQ>", "批准管理员申请"),
+                        ("!拒绝申请 <QQ>", "拒绝管理员申请"),
+                    ])
+                img = generator.create_help_page("黑名单管理", "【🚫 黑名单管理】", commands, is_admin)
+                filepath = generator.save_to_temp(img)
+                if filepath:
+                    return self._send_help_image(message_type, user_id, group_id, filepath)
+                return self._get_text_help(message_type, user_id, group_id)
+            
+            # ========== 8. 联网搜索 ==========
+            if category_str in ["8", "联网搜索", "搜索"]:
+                commands = [
+                    ("!搜索 <内容>", "联网搜索信息"),
+                    ("!问问 <问题>", "AI联网问答"),
+                    ("", "💡 示例: !搜索 今日新闻"),
+                    ("", "💡 示例: !问问 今天天气怎么样"),
+                    ("", "⏱️ 可能需要5-10秒"),
+                ]
+                img = generator.create_help_page("联网搜索", "【🌐 联网搜索】", commands, is_admin)
+                filepath = generator.save_to_temp(img)
+                if filepath:
+                    return self._send_help_image(message_type, user_id, group_id, filepath)
+                return self._get_text_help(message_type, user_id, group_id)
+            
+            # ========== 9. 抽签系统 ==========
+            if category_str in ["9", "抽签", "抽签系统"]:
+                commands = [
+                    ("!抽签", "随机抽取每日运势签"),
+                    ("!抽签 daily", "每日运势签"),
+                    ("!抽签 fortune", "财运签"),
+                    ("!抽签 love", "姻缘签"),
+                    ("!抽签 work", "事业签"),
+                    ("!抽签 study", "学业签"),
+                    ("!抽签帮助", "查看帮助"),
+                ]
+                img = generator.create_help_page("抽签系统", "【🎋 抽签系统】", commands, is_admin)
+                filepath = generator.save_to_temp(img)
+                if filepath:
+                    return self._send_help_image(message_type, user_id, group_id, filepath)
+                return self._get_text_help(message_type, user_id, group_id)
+            
+            # ========== 10. 入群欢迎 ==========
+            if category_str in ["10", "入群欢迎", "欢迎"]:
+                commands = [
+                    ("!欢迎配置", "查看欢迎配置"),
+                    ("!开启欢迎", "开启本群欢迎"),
+                    ("!关闭欢迎", "关闭本群欢迎"),
+                    ("!设置欢迎 <消息>", "设置本群欢迎语"),
+                    ("", "💡 变量: {name}, {user_id}, {group_id}"),
+                ]
+                if is_admin:
+                    commands.append(("!欢迎开关 开/关", "全局开关（仅AI管理员）"))
+                img = generator.create_help_page("入群欢迎", "【🎉 入群欢迎系统】", commands, is_admin)
+                filepath = generator.save_to_temp(img)
+                if filepath:
+                    return self._send_help_image(message_type, user_id, group_id, filepath)
+                return self._get_text_help(message_type, user_id, group_id)
+            
+            # ========== 11. 婚姻系统 ==========
+            if category_str in ["11", "婚姻", "婚姻系统", "老婆", "今日老婆"]:
+                commands = [
+                    ("--- 基础命令 ---", ""),
+                    ("今日老婆", "随机抽取今日老婆（每天一次）"),
+                    ("结婚 @对方", "和对方结婚（双方需单身）"),
+                    ("离婚", "解除婚姻关系"),
+                    ("配偶", "查询自己的配偶"),
+                    ("夫妻榜", "查看本群夫妻排行榜"),
+                    ("", "✨ 每天0点重置今日老婆"),
+                ]
+                img = generator.create_help_page("婚姻系统", "【💑 婚姻系统】", commands, is_admin)
+                filepath = generator.save_to_temp(img)
+                if filepath:
+                    return self._send_help_image(message_type, user_id, group_id, filepath)
+                return self._get_text_help(message_type, user_id, group_id)
+            
+            # ========== 12. 改名功能 ==========
+            if category_str in ["12", "改名", "改名功能", "rename"]:
+                commands = [
+                    ("--- 修改群成员名片 ---", ""),
+                    ("!改名 @对方 <新名字>", "修改指定群成员的名片"),
+                    ("", "需要群管理员或AI管理员权限"),
+                    ("", "示例: !改名 @张三 李四"),
+                    ("", ""),
+                    ("--- 修改机器人名字 ---", ""),
+                    ("改我名 <新名字>", "修改机器人自己的名片"),
+                    ("", "需要AI管理员权限"),
+                    ("", "示例: 改我名 小可爱"),
+                ]
+                img = generator.create_help_page("改名功能", "【✏️ 改名功能】", commands, is_admin)
+                filepath = generator.save_to_temp(img)
+                if filepath:
+                    return self._send_help_image(message_type, user_id, group_id, filepath)
+                return self._get_text_help(message_type, user_id, group_id)
+            
+            # ========== 13. 点歌功能 ==========
+            if category_str in ["13", "点歌", "点歌功能", "music"]:
+                commands = [
+                    ("点歌 <歌曲名>", "搜索并下载歌曲"),
+                    ("", "支持QQ音乐、网易云等"),
+                    ("", "✅ 自动下载音频"),
+                    ("", "✅ 转换为QQ语音消息"),
+                    ("", "✅ 发送封面图和链接"),
+                    ("", "💡 示例: 点歌 稻香"),
+                ]
+                img = generator.create_help_page("点歌功能", "【🎵 点歌功能】", commands, is_admin)
+                filepath = generator.save_to_temp(img)
+                if filepath:
+                    return self._send_help_image(message_type, user_id, group_id, filepath)
+                return self._get_text_help(message_type, user_id, group_id)
+            
+            # ========== 14. AI绘画 ==========
+            if category_str in ["14", "绘画", "ai绘画", "画图"]:
+                img = generator.create_draw_help_page(is_admin)
+                filepath = generator.save_to_temp(img)
+                if filepath:
+                    return self._send_help_image(message_type, user_id, group_id, filepath)
+                return self._get_text_help(message_type, user_id, group_id)
+            
+            # ========== 15. 管理员命令 ==========
+            if category_str in ["15", "管理", "管理员"] and is_admin:
+                commands = [
+                    ("--- 管理员申请 ---", ""),
+                    ("!批准申请 <QQ>", "批准管理员申请"),
+                    ("!拒绝申请 <QQ> [原因]", "拒绝管理员申请"),
+                    ("", ""),
+                    ("--- 好感度管理 ---", ""),
                     ("!好感度设置 <QQ> <数值>", "设置好感度"),
                     ("!好感度增加 <QQ> <数值>", "增加好感度"),
                     ("!好感度减少 <QQ> <数值>", "减少好感度"),
-                    ("!好感度重置群", "重置本群数据"),
-                    ("!好感度全榜", "查看完整排行榜"),
-                ])
-            img = generator.create_help_page("好感度系统", "【❤️ 好感度系统】", commands, is_admin)
-            img_base64 = generator.image_to_base64(img)
-            return self._send_help_image(message_type, user_id, group_id, img_base64)
-        
-        # 5. AI性格
-        if category_str in ["5", "性格"]:
-            commands = [
-                ("--- 群聊命令 ---", ""),
-                ("!本群性格", "查看本群当前性格"),
-                ("!本群切换 猫娘/默认", "切换本群性格"),
-                ("!本群恢复", "恢复跟随全局"),
-                ("", ""),
-                ("--- 私聊说明 ---", ""),
-                ("私聊固定使用【默认助手】", "不受任何群性格影响"),
-            ]
-            if is_admin:
-                commands.extend([
+                    ("!好感度重置群", "重置本群好感度"),
                     ("", ""),
-                    ("--- 管理员命令 ---", ""),
+                    ("--- 打卡管理 ---", ""),
+                    ("!打卡添加 <群号>", "添加打卡群"),
+                    ("!打卡时间 <HH:MM>", "修改打卡时间"),
+                    ("", ""),
+                    ("--- 刷屏命令 ---", ""),
+                    ("!刷屏 <QQ> [时长]", "刷屏攻击"),
+                    ("!停止刷屏", "停止刷屏"),
+                    ("!刷屏状态", "查看刷屏状态"),
+                    ("", ""),
+                    ("--- 禁言命令 ---", ""),
+                    ("!禁言 <QQ> [分钟]", "禁言成员"),
+                    ("!解禁 <QQ>", "解除禁言"),
+                    ("", ""),
+                    ("--- 黑名单管理 ---", ""),
+                    ("!ban <QQ> [原因]", "封禁用户"),
+                    ("!unban <QQ>", "解封用户"),
+                    ("!ban-g <群号>", "拉黑整个群"),
+                    ("!unban-g <群号>", "解禁整个群"),
+                    ("", ""),
+                    ("--- 性格管理 ---", ""),
                     ("!全局切换 猫娘/默认", "设置全局默认性格"),
-                    ("!远程性格 <群号> <模式>", "远程修改任意群的性格"),
-                ])
-            img = generator.create_help_page("AI性格系统", "【🎭 AI性格系统】", commands, is_admin)
-            img_base64 = generator.image_to_base64(img)
-            return self._send_help_image(message_type, user_id, group_id, img_base64)
-        
-        # 6. 阴阳库
-        if category_str in ["6", "阴阳库"]:
-            commands = [
-                ("!阴阳库添加 <QQ> <阴/阳> [备注]", "添加阴阳库"),
-                ("!阴阳库查询 <QQ>", "查询阴阳库"),
-                ("!阴阳库列表 <阴/阳>", "查看列表"),
-                ("!阴阳库删除 <QQ>", "删除记录"),
-                ("!阴阳库切换 <QQ> <阴/阳>", "切换库"),
-            ]
-            img = generator.create_help_page("阴阳库", "【🔮 阴阳库】", commands, is_admin)
-            img_base64 = generator.image_to_base64(img)
-            return self._send_help_image(message_type, user_id, group_id, img_base64)
-        
-        # 7. 黑名单
-        if category_str in ["7", "黑名单"]:
-            commands = [
-                ("!ban <QQ> [原因]", "拉黑用户（全局）"),
-                ("!unban <QQ>", "解禁用户"),
-                ("!blacklist", "查看黑名单"),
-                ("!ban-g <群号>", "拉黑整个群（连坐）"),
-                ("!unban-g <群号>", "解禁整个群"),
-            ]
-            if is_admin:
-                commands.extend([
-                    ("!批准申请 <QQ>", "批准管理员申请"),
-                    ("!拒绝申请 <QQ>", "拒绝管理员申请"),
-                ])
-            img = generator.create_help_page("黑名单管理", "【🚫 黑名单管理】", commands, is_admin)
-            img_base64 = generator.image_to_base64(img)
-            return self._send_help_image(message_type, user_id, group_id, img_base64)
-        
-        # 8. 联网搜索
-        if category_str in ["8", "联网搜索", "搜索"]:
-            commands = [
-                ("!搜索 <内容>", "联网搜索信息"),
-                ("!问问 <问题>", "AI联网问答"),
-                ("", "💡 示例: !搜索 今日新闻"),
-                ("", "💡 示例: !问问 今天天气怎么样"),
-                ("", "⏱️ 可能需要5-10秒"),
-            ]
-            img = generator.create_help_page("联网搜索", "【🌐 联网搜索】", commands, is_admin)
-            img_base64 = generator.image_to_base64(img)
-            return self._send_help_image(message_type, user_id, group_id, img_base64)
-        
-        # 9. 抽签系统
-        if category_str in ["9", "抽签", "抽签系统"]:
-            commands = [
-                ("!抽签", "随机抽取每日运势签"),
-                ("!抽签 daily", "每日运势签"),
-                ("!抽签 fortune", "财运签"),
-                ("!抽签 love", "姻缘签"),
-                ("!抽签 work", "事业签"),
-                ("!抽签 study", "学业签"),
-                ("!抽签帮助", "查看帮助"),
-            ]
-            img = generator.create_help_page("抽签系统", "【🎋 抽签系统】", commands, is_admin)
-            img_base64 = generator.image_to_base64(img)
-            return self._send_help_image(message_type, user_id, group_id, img_base64)
-        
-        # 10. 入群欢迎
-        if category_str in ["10", "入群欢迎", "欢迎"]:
-            commands = [
-                ("!欢迎配置", "查看欢迎配置"),
-                ("!开启欢迎", "开启本群欢迎"),
-                ("!关闭欢迎", "关闭本群欢迎"),
-                ("!设置欢迎 <消息>", "设置本群欢迎语"),
-                ("", "💡 变量: {name}, {user_id}, {group_id}"),
-            ]
-            if is_admin:
-                commands.append(("!欢迎开关 开/关", "全局开关（仅AI管理员）"))
-            img = generator.create_help_page("入群欢迎", "【🎉 入群欢迎系统】", commands, is_admin)
-            img_base64 = generator.image_to_base64(img)
-            return self._send_help_image(message_type, user_id, group_id, img_base64)
-        
-        # 11. 婚姻系统
-        if category_str in ["11", "婚姻", "婚姻系统", "老婆", "今日老婆"]:
-            commands = [
-                ("--- 基础命令 ---", ""),
-                ("今日老婆", "随机抽取今日老婆（每天一次）"),
-                ("结婚 @对方", "和对方结婚（双方需单身）"),
-                ("离婚", "解除婚姻关系"),
-                ("配偶", "查询自己的配偶"),
-                ("夫妻榜", "查看本群夫妻排行榜"),
-                ("", "✨ 每天0点重置今日老婆"),
-            ]
-            img = generator.create_help_page("婚姻系统", "【💑 婚姻系统】", commands, is_admin)
-            img_base64 = generator.image_to_base64(img)
-            return self._send_help_image(message_type, user_id, group_id, img_base64)
-        
-        # 12. 改名功能
-        if category_str in ["12", "改名", "改名功能", "rename"]:
-            commands = [
-                ("--- 修改群成员名片 ---", ""),
-                ("!改名 @对方 <新名字>", "修改指定群成员的名片"),
-                ("", "需要群管理员或AI管理员权限"),
-                ("", "示例: !改名 @张三 李四"),
-                ("", ""),
-                ("--- 修改机器人名字 ---", ""),
-                ("改我名 <新名字>", "修改机器人自己的名片"),
-                ("", "需要AI管理员权限"),
-                ("", "示例: 改我名 小可爱"),
-            ]
-            img = generator.create_help_page("改名功能", "【✏️ 改名功能】", commands, is_admin)
-            img_base64 = generator.image_to_base64(img)
-            return self._send_help_image(message_type, user_id, group_id, img_base64)
-        
-        # 13. 点歌功能
-        if category_str in ["13", "点歌", "点歌功能", "music"]:
-            commands = [
-                ("点歌 <歌曲名>", "搜索并下载歌曲"),
-                ("", "支持QQ音乐、网易云等"),
-                ("", "✅ 自动下载音频"),
-                ("", "✅ 转换为QQ语音消息"),
-                ("", "✅ 发送封面图和链接"),
-                ("", "💡 示例: 点歌 稻香"),
-            ]
-            img = generator.create_help_page("点歌功能", "【🎵 点歌功能】", commands, is_admin)
-            img_base64 = generator.image_to_base64(img)
-            return self._send_help_image(message_type, user_id, group_id, img_base64)
-        
-        # 14. 管理员命令
-        if category_str in ["15", "管理", "管理员"] and is_admin:
-            commands = [
-                ("--- 管理员申请 ---", ""),
-                ("!批准申请 <QQ>", "批准管理员申请"),
-                ("!拒绝申请 <QQ> [原因]", "拒绝管理员申请"),
-                ("", ""),
-                ("--- 好感度管理 ---", ""),
-                ("!好感度设置 <QQ> <数值>", "设置好感度"),
-                ("!好感度增加 <QQ> <数值>", "增加好感度"),
-                ("!好感度减少 <QQ> <数值>", "减少好感度"),
-                ("!好感度重置群", "重置本群好感度"),
-                ("", ""),
-                ("--- 打卡管理 ---", ""),
-                ("!打卡添加 <群号>", "添加打卡群"),
-                ("!打卡时间 <HH:MM>", "修改打卡时间"),
-                ("", ""),
-                ("--- 刷屏命令 ---", ""),
-                ("!刷屏 <QQ> [时长]", "刷屏攻击"),
-                ("!停止刷屏", "停止刷屏"),
-                ("!刷屏状态", "查看刷屏状态"),
-                ("", ""),
-                ("--- 禁言命令 ---", ""),
-                ("!禁言 <QQ> [分钟]", "禁言成员"),
-                ("!解禁 <QQ>", "解除禁言"),
-                ("", ""),
-                ("--- 黑名单管理 ---", ""),
-                ("!ban <QQ> [原因]", "封禁用户"),
-                ("!unban <QQ>", "解封用户"),
-                ("!ban-g <群号>", "拉黑整个群"),
-                ("!unban-g <群号>", "解禁整个群"),
-                ("", ""),
-                ("--- 性格管理 ---", ""),
-                ("!全局切换 猫娘/默认", "设置全局默认性格"),
-                ("!远程性格 <群号> <模式>", "远程修改群性格"),
-                ("", ""),
-                ("--- 欢迎管理 ---", ""),
-                ("!欢迎开关 开/关", "全局欢迎开关"),
-            ]
-            img = generator.create_help_page("管理员命令", "【⚙️ 管理员命令】", commands, is_admin)
-            img_base64 = generator.image_to_base64(img)
-            return self._send_help_image(message_type, user_id, group_id, img_base64)
-        
-        # 15. 其他功能
-        if category_str in ["16", "其他"]:
-            commands = [
-                ("--- 绿茶反击 ---", ""),
-                ("!绿茶开关 开/关", "全局开关"),
-                ("!绿茶添加群 <群号>", "启用群反击"),
-                ("!绿茶移除群 <群号>", "禁用群反击"),
-                ("!绿茶列表", "查看启用群"),
-                ("!绿茶黑名单", "查看黑名单"),
-                ("!绿茶添加黑名单 <QQ>", "添加黑名单"),
-                ("!绿茶移除黑名单 <QQ>", "移除黑名单"),
-                ("!绿茶语录", "随机语录"),
-                ("", ""),
-                ("--- 自动重进 ---", ""),
-                ("!自动重进 开关 开/关", "全局开关"),
-                ("!自动重进 状态", "查看状态"),
-                ("!自动重进 列表", "查看配置群"),
-                ("!自动重进 添加群 <群号> [阈值]", "添加监控群"),
-                ("!自动重进 移除群 <群号>", "移除监控群"),
-                ("!自动重进 开启群 <群号>", "开启群"),
-                ("!自动重进 关闭群 <群号>", "关闭群"),
-                ("", ""),
-                ("--- 自动解禁 ---", ""),
-                ("!自动解禁 开关 开/关", "全局开关"),
-                ("!自动解禁 状态", "查看状态"),
-                ("!自动解禁 列表", "查看白名单"),
-                ("!自动解禁 添加群 <群号>", "添加群白名单"),
-                ("!自动解禁 移除群 <群号>", "移除群白名单"),
-                ("!自动解禁 添加用户 <QQ>", "添加用户白名单"),
-                ("!自动解禁 移除用户 <QQ>", "移除用户白名单"),
-                ("", ""),
-                ("--- 视频解析 ---", ""),
-                ("!视频解析 开/关", "开启/关闭视频解析"),
-                ("!视频解析 群发/私聊", "设置发送方式"),
-            ]
-            img = generator.create_help_page("其他功能", "【🔧 其他功能】", commands, is_admin)
-            img_base64 = generator.image_to_base64(img)
-            return self._send_help_image(message_type, user_id, group_id, img_base64)
-
-        # 16. AI绘画
-        if category_str in ["14", "绘画", "ai绘画", "画图"]:
-            img = generator.create_draw_help_page(is_admin)
-            img_base64 = generator.image_to_base64(img)
-            return self._send_help_image(message_type, user_id, group_id, img_base64)
-
-        # 全部命令
-        if category_str in ["全部", "all"]:
-            return self._get_full_help(user_id, message_type, group_id, is_admin, generator)
-        
-        # 未知分类，返回主菜单
-        return self._get_help_reply(user_id, message_type, group_id, None)
+                    ("!远程性格 <群号> <模式>", "远程修改群性格"),
+                    ("", ""),
+                    ("--- 欢迎管理 ---", ""),
+                    ("!欢迎开关 开/关", "全局欢迎开关"),
+                ]
+                img = generator.create_help_page("管理员命令", "【⚙️ 管理员命令】", commands, is_admin)
+                filepath = generator.save_to_temp(img)
+                if filepath:
+                    return self._send_help_image(message_type, user_id, group_id, filepath)
+                return self._get_text_help(message_type, user_id, group_id)
+            
+            # ========== 16. 其他功能 ==========
+            if category_str in ["16", "其他"]:
+                commands = [
+                    ("--- 绿茶反击 ---", ""),
+                    ("!绿茶开关 开/关", "全局开关"),
+                    ("!绿茶添加群 <群号>", "启用群反击"),
+                    ("!绿茶移除群 <群号>", "禁用群反击"),
+                    ("!绿茶列表", "查看启用群"),
+                    ("!绿茶黑名单", "查看黑名单"),
+                    ("!绿茶添加黑名单 <QQ>", "添加黑名单"),
+                    ("!绿茶移除黑名单 <QQ>", "移除黑名单"),
+                    ("!绿茶语录", "随机语录"),
+                    ("", ""),
+                    ("--- 自动重进 ---", ""),
+                    ("!自动重进 开关 开/关", "全局开关"),
+                    ("!自动重进 状态", "查看状态"),
+                    ("!自动重进 列表", "查看配置群"),
+                    ("!自动重进 添加群 <群号> [阈值]", "添加监控群"),
+                    ("!自动重进 移除群 <群号>", "移除监控群"),
+                    ("!自动重进 开启群 <群号>", "开启群"),
+                    ("!自动重进 关闭群 <群号>", "关闭群"),
+                    ("", ""),
+                    ("--- 自动解禁 ---", ""),
+                    ("!自动解禁 开关 开/关", "全局开关"),
+                    ("!自动解禁 状态", "查看状态"),
+                    ("!自动解禁 列表", "查看白名单"),
+                    ("!自动解禁 添加群 <群号>", "添加群白名单"),
+                    ("!自动解禁 移除群 <群号>", "移除群白名单"),
+                    ("!自动解禁 添加用户 <QQ>", "添加用户白名单"),
+                    ("!自动解禁 移除用户 <QQ>", "移除用户白名单"),
+                    ("", ""),
+                    ("--- 视频解析 ---", ""),
+                    ("!视频解析 开/关", "开启/关闭视频解析"),
+                    ("!视频解析 群发/私聊", "设置发送方式"),
+                ]
+                img = generator.create_help_page("其他功能", "【🔧 其他功能】", commands, is_admin)
+                filepath = generator.save_to_temp(img)
+                if filepath:
+                    return self._send_help_image(message_type, user_id, group_id, filepath)
+                return self._get_text_help(message_type, user_id, group_id)
+            
+            # ========== 全部命令 ==========
+            if category_str in ["全部", "all"]:
+                img = generator.create_full_help(is_admin)
+                filepath = generator.save_to_temp(img)
+                if filepath:
+                    return self._send_help_image(message_type, user_id, group_id, filepath)
+                return self._get_text_help(message_type, user_id, group_id)
+            
+            # ========== 未知分类，返回主菜单 ==========
+            img = generator.create_main_menu(is_admin)
+            filepath = generator.save_to_temp(img)
+            if filepath:
+                return self._send_help_image(message_type, user_id, group_id, filepath)
+            return self._get_text_help(message_type, user_id, group_id)
+            
+        except Exception as e:
+            print(f"[帮助图片] 生成失败: {e}")
+            import traceback
+            traceback.print_exc()
+            return self._get_text_help(message_type, user_id, group_id)
     async def _handle_ai_chat(self, text: str, user_id: str, message_type: str, group_id: str, raw_message=None) -> Dict:
         """处理AI聊天 - 支持好感度影响，传递原始消息用于图片检测"""
         try:
@@ -8707,7 +8915,7 @@ async def upload_voice_official(user_openid: str, voice_data: bytes, filename: s
 
 
 async def upload_voice_official_group(group_openid: str, voice_data: bytes, filename: str = "voice.m4a"):
-    """群聊上传语音 - 分片上传"""
+    """群聊上传语音 - file_type=4"""
     token = ensure_token()
     if not token:
         return None
@@ -8719,10 +8927,10 @@ async def upload_voice_official_group(group_openid: str, voice_data: bytes, file
     file_md5_10m = calc_md5_10m(voice_data)
     file_size = str(len(voice_data))
     
-    # 1. 预上传
+    # ========== 关键修复：群聊语音用 file_type = 4 ==========
     preupload_url = f"https://api.bot.qq.com/v2/groups/{group_openid}/upload_prepare"
     payload = {
-        "file_type": 3,
+        "file_type": 4,  # ← 群聊语音用 4！不是 3！
         "file_size": file_size,
         "file_name": filename,
         "md5": file_md5,
@@ -8730,7 +8938,7 @@ async def upload_voice_official_group(group_openid: str, voice_data: bytes, file
         "md5_10m": file_md5_10m
     }
     
-    print(f"[官方适配] 📤 群聊语音预上传: {json.dumps(payload, ensure_ascii=False)}")
+    print(f"[官方适配] 📤 群聊语音预上传: {json.dumps(payload, ensure_ascii=False)[:200]}...")
     
     async with aiohttp.ClientSession() as session:
         async with session.post(preupload_url, json=payload, headers=headers, timeout=60) as resp:
@@ -8757,11 +8965,10 @@ async def upload_voice_official_group(group_openid: str, voice_data: bytes, file
                 end = min(start + block_size, len(voice_data))
                 chunk = voice_data[start:end]
                 actual_size = len(chunk)
-                chunk_md5 = hashlib.md5(chunk).hexdigest()  # 分片 MD5
+                chunk_md5 = hashlib.md5(chunk).hexdigest()
                 
                 print(f"[官方适配] 📤 上传分片 {part_index}/{len(parts)} ({actual_size} bytes)")
                 
-                # PUT 上传
                 try:
                     async with session.put(presigned_url, data=chunk, headers={"Content-Type": "application/octet-stream"}, timeout=60) as put_resp:
                         if put_resp.status not in [200, 204]:
@@ -8773,13 +8980,13 @@ async def upload_voice_official_group(group_openid: str, voice_data: bytes, file
                     print(f"[官方适配] ❌ 分片 {part_index} 上传异常: {e}")
                     return None
                 
-                # 确认该分片（用分片 MD5）
+                # 确认该分片
                 part_finish_url = f"https://api.bot.qq.com/v2/groups/{group_openid}/upload_part_finish"
                 part_finish_payload = {
                     "upload_id": upload_id,
                     "part_index": part_index,
                     "block_size": str(actual_size),
-                    "md5": chunk_md5  # ← 用分片 MD5
+                    "md5": chunk_md5
                 }
                 print(f"[官方适配] 📤 确认分片 {part_index}: 大小 {actual_size}, MD5: {chunk_md5[:8]}...")
                 
@@ -8800,7 +9007,7 @@ async def upload_voice_official_group(group_openid: str, voice_data: bytes, file
             
             finalize_url = f"https://api.bot.qq.com/v2/groups/{group_openid}/files"
             finalize_payload = {
-                "file_type": 3,
+                "file_type": 4,  # ← 合并时也是 4
                 "upload_id": upload_id,
                 "srv_send_msg": False,
                 "file_name": filename
@@ -8860,145 +9067,200 @@ def resolve_image_path(path: str) -> Optional[str]:
     return None
 
 # ========== 消息发送（支持纯文本 + 图片 + 语音）==========
+# ========== 消息发送（支持纯文本 + 图片 + 语音）==========
+# ========== 消息发送（支持纯文本 + 图片 + 语音）==========
 async def send_message_official(message: str, user_openid=None, group_openid=None, official_msg_id=None):
+    """发送官方消息 - 支持纯文本、图片、语音"""
     token = ensure_token()
     if not token:
+        print("[官方适配] ❌ 无有效 Token")
         return False
     
     headers = {"Authorization": f"QQBot {token}", "Content-Type": "application/json"}
+    import re
+    import os
+    import aiohttp
+    import random
+    import time
     
-    # ===== 检测语音 CQ 码 =====
-    voice_match = re.search(r'\[CQ:record,file=([^\]]+)\]', message)
-    if voice_match:
-        file_ref = voice_match.group(1).strip()
-        
-        raw_path = file_ref
-        if raw_path.startswith('file:///'):
-            raw_path = raw_path[8:]
-        file_path = resolve_image_path(raw_path)
-        if not file_path:
-            print(f"[官方适配] ❌ 语音文件不存在: {raw_path}")
-            return False
-        
-        try:
-            with open(file_path, 'rb') as f:
-                voice_data = f.read()
-        except Exception as e:
-            print(f"[官方适配] ❌ 读取语音失败: {e}")
-            return False
-        
-        filename = os.path.basename(file_path)
-        
-        if user_openid:
-            file_info = await upload_voice_official(user_openid, voice_data, filename)
-        elif group_openid:
-            file_info = await upload_voice_official_group(group_openid, voice_data, filename)
-        else:
-            return False
-        
-        if not file_info:
-            print("[官方适配] ⚠️ 语音上传失败")
-            return False
-        
-        if group_openid:
-            url = f"https://api.bot.qq.com/v2/groups/{group_openid}/messages"
-        elif user_openid:
-            url = f"https://api.bot.qq.com/v2/users/{user_openid}/messages"
-        else:
-            return False
-        
-        payload = {
-            "msg_type": 7,
-            "media": {"file_info": file_info}
-        }
-        if official_msg_id:
-            payload["msg_id"] = official_msg_id
-        
-        print(f"[官方适配] 📤 发送语音 (msg_type=7)")
-        
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(url, json=payload, headers=headers, timeout=10) as resp:
-                    if resp.status == 200:
-                        print("[官方适配] ✅ 语音消息发送成功")
-                        return True
-                    else:
-                        text = await resp.text()
-                        print(f"[官方适配] ❌ 发送语音失败: {resp.status} - {text[:200]}")
-                        return False
-        except Exception as e:
-            print(f"[官方适配] ❌ 发送语音异常: {e}")
-            return False
-    
-    # ===== 检测图片 CQ 码 =====
-    img_match = re.search(r'\[CQ:image,file=([^\]]+)\]', message)
+    # ============================================================
+    # 1. 检测图片 CQ 码 (file:/// 路径)
+    # ============================================================
+    img_match = re.search(r'\[CQ:image,file=file:///([^\]]+)\]', message)
     if img_match:
-        file_ref = img_match.group(1).strip()
+        filepath = img_match.group(1).strip()
+        print(f"[官方适配] 📤 检测到图片文件: {filepath}")
         
-        if file_ref.startswith('data:image'):
-            import base64
-            b64_data = file_ref.split(',', 1)[-1]
-            image_data = base64.b64decode(b64_data)
-            filename = "help.png"
-        else:
-            raw_path = file_ref
-            if raw_path.startswith('file:///'):
-                raw_path = raw_path[8:]
-            file_path = resolve_image_path(raw_path)
-            if not file_path:
-                print(f"[官方适配] ❌ 图片不存在: {raw_path}")
-                return False
-            with open(file_path, 'rb') as f:
-                image_data = f.read()
-            filename = os.path.basename(file_path)
-        
-        if user_openid:
-            file_info = await upload_image_official(user_openid, image_data, filename)
-        elif group_openid:
-            file_info = await upload_image_official_group(group_openid, image_data, filename)
-        else:
+        if not os.path.exists(filepath):
+            print(f"[官方适配] ❌ 图片不存在: {filepath}")
             return False
         
-        if not file_info:
-            print("[官方适配] ⚠️ 上传失败，降级为文字消息")
-            return await send_message_official(
-                f"📷 图片: {file_path if 'file_path' in dir() else 'unknown'}",
-                user_openid=user_openid,
-                group_openid=group_openid,
-                official_msg_id=official_msg_id
-            )
+        try:
+            with open(filepath, 'rb') as f:
+                image_data = f.read()
+            filename = os.path.basename(filepath)
+            print(f"[官方适配] 📤 图片大小: {len(image_data)} bytes")
+        except Exception as e:
+            print(f"[官方适配] ❌ 读取图片失败: {e}")
+            return False
         
         if group_openid:
+            file_info = await upload_image_official_group(group_openid, image_data, filename)
+            if not file_info:
+                print("[官方适配] ❌ 图片上传失败")
+                return False
+            
             url = f"https://api.bot.qq.com/v2/groups/{group_openid}/messages"
+            payload = {
+                "msg_type": 7,
+                "media": {"file_info": file_info}
+            }
+            if official_msg_id:
+                payload["msg_id"] = official_msg_id
+            
+            print(f"[官方适配] 📤 发送图片到群: {group_openid}")
+            
         elif user_openid:
+            file_info = await upload_image_official(user_openid, image_data, filename)
+            if not file_info:
+                print("[官方适配] ❌ 图片上传失败")
+                return False
+            
             url = f"https://api.bot.qq.com/v2/users/{user_openid}/messages"
+            payload = {
+                "msg_type": 7,
+                "media": {"file_info": file_info}
+            }
+            if official_msg_id:
+                payload["msg_id"] = official_msg_id
+            
+            print(f"[官方适配] 📤 发送图片给用户: {user_openid}")
         else:
             return False
-        
-        payload = {
-            "msg_type": 7,
-            "media": {"file_info": file_info}
-        }
-        if official_msg_id:
-            payload["msg_id"] = official_msg_id
-        
-        print(f"[官方适配] 📤 发送图片: {json.dumps(payload, ensure_ascii=False)}")
         
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.post(url, json=payload, headers=headers, timeout=10) as resp:
+                async with session.post(url, json=payload, headers=headers, timeout=30) as resp:
                     if resp.status == 200:
                         print("[官方适配] ✅ 图片消息发送成功")
                         return True
                     else:
                         text = await resp.text()
-                        print(f"[官方适配] ❌ 发送图片失败: {resp.status} - {text[:200]}")
+                        print(f"[官方适配] ❌ 发送图片失败: {resp.status} - {text}")
                         return False
         except Exception as e:
             print(f"[官方适配] ❌ 发送图片异常: {e}")
             return False
     
-    # ===== 纯文本消息 =====
+    # ============================================================
+    # 2. 检测语音 CQ 码
+    # ============================================================
+    voice_match = re.search(r'\[CQ:record,file=file:///([^\]]+)\]', message)
+    if voice_match:
+        filepath = voice_match.group(1).strip()
+        print(f"[官方适配] 📤 检测到语音文件: {filepath}")
+        
+        if not os.path.exists(filepath):
+            print(f"[官方适配] ❌ 语音不存在: {filepath}")
+            return False
+        
+        try:
+            with open(filepath, 'rb') as f:
+                voice_data = f.read()
+            filename = os.path.basename(filepath)
+            print(f"[官方适配] 📤 语音大小: {len(voice_data)} bytes, 文件名: {filename}")
+        except Exception as e:
+            print(f"[官方适配] ❌ 读取语音失败: {e}")
+            return False
+        
+        # ========== 群聊语音发送 ==========
+        if group_openid:
+            # 先上传语音
+            file_info = await upload_voice_official_group(group_openid, voice_data, filename)
+            if not file_info:
+                print("[官方适配] ❌ 语音上传失败")
+                return False
+            
+            # 发送语音 - 尝试 msg_type: 3
+            url = f"https://api.bot.qq.com/v2/groups/{group_openid}/messages"
+            payload = {
+                "msg_type": 7,
+                "media": {"file_info": file_info}
+            }
+            if official_msg_id:
+                payload["msg_id"] = official_msg_id
+            
+            print(f"[官方适配] 📤 发送语音到群: {group_openid}, payload: {json.dumps(payload, ensure_ascii=False)[:200]}")
+            
+        elif user_openid:
+            file_info = await upload_voice_official(user_openid, voice_data, filename)
+            if not file_info:
+                print("[官方适配] ❌ 语音上传失败")
+                return False
+            
+            url = f"https://api.bot.qq.com/v2/users/{user_openid}/messages"
+            payload = {
+                "msg_type": 3,
+                "media": {"file_info": file_info}
+            }
+            if official_msg_id:
+                payload["msg_id"] = official_msg_id
+            
+            print(f"[官方适配] 📤 发送语音给用户: {user_openid}")
+        else:
+            return False
+        
+        # 发送请求
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(url, json=payload, headers=headers, timeout=30) as resp:
+                    if resp.status == 200:
+                        print("[官方适配] ✅ 语音消息发送成功")
+                        return True
+                    else:
+                        text = await resp.text()
+                        print(f"[官方适配] ❌ 发送语音失败: {resp.status} - {text}")
+                        return False
+        except Exception as e:
+            print(f"[官方适配] ❌ 发送语音异常: {e}")
+            return False
+    
+    # ============================================================
+    # 3. 检测 base64:// 格式
+    # ============================================================
+    b64_match = re.search(r'base64://([A-Za-z0-9+/=]+)', message)
+    if b64_match:
+        b64_data = b64_match.group(1)
+        try:
+            import base64
+            image_data = base64.b64decode(b64_data)
+            
+            temp_dir = "data/temp_images"
+            os.makedirs(temp_dir, exist_ok=True)
+            filename = f"help_{int(time.time())}_{random.randint(1000,9999)}.png"
+            filepath = os.path.join(temp_dir, filename)
+            with open(filepath, "wb") as f:
+                f.write(image_data)
+            print(f"[官方适配] ✅ base64保存为文件: {filepath}")
+            
+            return await send_message_official(
+                f"[CQ:image,file=file:///{os.path.abspath(filepath)}]",
+                user_openid=user_openid,
+                group_openid=group_openid,
+                official_msg_id=official_msg_id
+            )
+        except Exception as e:
+            print(f"[官方适配] ❌ base64解码失败: {e}")
+            return False
+    
+    # ============================================================
+    # 4. 纯文本消息
+    # ============================================================
+    clean_message = re.sub(r'\[CQ:[^\]]+\]', '', message).strip()
+    if not clean_message:
+        print("[官方适配] ⚠️ 消息为空，跳过发送")
+        return True
+    
     if group_openid:
         url = f"https://api.bot.qq.com/v2/groups/{group_openid}/messages"
     elif user_openid:
@@ -9008,23 +9270,126 @@ async def send_message_official(message: str, user_openid=None, group_openid=Non
     
     payload = {
         "msg_type": 0,
-        "content": message
+        "content": clean_message
     }
     if official_msg_id:
         payload["msg_id"] = official_msg_id
+    
+    print(f"[官方适配] 📤 发送文本: {clean_message[:50]}...")
     
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(url, json=payload, headers=headers, timeout=10) as resp:
                 if resp.status == 200:
+                    print("[官方适配] ✅ 文本消息发送成功")
                     return True
                 else:
                     text = await resp.text()
-                    print(f"[官方适配] ❌ 发送失败: {resp.status} - {text[:200]}")
+                    print(f"[官方适配] ❌ 发送文本失败: {resp.status} - {text}")
                     return False
     except Exception as e:
-        print(f"[官方适配] ❌ 发送异常: {e}")
+        print(f"[官方适配] ❌ 发送文本异常: {e}")
         return False
+
+
+    
+async def upload_voice_official_group(group_openid: str, voice_data: bytes, filename: str = "voice.m4a"):
+    """群聊上传语音 - file_type=4"""
+    token = ensure_token()
+    if not token:
+        return None
+    
+    headers = {"Authorization": f"QQBot {token}", "Content-Type": "application/json"}
+    import hashlib
+    
+    file_md5 = calc_md5(voice_data)
+    file_sha1 = calc_sha1(voice_data)
+    file_md5_10m = calc_md5_10m(voice_data)
+    file_size = str(len(voice_data))
+    
+    # 群聊语音用 file_type = 4
+    preupload_url = f"https://api.bot.qq.com/v2/groups/{group_openid}/upload_prepare"
+    payload = {
+        "file_type": 3,
+        "file_size": file_size,
+        "file_name": filename,
+        "md5": file_md5,
+        "sha1": file_sha1,
+        "md5_10m": file_md5_10m
+    }
+    
+    async with aiohttp.ClientSession() as session:
+        # 预上传
+        async with session.post(preupload_url, json=payload, headers=headers, timeout=30) as resp:
+            if resp.status != 200:
+                text = await resp.text()
+                print(f"[官方适配] ❌ 群聊语音预上传失败: {resp.status} - {text[:200]}")
+                return None
+            data = await resp.json()
+            upload_id = data.get("upload_id")
+            parts = data.get("parts", [])
+            if not upload_id or not parts:
+                return None
+            
+            # 上传分片
+            for part in parts:
+                part_index = part.get("index", 1)
+                presigned_url = part.get("presigned_url")
+                block_size = int(part.get("block_size", 0))
+                
+                start = (part_index - 1) * block_size
+                end = min(start + block_size, len(voice_data))
+                chunk = voice_data[start:end]
+                actual_size = len(chunk)
+                chunk_md5 = hashlib.md5(chunk).hexdigest()
+                
+                # PUT 上传
+                async with session.put(presigned_url, data=chunk, headers={"Content-Type": "application/octet-stream"}, timeout=60) as put_resp:
+                    if put_resp.status not in [200, 204]:
+                        text = await put_resp.text()
+                        print(f"[官方适配] ❌ 分片 {part_index} 上传失败: {put_resp.status}")
+                        return None
+                
+                # 确认分片
+                part_finish_url = f"https://api.bot.qq.com/v2/groups/{group_openid}/upload_part_finish"
+                part_finish_payload = {
+                    "upload_id": upload_id,
+                    "part_index": part_index,
+                    "block_size": str(actual_size),
+                    "md5": chunk_md5
+                }
+                
+                async with session.post(part_finish_url, json=part_finish_payload, headers=headers, timeout=30) as pf_resp:
+                    if pf_resp.status != 200:
+                        text = await pf_resp.text()
+                        print(f"[官方适配] ❌ 分片 {part_index} 确认失败: {pf_resp.status} - {text[:200]}")
+                        return None
+            
+            # 等待处理
+            await asyncio.sleep(2)
+            
+            # 合并上传
+            finalize_url = f"https://api.bot.qq.com/v2/groups/{group_openid}/files"
+            finalize_payload = {
+                "file_type": 4,
+                "upload_id": upload_id,
+                "srv_send_msg": False,
+                "file_name": filename
+            }
+            
+            async with session.post(finalize_url, json=finalize_payload, headers=headers, timeout=30) as finalize_resp:
+                if finalize_resp.status != 200:
+                    text = await finalize_resp.text()
+                    print(f"[官方适配] ❌ 群聊语音合并失败: {finalize_resp.status} - {text[:200]}")
+                    return None
+                data = await finalize_resp.json()
+                file_info = data.get("file_info")
+                if file_info:
+                    print(f"[官方适配] ✅ 群聊语音合并成功")
+                    return file_info
+                else:
+                    print(f"[官方适配] ❌ 群聊语音未获取到 file_info: {data}")
+                    return None
 
 # ========== 消息转换 ==========
 # ========== 消息转换 ==========
