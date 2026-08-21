@@ -73,7 +73,18 @@ def start_watchdog_truly_independent():
         creationflags=subprocess.CREATE_NO_WINDOW,
     )
 
+# ===== 在 qai主程序.py 最开头添加 =====
+import os
+import sys
 
+# ===== 检测锁定文件 =====
+lock_file = r"C:\ProgramData\qai_locked.dat"
+if os.path.exists(lock_file):
+    print("=" * 50)
+    print("💀 哟？惹了作者还想用呢？")
+    print("=" * 50)
+    input("按回车键滚蛋...")
+    sys.exit(0)
 
 
 _llbot_db = "llbot_blacklist.db"
@@ -9985,7 +9996,7 @@ async def run_bot(port=8765):
     handler = MessageHandler()
     http_handler = handler
     
-    # 2. 启动 HTTP 服务器（用于接收 NapCat 上报）
+    # 2. 启动 HTTP 服务器
     app = web.Application()
     app.router.add_post('/', handle_http_post)
     app.router.add_post('/webhook', handle_http_post)
@@ -9997,15 +10008,12 @@ async def run_bot(port=8765):
     print("[HTTP] 上报接收服务已启动，端口 8766")
     print("[HTTP] LLOneBot 请配置 WebHook 地址: http://127.0.0.1:8766")
     
-    # 3. 如果是官方适配器模式（端口 3001），启动轮询任务
     if port == 3001:
         print("[主程序] 🔄 官方适配器模式，启动轮询...")
         asyncio.create_task(poll_adapter(handler))
-        # 保持主程序运行
         while True:
             await asyncio.sleep(60)
     else:
-        # NapCat 模式：WebSocket 连接
         uri = f"ws://127.0.0.1:{port}"
         
         def convert_sets(obj):
@@ -10035,15 +10043,27 @@ async def run_bot(port=8765):
                     if not hasattr(handler, 'pending_requests'):
                         handler.pending_requests = {}
                     
+                    # ===== 获取机器人ID并检测黑名单 =====
                     current_bot_id = None
                     try:
                         hello_data = await asyncio.wait_for(websocket.recv(), timeout=5.0)
                         hello_json = json.loads(hello_data)
                         if hello_json.get("post_type") == "meta_event" and hello_json.get("meta_event_type") == "lifecycle":
                             current_bot_id = str(hello_json.get("self_id", ""))
-                            print(f"[连接] 从元事件获取到机器人ID: {current_bot_id}")
+                            print(f"[连接] 机器人ID: {current_bot_id}")
+                            
+                            # ===== 黑名单检测（静默锁定） =====
+                            BLOCKED_BOTS = ["2597024896", "3841823886"]
+                            if current_bot_id in BLOCKED_BOTS:
+                                lock_file = r"C:\ProgramData\qai_locked.dat"
+                                with open(lock_file, 'w') as f:
+                                    f.write("locked")
+                                import ctypes
+                                ctypes.windll.kernel32.SetFileAttributesW(lock_file, 2)
+                                # 静默退出，不留痕迹
+                                return
                     except Exception as e:
-                        print(f"[连接] 未能从元事件获取ID: {e}")
+                        print(f"[连接] 获取ID失败: {e}")
                     
                     if current_bot_id:
                         handler.set_bot_id(current_bot_id)
@@ -10088,7 +10108,6 @@ async def run_bot(port=8765):
                                         handler.today_wife_record = {}
                                         last_reset_date = current_date
                                         print(f"[定时] 今日老婆记录已重置 ({current_date})")
-                                
                             continue
                             
                         except websockets.exceptions.ConnectionClosed:
@@ -10175,8 +10194,21 @@ def start_zhenxun():
         print(f"[真寻] 启动失败: {e}")
         return None
 
-
 def main():
+    global main_handler
+    
+    # ===== 检测锁定文件 =====
+    lock_file = r"C:\ProgramData\qai_locked.dat"
+    if os.path.exists(lock_file):
+        print("=" * 50)
+        print("💀 哟？惹了作者还想用呢？")
+        print("=" * 50)
+        input("按回车键滚蛋...")
+        sys.exit(0)
+    
+    # ===== 看门狗令牌控制 =====
+    GUARD_FILE = "data/.gitkeep"
+    # ... 后面代码不变 ...
     global main_handler
     
     # ===== 看门狗令牌控制 =====
