@@ -1,3 +1,5 @@
+from colorama import Fore, Back, Style, init
+init(autoreset=True)  # 自动重置颜色
 import os
 import sys
 import aiohttp
@@ -17,7 +19,65 @@ if os.path.exists(license_file):
     except Exception as e:
         print(f"[启动] 清理旧密钥失败: {e}")
 # ======================================
+# ==================== 彩色日志工具 ====================
+from colorama import Fore, Style, init
+init()
 
+class ColoredLogger:
+    """彩色日志输出工具"""
+    
+    @staticmethod
+    def format_group_message(group_id: str, user_id: str, nickname: str, content: str, time_str: str = None):
+        """格式化群消息日志"""
+        if time_str is None:
+            time_str = datetime.now().strftime("%H:%M:%S")
+        
+        # 截断过长内容
+        display_content = content[:100] + "..." if len(content) > 100 else content
+        
+        lines = [
+            f"{Fore.CYAN}┌───── {Fore.YELLOW}群消息 {Fore.CYAN}─────{Style.RESET_ALL}",
+            f"{Fore.CYAN}│{Style.RESET_ALL} {Fore.WHITE}时间:{Style.RESET_ALL} {Fore.GREEN}{time_str}{Style.RESET_ALL}",
+            f"{Fore.CYAN}│{Style.RESET_ALL} {Fore.WHITE}群号:{Style.RESET_ALL} {Fore.MAGENTA}{group_id}{Style.RESET_ALL}",
+            f"{Fore.CYAN}│{Style.RESET_ALL} {Fore.WHITE}发送者:{Style.RESET_ALL} {Fore.BLUE}{nickname}{Style.RESET_ALL} {Fore.LIGHTBLACK_EX}({user_id}){Style.RESET_ALL}",
+            f"{Fore.CYAN}│{Style.RESET_ALL} {Fore.WHITE}内容:{Style.RESET_ALL}",
+            f"{Fore.CYAN}│{Style.RESET_ALL} {Fore.LIGHTWHITE_EX}{display_content}{Style.RESET_ALL}",
+            f"{Fore.CYAN}└─────────────────{Style.RESET_ALL}"
+        ]
+        return "\n".join(lines)
+    
+    @staticmethod
+    def format_private_message(user_id: str, nickname: str, content: str, time_str: str = None):
+        """格式化私聊消息日志"""
+        if time_str is None:
+            time_str = datetime.now().strftime("%H:%M:%S")
+        
+        display_content = content[:100] + "..." if len(content) > 100 else content
+        
+        lines = [
+            f"{Fore.CYAN}┌───── {Fore.YELLOW}私聊消息 {Fore.CYAN}─────{Style.RESET_ALL}",
+            f"{Fore.CYAN}│{Style.RESET_ALL} {Fore.WHITE}时间:{Style.RESET_ALL} {Fore.GREEN}{time_str}{Style.RESET_ALL}",
+            f"{Fore.CYAN}│{Style.RESET_ALL} {Fore.WHITE}发送者:{Style.RESET_ALL} {Fore.BLUE}{nickname}{Style.RESET_ALL} {Fore.LIGHTBLACK_EX}({user_id}){Style.RESET_ALL}",
+            f"{Fore.CYAN}│{Style.RESET_ALL} {Fore.WHITE}内容:{Style.RESET_ALL}",
+            f"{Fore.CYAN}│{Style.RESET_ALL} {Fore.LIGHTWHITE_EX}{display_content}{Style.RESET_ALL}",
+            f"{Fore.CYAN}└─────────────────{Style.RESET_ALL}"
+        ]
+        return "\n".join(lines)
+
+    @staticmethod
+    def format_send_reply(target: str, content: str, is_group: bool = True):
+        """格式化发送回复日志"""
+        display_content = content[:80] + "..." if len(content) > 80 else content
+        target_type = "群" if is_group else "私聊"
+        
+        lines = [
+            f"{Fore.CYAN}┌───── {Fore.GREEN}发送回复 {Fore.CYAN}─────{Style.RESET_ALL}",
+            f"{Fore.CYAN}│{Style.RESET_ALL} {Fore.WHITE}目标:{Style.RESET_ALL} {Fore.MAGENTA}{target_type} {target}{Style.RESET_ALL}",
+            f"{Fore.CYAN}│{Style.RESET_ALL} {Fore.WHITE}内容:{Style.RESET_ALL}",
+            f"{Fore.CYAN}│{Style.RESET_ALL} {Fore.LIGHTWHITE_EX}{display_content}{Style.RESET_ALL}",
+            f"{Fore.CYAN}└─────────────────{Style.RESET_ALL}"
+        ]
+        return "\n".join(lines)
 # ... 你原有的代码 ...
 # ==================== 授权系统 ====================
 import secrets
@@ -3309,9 +3369,44 @@ class MarriageData:
 # ==================== Ollama AI 配置 ====================
 # ==================== Ollama AI 配置 ====================
 # ==================== Ollama AI 配置 ====================
+# ==================== Ollama 云端/本地自动检测 ====================
+import os as _os
+
+def get_ollama_config():
+    """
+    自动检测是否配置了 Ollama 云密钥
+    - 有 OLLAMA_API_KEY → 直连云端 https://ollama.com
+    - 没有             → 走本地 http://127.0.0.1:11434
+    返回 (base_url, headers, is_cloud)
+    """
+    api_key = _os.environ.get("OLLAMA_API_KEY", "").strip()
+    if api_key:
+        return (
+            "https://ollama.com",
+            {
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            True,
+        )
+    return (
+        "http://127.0.0.1:11434",
+        {"Content-Type": "application/json"},
+        False,
+    )
+
+def strip_cloud_suffix(model_name: str, is_cloud: bool) -> str:
+    """
+    云端直连时去掉 -cloud 后缀；
+    本地模式保留 -cloud（本地 Ollama 会自动代理到云端）
+    """
+    if is_cloud and model_name.endswith("-cloud"):
+        return model_name[:-6]
+    return model_name
 class OllamaAI:
     def __init__(self):
-        self.base_url = "http://127.0.0.1:11434"
+        self.base_url, self.api_headers, self.is_cloud = get_ollama_config()
+        print(f"[AI] Ollama 模式: {'云端' if self.is_cloud else '本地'} | 地址: {self.base_url}")
         
         # ========== 纯文本模型优先级列表 ==========
         self.text_models_priority = [
@@ -3471,21 +3566,18 @@ class OllamaAI:
     
     async def chat(self, message, use_personality: bool = True,
                    group_id: str = None, user_id: str = None, favor: int = None) -> str:
-    
+
         # 转换消息
         if isinstance(message, list):
             message_str = self._convert_message_to_string(message)
         else:
             message_str = message
-    
-        # 检测是否有图片
+
         has_image = '[图片:' in message_str
-    
+
+        # 有图片时优先多模态
         if has_image:
-            # 有图片时，优先使用支持多模态的模型
             print(f"[AI] 检测到图片，使用多模态模型")
-        
-            # 尝试使用 llava 系列模型
             multimodal_models = ["llava:7b", "llava-phi3:latest", "gemma4:31b-cloud"]
             for mm_model in multimodal_models:
                 result = await self._chat_with_model(
@@ -3493,12 +3585,10 @@ class OllamaAI:
                 )
                 if result and result.strip():
                     return result
-        
             print(f"[AI] 多模态模型均失败，降级到纯文本")
-    
-        # 纯文本：使用原有逻辑
-        print(f"[AI] 使用纯文本模型: {self.current_model}")
-    
+
+        # ========== 第一轮：当前模式 ==========
+        print(f"[AI] 当前模式: {'云端' if self.is_cloud else '本地'} | 模型: {self.current_model}")
         for attempt in range(len(self.text_models_priority)):
             result = await self._chat_with_model(
                 message_str, self.current_model, use_personality, group_id, user_id, favor
@@ -3508,9 +3598,52 @@ class OllamaAI:
                 return result
             if not self._switch_to_next_text_model():
                 break
-    
+
+        # ========== 第二轮：自动切换模式重试 ==========
+        if self.is_cloud:
+            print("[AI切换] 云端全部失败，自动降级到本地 Ollama")
+            self.base_url = "http://127.0.0.1:11434"
+            self.api_headers = {"Content-Type": "application/json"}
+            self.is_cloud = False
+        else:
+            # 本地失败，如果之前设了 API Key，可以再试试云端
+            api_key = os.environ.get("OLLAMA_API_KEY", "").strip()
+            if api_key:
+                print("[AI切换] 本地全部失败，尝试切换到云端")
+                self.base_url = "https://ollama.com"
+                self.api_headers = {
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                }
+                self.is_cloud = True
+            else:
+                return "AI服务暂时不可用"
+
+        self._reset_text_model_index()
+        for attempt in range(len(self.text_models_priority)):
+            result = await self._chat_with_model(
+                message_str, self.current_model, use_personality, group_id, user_id, favor
+            )
+            if result and result.strip():
+                # 成功后把模式恢复回去，下次请求优先走原模式
+                self._restore_original_mode()
+                self._reset_text_model_index()
+                return result
+            if not self._switch_to_next_text_model():
+                break
+
+        # 两边都失败，恢复原模式
+        self._restore_original_mode()
         return "AI服务暂时不可用"
+
+    def _restore_original_mode(self):
+        """恢复到配置决定的模式"""
+        base, headers, is_cloud = get_ollama_config()
+        self.base_url = base
+        self.api_headers = headers
+        self.is_cloud = is_cloud
     
+    # ========== 图片处理相关方法 ==========
     # ========== 图片处理相关方法 ==========
     async def _chat_with_model(self, message_str: str, model: str,
                             use_personality: bool = True,
@@ -3519,29 +3652,32 @@ class OllamaAI:
         import re
         import aiohttp
         import base64
-    
+
         try:
             has_image = '[图片:' in message_str
             image_base64 = None
-        
+
             # 如果有图片，获取 base64
             if has_image:
                 match = re.search(r'\[图片:([^\]]+)\]', message_str)
                 if match:
                     file_hash = match.group(1)
                     image_base64 = await self._get_image_base64(file_hash, group_id, raw_message_list=raw_message)
-        
+
             # 提取文字
             clean_text = re.sub(r'\[图片:[^\]]+\]', '', message_str)
             clean_text = re.sub(r'@\d+\s*', '', clean_text)
-        
+
             if not clean_text.strip():
                 clean_text = "请描述这张图片"
-        
+
+            # ===== 新增：根据模式处理模型名 =====
+            final_model = strip_cloud_suffix(model, self.is_cloud)
+
             # 如果有图片，使用 /api/generate 接口
             if image_base64:
                 payload = {
-                    "model": model,
+                    "model": final_model,
                     "prompt": clean_text,
                     "images": [image_base64],
                     "stream": False,
@@ -3561,19 +3697,19 @@ class OllamaAI:
                     else:
                         system_prompt = self.personality_mgr.get_personality_prompt("default")
                     messages.append({"role": "system", "content": system_prompt})
-            
+
                 if favor is not None and user_id is not None:
                     favor_prompt = self._build_favor_prompt(favor, user_id)
                     messages.append({"role": "system", "content": favor_prompt})
-            
+
                 if user_id:
                     context_message = self.memory_module.get_conversation_context(user_id, clean_text)
                     messages.append({"role": "user", "content": context_message})
                 else:
                     messages.append({"role": "user", "content": clean_text})
-            
+
                 payload = {
-                    "model": model,
+                    "model": final_model,
                     "messages": messages,
                     "stream": False,
                     "options": {
@@ -3583,24 +3719,25 @@ class OllamaAI:
                     }
                 }
                 api_endpoint = f"{self.base_url}/api/chat"
-        
+
             timeout = aiohttp.ClientTimeout(total=120, connect=30)
-        
+
             async with aiohttp.ClientSession() as session:
                 async with session.post(
                     api_endpoint,
                     json=payload,
+                    headers=self.api_headers,
                     timeout=timeout
                 ) as response:
                     if response.status == 200:
                         result = await response.json()
-                    
+
                         # 根据接口不同，提取响应
                         if api_endpoint.endswith("/generate"):
                             response_text = result.get("response", "").strip()
                         else:
                             response_text = result.get("message", {}).get("content", "").strip()
-                    
+
                         if response_text:
                             response_text = re.sub(r'\d{5,11}', '', response_text)
                             return response_text
@@ -3609,7 +3746,7 @@ class OllamaAI:
                         error_text = await response.text()
                         print(f"[AI警告] HTTP {response.status}: {error_text[:200]}")
                         return None
-                    
+
         except Exception as e:
             print(f"[AI警告] 异常: {e}")
             import traceback
@@ -4767,45 +4904,76 @@ class MessageHandler:
             # ===== 🆕 屏蔽 q群管家 =====
             sender_info = data.get("sender", {})
             sender_nickname = sender_info.get("nickname", "") or sender_info.get("card", "") or ""
-            # 检查发送者昵称是否包含"群管家"
             if "群管家" in sender_nickname or "Q群管家" in sender_nickname:
                 print(f"[屏蔽] 检测到群管家消息，已屏蔽: {sender_nickname}")
                 return None
             
-            # 额外检查：如果消息内容是群管家发的且包含特定标识
             if sender_info.get("is_bot", False) and "群管家" in str(data.get("message", "")):
                 print(f"[屏蔽] 群管家消息（内容检测），已屏蔽")
                 return None
             
-            # ... 后续代码保持不变 ...
-            
-            # ... 后续代码
             post_type = data.get("post_type", "")
             
             # 确保有self_id
             if "self_id" not in data and self.bot_self_id:
                 data["self_id"] = self.bot_self_id
-        
+            
             # 所有消息都传给防撤回系统
             try:
                 self.anti_recall.record_message(data)
             except Exception as e:
                 print(f"[防撤回] 记录消息失败: {e}")
-        
+            
             # 提取变量
             message_type = data.get("message_type", "")
             user_id = str(data.get("user_id", "unknown"))
             group_id = data.get("group_id")
-        
+            
+            # ========== 🆕 彩色日志输出（放在最前面，不管是否@都显示）==========
+            if message_type == "group" and group_id:
+                # 获取发送者昵称
+                sender_info = data.get("sender", {})
+                nickname = sender_info.get("card") or sender_info.get("nickname") or str(user_id)
+                
+                # 获取消息内容
+                raw_msg = data.get("message", "")
+                if isinstance(raw_msg, list):
+                    text_parts = []
+                    for seg in raw_msg:
+                        if isinstance(seg, dict):
+                            seg_type = seg.get("type")
+                            seg_data = seg.get("data", {})
+                            if seg_type == "text":
+                                text_parts.append(seg_data.get("text", ""))
+                            elif seg_type == "image":
+                                text_parts.append("[图片]")
+                            elif seg_type == "at":
+                                text_parts.append(f"@{seg_data.get('qq', '')}")
+                            elif seg_type == "face":
+                                text_parts.append("[表情]")
+                            elif seg_type == "reply":
+                                text_parts.append(f"[回复:{seg_data.get('id', '')}]")
+                            else:
+                                text_parts.append(f"[{seg_type}]")
+                        elif isinstance(seg, str):
+                            text_parts.append(seg)
+                    display_message = ''.join(text_parts)
+                else:
+                    display_message = str(raw_msg) if raw_msg else ""
+                
+                print(ColoredLogger.format_group_message(str(group_id), str(user_id), nickname, display_message))
+            
+            elif message_type == "private":
+                sender_info = data.get("sender", {})
+                nickname = sender_info.get("nickname") or str(user_id)
+                raw_msg = data.get("message", "")
+                display_message = str(raw_msg) if raw_msg else ""
+                print(ColoredLogger.format_private_message(str(user_id), nickname, display_message))
+            
             # 处理非消息事件
             if post_type != "message":
                 return self._handle_non_message(data)
-        
-            # 输出消息
-            if message_type == "group":
-                pure_text = self._extract_pure_text(data)
-                print(f"[消息] 群{group_id} ← {user_id}: {pure_text[:50]}...")
-            post_type = data.get("post_type", "")
+            
             # ===== 刷屏检测 =====
             if message_type == "group" and group_id:
                 spam_result = await self.spam_detector.check_message(
@@ -4813,6 +4981,7 @@ class MessageHandler:
                 )
                 if spam_result:
                     return spam_result
+            
             # ====== 互斥骂人逻辑 ======
             new_system_triggered = False
             scolding_msg = None
@@ -4833,7 +5002,7 @@ class MessageHandler:
                         print(f"[旧系统] 触发关键词检测")
                         scolding_msg = self._get_scolding_message(user_id, data)
                         old_system_triggered = True
-        
+            
             if new_system_triggered or old_system_triggered:
                 print(f"[骂人] 使用{'新' if new_system_triggered else '旧'}系统回复")
                 return self._create_reply(
@@ -4842,11 +5011,11 @@ class MessageHandler:
                     group_id=group_id,
                     message=scolding_msg
                 )
-        
+            
             # ====== 检查禁用群 ======
             if message_type == "group" and str(group_id) in self.disabled_groups:
                 return None
-        
+            
             # @刷屏检测
             if self.at_spam_config['enabled'] and self.is_at_bot(data):
                 if self._check_at_spam(user_id):
@@ -4854,7 +5023,7 @@ class MessageHandler:
                     if message_type == "group":
                         warning_msg = f"[CQ:at,qq={user_id}] {warning_msg}"
                     return self._create_reply(message_type, user_id, group_id, warning_msg)
-        
+            
             # ========== 视频解析 ==========
             if hasattr(self, 'video_parser') and self.video_parser and self.video_parser.config.get("enabled", False):
                 raw_message = data.get("message", "")
@@ -4873,7 +5042,7 @@ class MessageHandler:
                         if info:
                             msg = self.video_parser.format_message(info)
                             return self._create_reply(message_type, user_id, group_id, msg)
-        
+            
             # ========== 检查是否需要回复（@机器人）==========
             if message_type == "private":
                 should_reply = True
@@ -4886,14 +5055,14 @@ class MessageHandler:
             if not should_reply:
                 print(f"[DEBUG] 不回复，跳过")
                 return None
-        
+            
             # 黑名单检查
             if user_id and self.blacklist.is_banned(user_id):
                 msg = "您已被加入黑名单，无法使用功能"
                 if message_type == "group":
                     msg = f"[CQ:at,qq={user_id}] {msg}"
                 return self._create_reply(message_type, user_id, group_id, msg)
-        
+            
             # 提取文本
             text = self._extract_pure_text(data)
             if not text or text == "（空消息）":
@@ -4907,23 +5076,20 @@ class MessageHandler:
                         reply = f"[CQ:at,qq={user_id}] {reply}"
                     print(f"[安全] 用户 {user_id} 触发拦截: {text[:50]}")
                     return self._create_reply(message_type, user_id, group_id, reply)
-      
+          
             # 长文本检查
             if len(text) > 1000:
                 skip_msg = "检测到长文本，已取消调用"
                 if message_type == "group":
                     skip_msg = f"[CQ:at,qq={user_id}] {skip_msg}"
                 return self._create_reply(message_type, user_id, group_id, skip_msg)
-        
+            
             # ========== 处理命令 ==========
             command_response = await self._process_commands(text, user_id, message_type, group_id, raw_message_data=data)
             
-            # ===== 关键修复：检查命令是否已处理 =====
             if command_response is not None:
-                # 如果是特殊标记 _handled，说明已通过 HTTP API 发送，直接返回 None
                 if isinstance(command_response, dict) and command_response.get("_handled"):
                     return None
-                # 如果是正常的回复 dict，直接返回
                 if isinstance(command_response, dict):
                     return command_response
                 return None
@@ -4961,7 +5127,7 @@ class MessageHandler:
             return await self._handle_ai_chat(text, user_id, message_type, group_id, raw_message)
         
         except Exception as e:
-            print(f"[错误] handle_message异常: {e}")
+            print(f"{Fore.RED}[错误] handle_message异常: {e}{Style.RESET_ALL}")
             import traceback
             traceback.print_exc()
             return None
@@ -8968,6 +9134,13 @@ async def handle_single_event(websocket, handler, data, bot_self_id):
         reply = await handler.handle_message(data)
         
         if reply and isinstance(reply, dict):
+            # 获取发送者信息用于日志
+            user_id = data.get("user_id")
+            group_id = data.get("group_id")
+            sender_info = data.get("sender", {})
+            nickname = sender_info.get("card") or sender_info.get("nickname") or str(user_id)
+            message_type = data.get("message_type", "group")
+            
             # 1. 检查是否是刷屏命令确认消息
             reply_text = reply.get("params", {}).get("message", "")
             
@@ -8975,8 +9148,6 @@ async def handle_single_event(websocket, handler, data, bot_self_id):
             is_spam_command = False
             target_qq = None
             duration_text = ""
-            group_id = data.get("group_id")
-            user_id = data.get("user_id")
             
             # 模式1: @机器人 QQ号 [时长]
             if data.get("message", "").strip().startswith("@机器人"):
@@ -8984,12 +9155,10 @@ async def handle_single_event(websocket, handler, data, bot_self_id):
                 parts = raw_msg.split()
                 for i, part in enumerate(parts):
                     if part == "机器人" and i < len(parts) - 1:
-                        # 下一个可能是QQ号
                         for j in range(i + 1, len(parts)):
                             if parts[j].isdigit() and len(parts[j]) >= 5:
                                 target_qq = int(parts[j])
                                 is_spam_command = True
-                                # 检查后面是否有时长
                                 if j + 1 < len(parts):
                                     duration_text = parts[j + 1]
                                 break
@@ -9006,23 +9175,21 @@ async def handle_single_event(websocket, handler, data, bot_self_id):
             
             # 如果检测到刷屏命令
             if is_spam_command and target_qq and group_id:
-                # 立即启动刷屏（不等待回复发送完成）
                 if hasattr(handler, 'spammer'):
-                    print(f"[刷屏器] 检测到刷屏命令，目标: {target_qq}, 时长: {duration_text}")
+                    print(f"{Fore.YELLOW}[刷屏器] 检测到刷屏命令，目标: {target_qq}, 时长: {duration_text}{Style.RESET_ALL}")
                     
-                    # 检查权限
                     if not handler.admin_manager.is_admin(str(user_id)):
-                        # 发送权限错误消息
                         await websocket.send(json.dumps({
                             "action": "send_msg",
                             "params": {
                                 "message_type": "group",
                                 "group_id": int(group_id),
-                                "message": f"[CQ:at,qq={user_id}] ? 需要管理员权限才能使用刷屏功能"
+                                "message": f"[CQ:at,qq={user_id}] ❌ 需要管理员权限才能使用刷屏功能"
                             }
                         }))
+                        # 记录回复
+                        print(ColoredLogger.format_send_reply(group_id, "权限不足", True))
                     else:
-                        # 启动刷屏任务
                         task_id, result_msg = await handler.spammer.start_spam(
                             target_qq=target_qq,
                             group_id=int(group_id),
@@ -9031,8 +9198,7 @@ async def handle_single_event(websocket, handler, data, bot_self_id):
                         )
                         
                         if task_id:
-                            print(f"[刷屏器] 后台任务已启动: {task_id}")
-                            # 发送启动确认消息
+                            print(f"{Fore.GREEN}[刷屏器] 后台任务已启动: {task_id}{Style.RESET_ALL}")
                             await websocket.send(json.dumps({
                                 "action": "send_msg",
                                 "params": {
@@ -9041,21 +9207,25 @@ async def handle_single_event(websocket, handler, data, bot_self_id):
                                     "message": f"[CQ:at,qq={user_id}] {result_msg}"
                                 }
                             }))
+                            print(ColoredLogger.format_send_reply(group_id, result_msg, True))
             
             # 2. 发送原始回复
             await websocket.send(json.dumps(reply))
+            
+            # 记录发送的回复
+            reply_params = reply.get("params", {})
+            reply_content = reply_params.get("message", "")
+            if reply_content:
+                is_group = reply_params.get("message_type") == "group"
+                target_id = reply_params.get("group_id") or reply_params.get("user_id")
+                if target_id:
+                    print(ColoredLogger.format_send_reply(target_id, reply_content, is_group))
             
             # 3. 强制记录防撤回缓存...
             # ... [原有的防撤回记录代码]
             
     except Exception as e:
-        print(f"[错误] 消息处理异常: {e}")
-        import traceback
-        traceback.print_exc()
-
-        
-    except Exception as e:
-        print(f"[错误] 消息处理异常: {e}")
+        print(f"{Fore.RED}[错误] 消息处理异常: {e}{Style.RESET_ALL}")
         import traceback
         traceback.print_exc()
 async def handle_event(websocket, handler, data, bot_self_id):
@@ -9090,11 +9260,38 @@ async def handle_message_event(websocket, handler, data, bot_self_id):
     group_id = data.get("group_id")
     raw_message = data.get("message", "")
     
-    # 输出接收到的消息
-    if message_type == "private":
-        print(f"[消息] 私聊 ← {user_id}: {raw_message[:50]}...")
+    # 获取发送者昵称
+    sender_info = data.get("sender", {})
+    nickname = sender_info.get("card") or sender_info.get("nickname") or str(user_id)
+    
+    # 转换消息内容为字符串
+    if isinstance(raw_message, list):
+        text_parts = []
+        for seg in raw_message:
+            if isinstance(seg, dict):
+                seg_type = seg.get("type")
+                seg_data = seg.get("data", {})
+                if seg_type == "text":
+                    text_parts.append(seg_data.get("text", ""))
+                elif seg_type == "image":
+                    text_parts.append("[图片]")
+                elif seg_type == "at":
+                    text_parts.append(f"@{seg_data.get('qq', '')}")
+                elif seg_type == "face":
+                    text_parts.append(f"[表情]")
+                else:
+                    text_parts.append(f"[{seg_type}]")
+            elif isinstance(seg, str):
+                text_parts.append(seg)
+        display_message = ''.join(text_parts)
     else:
-        print(f"[消息] 群聊{group_id} ← {user_id}: {raw_message[:50]}...")
+        display_message = str(raw_message) if raw_message else ""
+    
+    # 使用彩色日志
+    if message_type == "private":
+        print(ColoredLogger.format_private_message(user_id, nickname, display_message))
+    else:
+        print(ColoredLogger.format_group_message(group_id, user_id, nickname, display_message))
     
     # 处理消息
     reply = await handler.handle_message(data)
@@ -9102,7 +9299,6 @@ async def handle_message_event(websocket, handler, data, bot_self_id):
     if reply:
         # 处理手动打卡命令
         if isinstance(reply, dict) and reply.get("type") == "manual_sign":
-            # 使用打卡模块发送手动打卡
             if hasattr(handler, 'sign_module') and handler.sign_module:
                 sign_group_id = reply.get("group_id")
                 sign_user_id = reply.get("user_id")
@@ -9111,7 +9307,6 @@ async def handle_message_event(websocket, handler, data, bot_self_id):
                 )
                 print(f"[打卡] 手动打卡结果: {result}")
             else:
-                # 备用方案
                 responses = ["打卡成功！", "已为你签到！"]
                 response_msg = random.choice(responses)
                 await websocket.send(json.dumps({
@@ -9122,11 +9317,22 @@ async def handle_message_event(websocket, handler, data, bot_self_id):
                         "message": f"[CQ:at,qq={user_id}] {response_msg}"
                     }
                 }))
+                # 记录发送的回复
+                print(ColoredLogger.format_send_reply(group_id, response_msg, True))
         
         # 普通回复
         elif "action" in reply:
             await websocket.send(json.dumps(reply))
-            print(f"[消息] → 发送回复到{'私聊' if message_type == 'private' else f'群聊{group_id}'}")
+            
+            # 获取回复内容
+            reply_params = reply.get("params", {})
+            reply_content = reply_params.get("message", "")
+            
+            # 记录发送的回复
+            if message_type == "private":
+                print(ColoredLogger.format_send_reply(user_id, reply_content, False))
+            else:
+                print(ColoredLogger.format_send_reply(group_id, reply_content, True))
             
             # 记录防撤回
             if "params" in reply:
@@ -9137,7 +9343,7 @@ async def handle_message_event(websocket, handler, data, bot_self_id):
                 if msg_type == "group" and msg_group_id and msg_content:
                     handler.anti_recall.record_sent_message(str(msg_group_id), msg_content)
     else:
-        print(f"[消息] 无回复")
+        print(f"{Fore.LIGHTBLACK_EX}[消息] 无回复{Style.RESET_ALL}")
 
 async def handle_notice_event(websocket, handler, data):
     notice_type = data.get("notice_type")
@@ -9207,23 +9413,15 @@ async def handle_http_post(request):
     global http_handler
     try:
         data = await request.json()
-        # 如果数据里有 message 字段，就转成字符串
-        if 'message' in data and isinstance(data['message'], list):
-            text_parts = []
-            for seg in data['message']:
-                if seg.get('type') == 'text':
-                    text_parts.append(seg.get('data', {}).get('text', ''))
-                elif seg.get('type') == 'image':
-                    text_parts.append('[图片]')
-            data['message'] = ''.join(text_parts)
-            print(f"[HTTP上报] Array格式已转换")
-        print(f"[HTTP上报] 收到消息: {json.dumps(data, ensure_ascii=False)[:300]}")
-        if http_handler and data.get("post_type") == "message":
-            asyncio.create_task(http_handler.handle_message(data))
-        # 返回 JSON 格式，而不是纯文本 "OK"
+        
+        # 打印原始数据
+        print(f"[HTTP上报] 📨 原始数据: {json.dumps(data, ensure_ascii=False)[:500]}")
+        
+        # ===== 直接返回成功，不处理任何消息逻辑 =====
         return web.json_response({"status": "ok", "retcode": 0})
+        
     except Exception as e:
-        print(f"[HTTP上报] 错误: {e}")
+        print(f"[HTTP上报] ❌ 错误: {e}")
         return web.json_response({"status": "error", "retcode": -1}, status=500)
 import asyncio
 import aiohttp
@@ -10796,7 +10994,25 @@ def main():
         print("[看门狗] 已独立启动")
     
     _check()
-    
+    # ===== Ollama 模式提示 =====
+    # ===== Ollama 模式提示 =====
+    _ollama_key = os.environ.get("OLLAMA_API_KEY", "").strip()
+    print("=" * 50)
+    if _ollama_key:
+        _masked = _ollama_key[:8] + "..." + _ollama_key[-6:]
+        print(f"🧠 Ollama: ☁️  云端模式 (密钥 {_masked})")
+        print("   💡 想切回本地？删除环境变量 OLLAMA_API_KEY 后重开窗口")
+    else:
+        print("🧠 Ollama: 💻 本地模式")
+        print("   💡 想用云端？设置环境变量 OLLAMA_API_KEY")
+        print("   ┌─────────────────────────────────────────")
+        print("   │ 永久设置（推荐，重开窗口生效）:")
+        print("   │   setx OLLAMA_API_KEY \"你的密钥\"")
+        print("   │")
+        print("   │ 临时设置（只对当前窗口有效）:")
+        print("   │   $env:OLLAMA_API_KEY = \"你的密钥\"")
+        print("   └─────────────────────────────────────────")
+    print("=" * 50)
     print("=" * 50)
     print("🤖 XP12 机器人启动器")
     print("=" * 50)

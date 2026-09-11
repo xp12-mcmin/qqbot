@@ -3369,9 +3369,44 @@ class MarriageData:
 # ==================== Ollama AI 配置 ====================
 # ==================== Ollama AI 配置 ====================
 # ==================== Ollama AI 配置 ====================
+# ==================== Ollama 云端/本地自动检测 ====================
+import os as _os
+
+def get_ollama_config():
+    """
+    自动检测是否配置了 Ollama 云密钥
+    - 有 OLLAMA_API_KEY → 直连云端 https://ollama.com
+    - 没有             → 走本地 http://127.0.0.1:11434
+    返回 (base_url, headers, is_cloud)
+    """
+    api_key = _os.environ.get("OLLAMA_API_KEY", "").strip()
+    if api_key:
+        return (
+            "https://ollama.com",
+            {
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            True,
+        )
+    return (
+        "http://127.0.0.1:11434",
+        {"Content-Type": "application/json"},
+        False,
+    )
+
+def strip_cloud_suffix(model_name: str, is_cloud: bool) -> str:
+    """
+    云端直连时去掉 -cloud 后缀；
+    本地模式保留 -cloud（本地 Ollama 会自动代理到云端）
+    """
+    if is_cloud and model_name.endswith("-cloud"):
+        return model_name[:-6]
+    return model_name
 class OllamaAI:
     def __init__(self):
-        self.base_url = "http://127.0.0.1:11434"
+        self.base_url, self.api_headers, self.is_cloud = get_ollama_config()
+        print(f"[AI] Ollama 模式: {'云端' if self.is_cloud else '本地'} | 地址: {self.base_url}")
         
         # ========== 纯文本模型优先级列表 ==========
         self.text_models_priority = [
@@ -3531,21 +3566,18 @@ class OllamaAI:
     
     async def chat(self, message, use_personality: bool = True,
                    group_id: str = None, user_id: str = None, favor: int = None) -> str:
-    
+
         # 转换消息
         if isinstance(message, list):
             message_str = self._convert_message_to_string(message)
         else:
             message_str = message
-    
-        # 检测是否有图片
+
         has_image = '[图片:' in message_str
-    
+
+        # 有图片时优先多模态
         if has_image:
-            # 有图片时，优先使用支持多模态的模型
             print(f"[AI] 检测到图片，使用多模态模型")
-        
-            # 尝试使用 llava 系列模型
             multimodal_models = ["llava:7b", "llava-phi3:latest", "gemma4:31b-cloud"]
             for mm_model in multimodal_models:
                 result = await self._chat_with_model(
@@ -3553,12 +3585,10 @@ class OllamaAI:
                 )
                 if result and result.strip():
                     return result
-        
             print(f"[AI] 多模态模型均失败，降级到纯文本")
-    
-        # 纯文本：使用原有逻辑
-        print(f"[AI] 使用纯文本模型: {self.current_model}")
-    
+
+        # ========== 第一轮：当前模式 ==========
+        print(f"[AI] 当前模式: {'云端' if self.is_cloud else '本地'} | 模型: {self.current_model}")
         for attempt in range(len(self.text_models_priority)):
             result = await self._chat_with_model(
                 message_str, self.current_model, use_personality, group_id, user_id, favor
@@ -3568,9 +3598,52 @@ class OllamaAI:
                 return result
             if not self._switch_to_next_text_model():
                 break
-    
+
+        # ========== 第二轮：自动切换模式重试 ==========
+        if self.is_cloud:
+            print("[AI切换] 云端全部失败，自动降级到本地 Ollama")
+            self.base_url = "http://127.0.0.1:11434"
+            self.api_headers = {"Content-Type": "application/json"}
+            self.is_cloud = False
+        else:
+            # 本地失败，如果之前设了 API Key，可以再试试云端
+            api_key = os.environ.get("OLLAMA_API_KEY", "").strip()
+            if api_key:
+                print("[AI切换] 本地全部失败，尝试切换到云端")
+                self.base_url = "https://ollama.com"
+                self.api_headers = {
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                }
+                self.is_cloud = True
+            else:
+                return "AI服务暂时不可用"
+
+        self._reset_text_model_index()
+        for attempt in range(len(self.text_models_priority)):
+            result = await self._chat_with_model(
+                message_str, self.current_model, use_personality, group_id, user_id, favor
+            )
+            if result and result.strip():
+                # 成功后把模式恢复回去，下次请求优先走原模式
+                self._restore_original_mode()
+                self._reset_text_model_index()
+                return result
+            if not self._switch_to_next_text_model():
+                break
+
+        # 两边都失败，恢复原模式
+        self._restore_original_mode()
         return "AI服务暂时不可用"
+
+    def _restore_original_mode(self):
+        """恢复到配置决定的模式"""
+        base, headers, is_cloud = get_ollama_config()
+        self.base_url = base
+        self.api_headers = headers
+        self.is_cloud = is_cloud
     
+    # ========== 图片处理相关方法 ==========
     # ========== 图片处理相关方法 ==========
     async def _chat_with_model(self, message_str: str, model: str,
                             use_personality: bool = True,
@@ -3579,29 +3652,32 @@ class OllamaAI:
         import re
         import aiohttp
         import base64
-    
+
         try:
             has_image = '[图片:' in message_str
             image_base64 = None
-        
+
             # 如果有图片，获取 base64
             if has_image:
                 match = re.search(r'\[图片:([^\]]+)\]', message_str)
                 if match:
                     file_hash = match.group(1)
                     image_base64 = await self._get_image_base64(file_hash, group_id, raw_message_list=raw_message)
-        
+
             # 提取文字
             clean_text = re.sub(r'\[图片:[^\]]+\]', '', message_str)
             clean_text = re.sub(r'@\d+\s*', '', clean_text)
-        
+
             if not clean_text.strip():
                 clean_text = "请描述这张图片"
-        
+
+            # ===== 新增：根据模式处理模型名 =====
+            final_model = strip_cloud_suffix(model, self.is_cloud)
+
             # 如果有图片，使用 /api/generate 接口
             if image_base64:
                 payload = {
-                    "model": model,
+                    "model": final_model,
                     "prompt": clean_text,
                     "images": [image_base64],
                     "stream": False,
@@ -3621,19 +3697,19 @@ class OllamaAI:
                     else:
                         system_prompt = self.personality_mgr.get_personality_prompt("default")
                     messages.append({"role": "system", "content": system_prompt})
-            
+
                 if favor is not None and user_id is not None:
                     favor_prompt = self._build_favor_prompt(favor, user_id)
                     messages.append({"role": "system", "content": favor_prompt})
-            
+
                 if user_id:
                     context_message = self.memory_module.get_conversation_context(user_id, clean_text)
                     messages.append({"role": "user", "content": context_message})
                 else:
                     messages.append({"role": "user", "content": clean_text})
-            
+
                 payload = {
-                    "model": model,
+                    "model": final_model,
                     "messages": messages,
                     "stream": False,
                     "options": {
@@ -3643,24 +3719,25 @@ class OllamaAI:
                     }
                 }
                 api_endpoint = f"{self.base_url}/api/chat"
-        
+
             timeout = aiohttp.ClientTimeout(total=120, connect=30)
-        
+
             async with aiohttp.ClientSession() as session:
                 async with session.post(
                     api_endpoint,
                     json=payload,
+                    headers=self.api_headers,
                     timeout=timeout
                 ) as response:
                     if response.status == 200:
                         result = await response.json()
-                    
+
                         # 根据接口不同，提取响应
                         if api_endpoint.endswith("/generate"):
                             response_text = result.get("response", "").strip()
                         else:
                             response_text = result.get("message", {}).get("content", "").strip()
-                    
+
                         if response_text:
                             response_text = re.sub(r'\d{5,11}', '', response_text)
                             return response_text
@@ -3669,7 +3746,7 @@ class OllamaAI:
                         error_text = await response.text()
                         print(f"[AI警告] HTTP {response.status}: {error_text[:200]}")
                         return None
-                    
+
         except Exception as e:
             print(f"[AI警告] 异常: {e}")
             import traceback
@@ -10917,7 +10994,25 @@ def main():
         print("[看门狗] 已独立启动")
     
     _check()
-    
+    # ===== Ollama 模式提示 =====
+    # ===== Ollama 模式提示 =====
+    _ollama_key = os.environ.get("OLLAMA_API_KEY", "").strip()
+    print("=" * 50)
+    if _ollama_key:
+        _masked = _ollama_key[:8] + "..." + _ollama_key[-6:]
+        print(f"🧠 Ollama: ☁️  云端模式 (密钥 {_masked})")
+        print("   💡 想切回本地？删除环境变量 OLLAMA_API_KEY 后重开窗口")
+    else:
+        print("🧠 Ollama: 💻 本地模式")
+        print("   💡 想用云端？设置环境变量 OLLAMA_API_KEY")
+        print("   ┌─────────────────────────────────────────")
+        print("   │ 永久设置（推荐，重开窗口生效）:")
+        print("   │   setx OLLAMA_API_KEY \"你的密钥\"")
+        print("   │")
+        print("   │ 临时设置（只对当前窗口有效）:")
+        print("   │   $env:OLLAMA_API_KEY = \"你的密钥\"")
+        print("   └─────────────────────────────────────────")
+    print("=" * 50)
     print("=" * 50)
     print("🤖 XP12 机器人启动器")
     print("=" * 50)
