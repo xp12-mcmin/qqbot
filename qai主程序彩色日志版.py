@@ -4087,7 +4087,10 @@ class MessageHandler:
         for method_name in ['_extract_at_target_from_raw', '_extract_target_user', '_extract_delta_value']:
             if not hasattr(self, method_name):
                 print(f"[好感度修复] {method_name} 方法未找到")
-
+        # ===== 违禁词检测器 =====
+        from banned_word_detector import get_banned_word_detector
+        self.banned_word_detector = get_banned_word_detector()
+        print("[调试] 违禁词检测器加载成功")
         # 初始化 AI 性格（传入黑名单）
         self.ai = OllamaAI()
         if hasattr(self.ai, 'personality_mgr'):
@@ -4744,7 +4747,99 @@ class MessageHandler:
             return False
         except Exception:
             return False
-    
+    async def _check_banned_word(self, group_id: str, user_id: str, data: Dict) -> Optional[Dict]:
+        """
+        违禁词检测处理：撤回 + 累计禁言（每群独立开关）
+        返回:
+            None: 无违禁词或该群未启用
+            Dict: 需要执行的 action（撤回/禁言）
+        """
+        try:
+            if not hasattr(self, 'banned_word_detector') or not self.banned_word_detector:
+                return None
+            
+            # ===== 关键修复：改成每群独立判断 =====
+            if not self.banned_word_detector.is_group_enabled(group_id):
+                return None
+            
+            # 提取纯文本
+            text = self._extract_pure_text(data)
+            if not text or text in ["（空消息）", "（提取失败）"]:
+                return None
+            
+            # 检测
+            result = self.banned_word_detector.check_message(group_id, user_id, text)
+            if not result:
+                return None
+            
+            matched_word = result["matched_word"]
+            count = result["count"]
+            threshold = result["threshold"]
+            should_mute = result["should_mute"]
+            mute_duration = result["mute_duration"]
+            delete_message = result["delete_message"]
+            notify = result["notify"]
+            
+            # 获取原始 message_id（用于撤回）
+            raw_message_id = data.get("message_id")
+            
+            actions = []
+            
+            # ========== 1. 撤回消息 ==========
+            if delete_message and raw_message_id:
+                actions.append({
+                    "action": "delete_msg",
+                    "params": {"message_id": raw_message_id}
+                })
+                print(f"[违禁词] 🗑️ 撤回消息 ID: {raw_message_id}")
+            
+            # ========== 2. 禁言 ==========
+            if should_mute:
+                actions.append({
+                    "action": "set_group_ban",
+                    "params": {
+                        "group_id": int(group_id),
+                        "user_id": int(user_id),
+                        "duration": mute_duration
+                    }
+                })
+                print(f"[违禁词] 🔨 禁言用户 {user_id} {mute_duration}秒")
+            
+            # ========== 3. 提示 ==========
+            if notify:
+                if should_mute:
+                    mute_desc = self._format_duration(mute_duration)
+                    tip = f"[CQ:at,qq={user_id}] 🚫 检测到违禁词「{matched_word}」\n⚠️ 已累计 {threshold} 次，禁言 {mute_desc}"
+                else:
+                    tip = f"[CQ:at,qq={user_id}] 🚫 检测到违禁词「{matched_word}」\n⚠️ 警告 {count}/{threshold} 次"
+                actions.append({
+                    "action": "send_msg",
+                    "params": {
+                        "message_type": "group",
+                        "group_id": int(group_id),
+                        "message": tip
+                    }
+                })
+            
+            # 直接发送所有 action（撤回优先）
+            if actions:
+                if hasattr(self, 'websocket') and self.websocket:
+                    for act in actions:
+                        try:
+                            await self.websocket.send(json.dumps(act))
+                        except Exception as e:
+                            print(f"[违禁词] 发送 action 失败: {e}")
+                
+                # 返回"已处理"标记，阻止后续 AI 回复
+                return {"_handled": True}
+            
+            return None
+            
+        except Exception as e:
+            print(f"[违禁词] 处理异常: {e}")
+            import traceback
+            traceback.print_exc()
+            return None   
     def _check_at_spam(self, user_id: str) -> bool:
         """@刷屏检测 - 保持原有逻辑"""
         try:
@@ -4981,7 +5076,14 @@ class MessageHandler:
                 )
                 if spam_result:
                     return spam_result
-            
+            # ===== 违禁词检测 =====
+            if message_type == "group" and group_id:
+                banned_result = await self._check_banned_word(
+                    str(group_id), str(user_id), data
+                )
+                if banned_result:
+                    # 有违禁词，返回处理结果（撤回/禁言）
+                    return banned_result            
             # ====== 互斥骂人逻辑 ======
             new_system_triggered = False
             scolding_msg = None
@@ -5920,6 +6022,187 @@ class MessageHandler:
             }))
             
             return self._create_reply(message_type, user_id, group_id, f"✅ 已将机器人名字改为：{new_name}")
+        # ========== 违禁词检测管理 ==========
+        if text_lower.startswith(("!违禁词", "！违禁词")):
+            if not is_admin:
+                return self._create_reply(message_type, user_id, group_id, "❌ 只有AI管理员可以管理违禁词")
+            
+            if not hasattr(self, 'banned_word_detector') or not self.banned_word_detector:
+                return self._create_reply(message_type, user_id, group_id, "❌ 违禁词模块未初始化")
+            
+            detector = self.banned_word_detector
+            parts = text.split()
+            
+            if len(parts) < 2:
+                return self._create_reply(message_type, user_id, group_id,
+                    "📝 违禁词命令:\n"
+                    "  ── 开关 ──\n"
+                    "  !违禁词 全局 开/关        全局总开关\n"
+                    "  !违禁词 启用             启用本群\n"
+                    "  !违禁词 禁用             禁用本群\n"
+                    "  !违禁词 启用群 <群号>    启用指定群\n"
+                    "  !违禁词 禁用群 <群号>    禁用指定群\n"
+                    "  !违禁词 群列表           查看已启用群\n"
+                    "  ── 词库 ──\n"
+                    "  !违禁词 添加 <词>\n"
+                    "  !违禁词 删除 <词>\n"
+                    "  !违禁词 列表\n"
+                    "  ── 参数 ──\n"
+                    "  !违禁词 阈值 <次数>\n"
+                    "  !违禁词 时长 <秒>\n"
+                    "  !违禁词 重置 <小时>\n"
+                    "  !违禁词 撤回 开/关\n"
+                    "  ── 记录 ──\n"
+                    "  !违禁词 清除记录 <QQ>\n"
+                    "  !违禁词 清空本群\n"
+                    "  !违禁词 状态")
+            
+            cmd = parts[1].lower()
+            
+            # ========== 全局开关 ==========
+            if cmd in ["全局", "global"]:
+                if len(parts) >= 3:
+                    enabled = parts[2] in ["开", "on", "开启", "启用"]
+                    return self._create_reply(message_type, user_id, group_id, detector.set_global_enabled(enabled))
+                return self._create_reply(message_type, user_id, group_id,
+                    f"全局状态: {'开启' if detector.is_global_enabled() else '关闭'}\n"
+                    f"用法: !违禁词 全局 开/关")
+            
+            # ========== 启用本群 ==========
+            if cmd in ["启用", "开", "on"]:
+                if message_type != "group":
+                    return self._create_reply(message_type, user_id, group_id, "❌ 该命令只能在群聊中使用")
+                if detector.enable_group(str(group_id)):
+                    return self._create_reply(message_type, user_id, group_id, f"✅ 已启用本群（{group_id}）的违禁词检测")
+                return self._create_reply(message_type, user_id, group_id, "ℹ️ 本群已经在启用列表中")
+            
+            # ========== 禁用本群 ==========
+            if cmd in ["禁用", "关", "off"]:
+                if message_type != "group":
+                    return self._create_reply(message_type, user_id, group_id, "❌ 该命令只能在群聊中使用")
+                if detector.disable_group(str(group_id)):
+                    return self._create_reply(message_type, user_id, group_id, f"✅ 已禁用本群（{group_id}）的违禁词检测")
+                return self._create_reply(message_type, user_id, group_id, "ℹ️ 本群不在启用列表中")
+            
+            # ========== 启用指定群 ==========
+            if cmd in ["启用群", "enable"]:
+                if len(parts) < 3 or not parts[2].isdigit():
+                    return self._create_reply(message_type, user_id, group_id, "❌ 格式: !违禁词 启用群 <群号>")
+                target_group = parts[2]
+                if detector.enable_group(target_group):
+                    return self._create_reply(message_type, user_id, group_id, f"✅ 已启用群 {target_group} 的违禁词检测")
+                return self._create_reply(message_type, user_id, group_id, f"ℹ️ 群 {target_group} 已在启用列表中")
+            
+            # ========== 禁用指定群 ==========
+            if cmd in ["禁用群", "disable"]:
+                if len(parts) < 3 or not parts[2].isdigit():
+                    return self._create_reply(message_type, user_id, group_id, "❌ 格式: !违禁词 禁用群 <群号>")
+                target_group = parts[2]
+                if detector.disable_group(target_group):
+                    return self._create_reply(message_type, user_id, group_id, f"✅ 已禁用群 {target_group} 的违禁词检测")
+                return self._create_reply(message_type, user_id, group_id, f"ℹ️ 群 {target_group} 不在启用列表中")
+            
+            # ========== 查看已启用群 ==========
+            if cmd in ["群列表", "grouplist", "groups"]:
+                groups = detector.get_enabled_groups()
+                if not groups:
+                    return self._create_reply(message_type, user_id, group_id, "📭 暂无启用的群")
+                lines = [f"📋 已启用违禁词检测的群 (共{len(groups)}个):"]
+                for i, g in enumerate(groups, 1):
+                    lines.append(f"  {i}. {g}")
+                return self._create_reply(message_type, user_id, group_id, "\n".join(lines))
+            
+            # ========== 状态 ==========
+            if cmd in ["状态", "status"]:
+                return self._create_reply(message_type, user_id, group_id,
+                    detector.get_status(str(group_id) if message_type == "group" else None))
+            
+            # ========== 添加 ==========
+            if cmd in ["添加", "add"]:
+                if len(parts) < 3:
+                    return self._create_reply(message_type, user_id, group_id, "❌ 格式: !违禁词 添加 <词>")
+                word = parts[2]
+                if detector.add_word(word):
+                    return self._create_reply(message_type, user_id, group_id, f"✅ 已添加违禁词: {word}")
+                return self._create_reply(message_type, user_id, group_id, f"❌ 添加失败（可能已存在）")
+            
+            # ========== 删除 ==========
+            if cmd in ["删除", "remove", "del"]:
+                if len(parts) < 3:
+                    return self._create_reply(message_type, user_id, group_id, "❌ 格式: !违禁词 删除 <词>")
+                word = parts[2]
+                if detector.remove_word(word):
+                    return self._create_reply(message_type, user_id, group_id, f"✅ 已删除违禁词: {word}")
+                return self._create_reply(message_type, user_id, group_id, f"❌ 未找到该词")
+            
+            # ========== 列表 ==========
+            if cmd in ["列表", "list"]:
+                words = detector.list_words()
+                if not words:
+                    return self._create_reply(message_type, user_id, group_id, "📭 违禁词列表为空")
+                lines = [f"📋 违禁词列表 (共{len(words)}个):"]
+                for i, w in enumerate(words[:50], 1):
+                    lines.append(f"  {i}. {w}")
+                if len(words) > 50:
+                    lines.append(f"  ... 共 {len(words)} 个")
+                return self._create_reply(message_type, user_id, group_id, "\n".join(lines))
+            
+            # ========== 阈值 ==========
+            if cmd in ["阈值", "threshold"]:
+                if len(parts) < 3 or not parts[2].isdigit():
+                    return self._create_reply(message_type, user_id, group_id,
+                        f"当前阈值: {detector.config['mute_threshold']} 次\n格式: !违禁词 阈值 <次数>")
+                if detector.set_mute_threshold(int(parts[2])):
+                    return self._create_reply(message_type, user_id, group_id,
+                        f"✅ 禁言阈值已设为 {parts[2]} 次")
+                return self._create_reply(message_type, user_id, group_id, "❌ 设置失败")
+            
+            # ========== 时长 ==========
+            if cmd in ["时长", "duration"]:
+                if len(parts) < 3 or not parts[2].isdigit():
+                    return self._create_reply(message_type, user_id, group_id,
+                        f"当前禁言时长: {detector.config['mute_duration']}秒\n格式: !违禁词 时长 <秒>")
+                if detector.set_mute_duration(int(parts[2])):
+                    return self._create_reply(message_type, user_id, group_id,
+                        f"✅ 禁言时长已设为 {parts[2]} 秒")
+                return self._create_reply(message_type, user_id, group_id, "❌ 设置失败")
+            
+            # ========== 重置 ==========
+            if cmd in ["重置", "reset"]:
+                if len(parts) < 3 or not parts[2].isdigit():
+                    return self._create_reply(message_type, user_id, group_id,
+                        f"当前重置时间: {detector.config['reset_hours']}小时\n格式: !违禁词 重置 <小时>")
+                if detector.set_reset_hours(int(parts[2])):
+                    return self._create_reply(message_type, user_id, group_id,
+                        f"✅ 重置时间已设为 {parts[2]} 小时")
+                return self._create_reply(message_type, user_id, group_id, "❌ 设置失败")
+            
+            # ========== 撤回开关 ==========
+            if cmd in ["撤回", "delete"]:
+                if len(parts) >= 3:
+                    enabled = parts[2] in ["开", "on", "开启", "启用"]
+                else:
+                    enabled = not detector.config.get("delete_message", True)
+                if detector.set_delete_message(enabled):
+                    return self._create_reply(message_type, user_id, group_id,
+                        f"✅ 撤回消息已{'开启' if enabled else '关闭'}")
+                return self._create_reply(message_type, user_id, group_id, "❌ 设置失败")
+            
+            # ========== 清除单个用户记录 ==========
+            if cmd in ["清除记录", "清除", "clear"]:
+                if len(parts) < 3:
+                    return self._create_reply(message_type, user_id, group_id, "❌ 格式: !违禁词 清除记录 <QQ>")
+                target = parts[2]
+                if detector.clear_user_record(str(group_id), target):
+                    return self._create_reply(message_type, user_id, group_id, f"✅ 已清除用户 {target} 的违禁记录")
+                return self._create_reply(message_type, user_id, group_id, f"❌ 用户 {target} 无记录")
+            
+            # ========== 清空本群记录 ==========
+            if cmd in ["清空本群", "清空"]:
+                count = detector.clear_group_records(str(group_id))
+                return self._create_reply(message_type, user_id, group_id, f"✅ 已清空本群 {count} 个用户的违禁记录")
+            
+            return self._create_reply(message_type, user_id, group_id, "❌ 未知命令，发送 !违禁词 查看帮助")
         # ---------- 13.12 全局性格 ----------
         if text_lower.startswith(("!全局切换", "！全局切换")):
             parts = text.split()
@@ -8445,6 +8728,23 @@ class MessageHandler:
                     ("", ""),
                     ("--- 欢迎管理 ---", ""),
                     ("!欢迎开关 开/关", "全局欢迎开关"),
+                    ("", ""),
+                    ("--- 违禁词检测 ---", ""),
+                    ("!违禁词 全局 开/关", "全局总开关"),
+                    ("!违禁词 启用/禁用", "启用/禁用本群"),
+                    ("!违禁词 启用群 <群号>", "远程启用指定群"),
+                    ("!违禁词 禁用群 <群号>", "远程禁用指定群"),
+                    ("!违禁词 群列表", "查看已启用群"),
+                    ("!违禁词 添加 <词>", "添加违禁词"),
+                    ("!违禁词 删除 <词>", "删除违禁词"),
+                    ("!违禁词 列表", "查看所有违禁词"),
+                    ("!违禁词 阈值 <次数>", "设置第几次禁言(默认10)"),
+                    ("!违禁词 时长 <秒>", "设置禁言时长(默认600)"),
+                    ("!违禁词 重置 <小时>", "设置重置时间(默认3h)"),
+                    ("!违禁词 撤回 开/关", "是否撤回违禁消息"),
+                    ("!违禁词 清除记录 <QQ>", "清除单个用户记录"),
+                    ("!违禁词 清空本群", "清空本群所有记录"),
+                    ("!违禁词 状态", "查看当前状态"),
                 ]
                 img = generator.create_help_page("管理员命令", "【⚙️ 管理员命令】", commands, is_admin)
                 filepath = generator.save_to_temp(img)
