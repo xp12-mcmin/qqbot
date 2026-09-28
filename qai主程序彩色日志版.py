@@ -4090,6 +4090,14 @@ class MessageHandler:
         # ===== 违禁词检测器 =====
         from banned_word_detector import get_banned_word_detector
         self.banned_word_detector = get_banned_word_detector()
+        # ===== 进群审核 =====
+        from group_audit import get_group_audit
+        self.group_audit = get_group_audit(
+            blacklist=self.blacklist,
+            banned_word_detector=self.banned_word_detector,
+            ai=self.ai
+        )
+        print("[调试] 进群审核模块加载成功")
         print("[调试] 违禁词检测器加载成功")
         # 初始化 AI 性格（传入黑名单）
         self.ai = OllamaAI()
@@ -4644,7 +4652,54 @@ class MessageHandler:
                 return self._handle_group_increase(data)
             
         return None
-
+    async def _handle_group_request(self, data: Dict) -> Optional[Dict]:
+        """处理加群申请事件（OneBot 11）"""
+        try:
+            # 调试：打印原始事件
+            print(f"[进群审核] 原始事件: {json.dumps(data, ensure_ascii=False)}")
+            
+            group_id = str(data.get("group_id", ""))
+            user_id = str(data.get("user_id", ""))
+            comment = data.get("comment", "") or ""
+            sub_type = data.get("sub_type", "add")
+            flag = data.get("flag", "")
+            
+            # 只处理主动申请
+            if sub_type != "add":
+                print(f"[进群审核] 非主动申请 (sub_type={sub_type})，跳过")
+                return None
+            
+            if not hasattr(self, 'group_audit') or not self.group_audit:
+                return None
+            
+            nickname = data.get("nickname", "") or user_id
+            
+            print(f"[进群审核] 群{group_id} 用户{nickname}({user_id}) 申请加群，留言: {comment}")
+            
+            result, reason = await self.group_audit.audit_request(
+                group_id, user_id, nickname, comment
+            )
+            
+            approve = (result == "approve")
+            print(f"[进群审核] {'✅ 同意' if approve else '❌ 拒绝'} {user_id}，原因: {reason}")
+            
+            params = {
+                "flag": flag,
+                "sub_type": "add",
+                "approve": approve
+            }
+            if not approve and reason:
+                params["reason"] = reason
+            
+            return {
+                "action": "set_group_add_request",
+                "params": params
+            }
+        except Exception as e:
+            print(f"[进群审核] 处理异常: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
     def _handle_group_increase(self, data: Dict) -> Optional[Dict]:
         """处理新人入群事件"""
         try:
@@ -5067,6 +5122,10 @@ class MessageHandler:
             
             # 处理非消息事件
             if post_type != "message":
+                # 加群申请（OneBot 11 request 事件）
+                if post_type == "request" and data.get("request_type") == "group":
+                    return await self._handle_group_request(data)
+                # 其他 notice 事件
                 return self._handle_non_message(data)
             
             # ===== 刷屏检测 =====
@@ -6864,7 +6923,183 @@ class MessageHandler:
             parts = text.split()
             if len(parts) >= 2:
                 return self._create_reply(message_type, user_id, group_id, f"打卡时间已更新为 {parts[1]}")
-        
+        # ========== 进群审核管理 ==========
+        if text_lower.startswith(("!审核", "！审核")):
+            if not is_admin:
+                return self._create_reply(message_type, user_id, group_id, "❌ 只有AI管理员可以操作")
+            
+            if not hasattr(self, 'group_audit') or not self.group_audit:
+                return self._create_reply(message_type, user_id, group_id, "❌ 进群审核模块未初始化")
+            
+            audit = self.group_audit
+            parts = text.split()
+            
+            if len(parts) < 2:
+                return self._create_reply(message_type, user_id, group_id,
+                    "📝 进群审核命令:\n"
+                    "  ── 开关 ──\n"
+                    "  !审核 全局 开/关          模块总开关\n"
+                    "  !审核 启用                本群加入白名单\n"
+                    "  !审核 禁用                本群移出白名单\n"
+                    "  !审核 启用群 <群号>       远程启用\n"
+                    "  !审核 禁用群 <群号>       远程禁用\n"
+                    "  !审核 群列表              查看白名单\n"
+                    "  ── 诉求 ──\n"
+                    "  !审核 添加诉求 <文本>     设置本群AI审批标准\n"
+                    "  !审核 查看诉求\n"
+                    "  !审核 删除诉求\n"
+                    "  ── 关键词 ──\n"
+                    "  !审核 添加关键词 <词>\n"
+                    "  !审核 删除关键词 <词>\n"
+                    "  !审核 关键词列表\n"
+                    "  ── 其他 ──\n"
+                    "  !审核 状态\n"
+                    "  !审核 记录")
+            
+            cmd = parts[1].lower()
+            
+            # 全局开关
+            if cmd in ["全局", "global"]:
+                if len(parts) >= 3:
+                    enabled = parts[2] in ["开", "on", "开启", "启用"]
+                    return self._create_reply(message_type, user_id, group_id, audit.set_global_enabled(enabled))
+                return self._create_reply(message_type, user_id, group_id,
+                    f"全局状态: {'开启' if audit.is_global_enabled() else '关闭'}\n用法: !审核 全局 开/关")
+            
+            # 启用本群
+            if cmd in ["启用", "开", "on"]:
+                if message_type != "group":
+                    return self._create_reply(message_type, user_id, group_id, "❌ 只能在群聊中使用")
+                gid = str(group_id)
+                if audit.enable_group(gid):
+                    # 启用后检查是否设置诉求
+                    prompt = audit.get_group_prompt(gid)
+                    if not prompt:
+                        tip = (
+                            f"✅ 已启用本群进群审核\n\n"
+                            f"⚠️ 提醒：你还没设置本群审核诉求！\n"
+                            f"建议立即设置，否则 AI 将按默认标准审核。\n\n"
+                            f"📝 设置命令:\n"
+                            f"!审核 添加诉求 <你想说给AI的审核标准>\n\n"
+                            f"💡 示例:\n"
+                            f"!审核 添加诉求 本群只收玩MC的，拒绝广告、骚扰、卖号"
+                        )
+                        return self._create_reply(message_type, user_id, group_id, tip)
+                    return self._create_reply(message_type, user_id, group_id, f"✅ 已启用本群进群审核\n本群诉求: {prompt}")
+                return self._create_reply(message_type, user_id, group_id, "ℹ️ 本群已在白名单中")
+            
+            # 禁用本群
+            if cmd in ["禁用", "关", "off"]:
+                if message_type != "group":
+                    return self._create_reply(message_type, user_id, group_id, "❌ 只能在群聊中使用")
+                if audit.disable_group(str(group_id)):
+                    return self._create_reply(message_type, user_id, group_id, f"✅ 已禁用本群进群审核")
+                return self._create_reply(message_type, user_id, group_id, "ℹ️ 本群不在白名单中")
+            
+            # 启用指定群
+            if cmd in ["启用群", "enable"]:
+                if len(parts) < 3 or not parts[2].isdigit():
+                    return self._create_reply(message_type, user_id, group_id, "❌ 格式: !审核 启用群 <群号>")
+                target = parts[2]
+                if audit.enable_group(target):
+                    prompt = audit.get_group_prompt(target)
+                    if not prompt:
+                        tip = (
+                            f"✅ 已启用群 {target} 的进群审核\n\n"
+                            f"⚠️ 提醒：该群还没设置审核诉求！\n"
+                            f"请到群 {target} 里发送:\n"
+                            f"!审核 添加诉求 <审核标准>"
+                        )
+                        return self._create_reply(message_type, user_id, group_id, tip)
+                    return self._create_reply(message_type, user_id, group_id, f"✅ 已启用群 {target}")
+                return self._create_reply(message_type, user_id, group_id, f"ℹ️ 群 {target} 已在白名单中")
+            
+            # 禁用指定群
+            if cmd in ["禁用群", "disable"]:
+                if len(parts) < 3 or not parts[2].isdigit():
+                    return self._create_reply(message_type, user_id, group_id, "❌ 格式: !审核 禁用群 <群号>")
+                if audit.disable_group(parts[2]):
+                    return self._create_reply(message_type, user_id, group_id, f"✅ 已禁用群 {parts[2]}")
+                return self._create_reply(message_type, user_id, group_id, f"ℹ️ 群 {parts[2]} 不在白名单中")
+            
+            # 群列表
+            if cmd in ["群列表", "grouplist", "groups"]:
+                groups = audit.config["enabled_groups"]
+                if not groups:
+                    return self._create_reply(message_type, user_id, group_id, "📭 白名单为空")
+                lines = [f"📋 已启用进群审核的群 (共{len(groups)}个):"]
+                for i, g in enumerate(groups, 1):
+                    has_prompt = "✅" if audit.get_group_prompt(g) else "⚠️"
+                    lines.append(f"  {i}. {g} {has_prompt}")
+                lines.append("\n💡 ✅=已设诉求 ⚠️=未设诉求")
+                return self._create_reply(message_type, user_id, group_id, "\n".join(lines))
+            
+            # 添加诉求
+            if cmd in ["添加诉求", "addprompt"]:
+                if message_type != "group":
+                    return self._create_reply(message_type, user_id, group_id, "❌ 只能在群聊中使用")
+                parts_full = text.split(maxsplit=2)
+                if len(parts_full) < 3:
+                    return self._create_reply(message_type, user_id, group_id, 
+                        "❌ 格式: !审核 添加诉求 <文本>\n"
+                        "💡 示例: !审核 添加诉求 本群只收玩MC的，拒绝广告骚扰")
+                prompt_text = parts_full[2].strip()
+                if not prompt_text:
+                    return self._create_reply(message_type, user_id, group_id, "❌ 诉求不能为空")
+                return self._create_reply(message_type, user_id, group_id, audit.set_group_prompt(str(group_id), prompt_text))
+            
+            # 查看诉求
+            if cmd in ["查看诉求", "getprompt"]:
+                if message_type != "group":
+                    return self._create_reply(message_type, user_id, group_id, "❌ 只能在群聊中使用")
+                p = audit.get_group_prompt(str(group_id))
+                return self._create_reply(message_type, user_id, group_id,
+                    f"📝 本群诉求:\n{p if p else '（未设置，AI按默认标准审核）'}")
+            
+            # 删除诉求
+            if cmd in ["删除诉求", "delprompt"]:
+                if message_type != "group":
+                    return self._create_reply(message_type, user_id, group_id, "❌ 只能在群聊中使用")
+                if audit.remove_group_prompt(str(group_id)):
+                    return self._create_reply(message_type, user_id, group_id, "✅ 已删除本群诉求")
+                return self._create_reply(message_type, user_id, group_id, "ℹ️ 本群未设置诉求")
+            
+            # 添加关键词
+            if cmd in ["添加关键词", "addkw"]:
+                if len(parts) < 3:
+                    return self._create_reply(message_type, user_id, group_id, "❌ 格式: !审核 添加关键词 <词>")
+                if audit.add_keyword(parts[2]):
+                    return self._create_reply(message_type, user_id, group_id, f"✅ 已添加审核关键词: {parts[2]}")
+                return self._create_reply(message_type, user_id, group_id, "❌ 添加失败（可能已存在）")
+            
+            # 删除关键词
+            if cmd in ["删除关键词", "delkw"]:
+                if len(parts) < 3:
+                    return self._create_reply(message_type, user_id, group_id, "❌ 格式: !审核 删除关键词 <词>")
+                if audit.remove_keyword(parts[2]):
+                    return self._create_reply(message_type, user_id, group_id, f"✅ 已删除审核关键词: {parts[2]}")
+                return self._create_reply(message_type, user_id, group_id, "❌ 未找到该词")
+            
+            # 关键词列表
+            if cmd in ["关键词列表", "kwlist"]:
+                kws = audit.config["extra_keywords"]
+                if not kws:
+                    return self._create_reply(message_type, user_id, group_id, "📭 审核关键词为空")
+                lines = [f"📋 审核关键词 (共{len(kws)}个):"]
+                for i, w in enumerate(kws, 1):
+                    lines.append(f"  {i}. {w}")
+                return self._create_reply(message_type, user_id, group_id, "\n".join(lines))
+            
+            # 状态
+            if cmd in ["状态", "status"]:
+                return self._create_reply(message_type, user_id, group_id,
+                    audit.get_status(str(group_id) if message_type == "group" else None))
+            
+            # 记录
+            if cmd in ["记录", "records"]:
+                return self._create_reply(message_type, user_id, group_id, audit.get_recent_records(10))
+            
+            return self._create_reply(message_type, user_id, group_id, "❌ 未知命令，发送 !审核 查看帮助")        
         # ---------- 13.10 骂人系统 ----------
         if text_lower.startswith("!骂人开关"):
             parts = text.split()
@@ -8729,7 +8964,7 @@ class MessageHandler:
                     ("--- 欢迎管理 ---", ""),
                     ("!欢迎开关 开/关", "全局欢迎开关"),
                     ("", ""),
-                    ("--- 违禁词检测 ---", ""),
+                    ("--- 检测 ---", ""),
                     ("!违禁词 全局 开/关", "全局总开关"),
                     ("!违禁词 启用/禁用", "启用/禁用本群"),
                     ("!违禁词 启用群 <群号>", "远程启用指定群"),
@@ -8745,6 +8980,21 @@ class MessageHandler:
                     ("!违禁词 清除记录 <QQ>", "清除单个用户记录"),
                     ("!违禁词 清空本群", "清空本群所有记录"),
                     ("!违禁词 状态", "查看当前状态"),
+                    ("", ""),
+                    ("--- 进群审核 ---", ""),
+                    ("!审核 全局 开/关", "模块总开关(默认关)"),
+                    ("!审核 启用/禁用", "启用/禁用本群"),
+                    ("!审核 启用群 <群号>", "远程启用"),
+                    ("!审核 禁用群 <群号>", "远程禁用"),
+                    ("!审核 群列表", "查看白名单"),
+                    ("!审核 添加诉求 <文本>", "设置本群AI审批标准"),
+                    ("!审核 查看诉求", "查看本群诉求"),
+                    ("!审核 删除诉求", "删除本群诉求"),
+                    ("!审核 添加关键词 <词>", "添加审核违禁词"),
+                    ("!审核 删除关键词 <词>", "删除审核违禁词"),
+                    ("!审核 关键词列表", "查看审核违禁词"),
+                    ("!审核 状态", "查看状态"),
+                    ("!审核 记录", "查看最近审核记录"),
                 ]
                 img = generator.create_help_page("管理员命令", "【⚙️ 管理员命令】", commands, is_admin)
                 filepath = generator.save_to_temp(img)
