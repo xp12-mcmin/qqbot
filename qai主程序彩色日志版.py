@@ -3,6 +3,7 @@ init(autoreset=True)  # 自动重置颜色
 import os
 import sys
 import aiohttp
+from notify_manager import KickNotifyManager
 # ========== 强制切换到脚本所在目录 ==========
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
 print(f"[启动] 工作目录已切换到: {os.getcwd()}")
@@ -4082,6 +4083,8 @@ class MessageHandler:
             self._load_scolding_config()
         else:
             print("[骂人模块] _load_scolding_config 方法未找到，使用默认值")
+        self.kick_notify = KickNotifyManager()
+        self.kick_notify = KickNotifyManager()
         # 同样保护所有可能有问题的调用
         # ========== 防御性检查：好感度辅助方法 ==========
         for method_name in ['_extract_at_target_from_raw', '_extract_target_user', '_extract_delta_value']:
@@ -4634,23 +4637,23 @@ class MessageHandler:
                         print(f"[自动解禁全体] ❌ 解禁失败: {resp.status} - {text}")
         except Exception as e:
             print(f"[自动解禁全体] ❌ HTTP 异常: {e}")
-    def _handle_non_message(self, data: Dict) -> Optional[Dict]:
+    async def _handle_non_message(self, data: Dict) -> Optional[Dict]:
         post_type = data.get("post_type")
         if post_type == "notice":
             notice_type = data.get("notice_type")
-            
+
             if notice_type == "group_recall":
                 return self.anti_recall.handle_recall_event(data)
-            
             elif notice_type == "group_ban":
                 print("[禁言] 收到群禁言事件")
                 return self._handle_group_ban(data)
-            
-            # ========== 新增：处理入群事件 ==========
             elif notice_type == "group_increase":
                 print("[入群] 收到新人入群事件")
                 return self._handle_group_increase(data)
-            
+            # 🆕
+            elif notice_type == "group_decrease":
+                return await self.kick_notify.handle_group_decrease(data, self)
+
         return None
     async def _handle_group_request(self, data: Dict) -> Optional[Dict]:
         """处理加群申请事件（OneBot 11）"""
@@ -5126,7 +5129,7 @@ class MessageHandler:
                 if post_type == "request" and data.get("request_type") == "group":
                     return await self._handle_group_request(data)
                 # 其他 notice 事件
-                return self._handle_non_message(data)
+                return await self._handle_non_message(data)
             
             # ===== 刷屏检测 =====
             if message_type == "group" and group_id:
@@ -7306,6 +7309,15 @@ class MessageHandler:
                     status = "开启" if self.favorability.config.get("ai_enabled", True) else "关闭"
                     return self._create_reply(message_type, user_id, group_id, f"🤖 好感度AI分析状态: {status}")
             return self._create_reply(message_type, user_id, group_id, "格式: !好感度AI 开/关/状态")
+        # ========== 被踢通知 / 退群群发 ==========
+        if is_admin:
+            handled, reply = self.kick_notify.handle_command(
+                text, group_id=group_id, user_id=user_id, is_admin=True
+            )
+            if handled:
+                if reply:
+                    return self._create_reply(message_type, user_id, group_id, reply)
+                return {"_handled": True}
         # ========== 视频解析命令 ==========
         # ========== 视频解析命令 ==========
         if text_lower.startswith(("!视频解析", "！视频解析")):
@@ -8995,6 +9007,9 @@ class MessageHandler:
                     ("!审核 关键词列表", "查看审核违禁词"),
                     ("!审核 状态", "查看状态"),
                     ("!审核 记录", "查看最近审核记录"),
+                    ("", ""),
+                    ("--- 被踢通知 ---", ""),
+                    ("被踢通知","显示被踢通知帮助菜单"),
                 ]
                 img = generator.create_help_page("管理员命令", "【⚙️ 管理员命令】", commands, is_admin)
                 filepath = generator.save_to_temp(img)
@@ -9047,6 +9062,7 @@ class MessageHandler:
                     ("--- 视频解析 ---", ""),
                     ("!视频解析 开/关", "开启/关闭视频解析"),
                     ("!视频解析 群发/私聊", "设置发送方式"),
+                    ("被踢通知","被踢通知帮助")
                 ]
                 img = generator.create_help_page("其他功能", "【🔧 其他功能】", commands, is_admin)
                 filepath = generator.save_to_temp(img)
