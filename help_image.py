@@ -206,6 +206,7 @@ class HelpImageGenerator:
         draw.line((20, y+10, width-20, y+10), fill='#333333', width=1)
         draw.text((20, y+30), "💡 示例: !帮助 14   查看AI绘画", fill='#aaaaaa', font=self.font_normal)
         draw.text((20, y+55), "📝 发送「!帮助 全部」查看完整命令", fill='#aaaaaa', font=self.font_normal)
+        draw.text((20, y+80), "📝反馈发到邮箱xp1234567890qwertyuiop@outlook.com", fill='#aaaaaa', font=self.font_normal)
         
         return img
     

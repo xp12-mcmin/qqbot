@@ -5,13 +5,15 @@ from datetime import datetime
 
 import websocket  # pip install websocket-client
 
-WS_URL = "ws://127.0.0.1:8765"
+# ================= 配置区 =================
+WS_URL = "ws://127.0.0.1:5678"
 ACCESS_TOKEN = ""
 
-GROUP_ID = 1031177320
-USER_ID = 1562389003
-DURATION = 100          # 禁言时长，单位秒，1 天 = 86400
-CHECK_INTERVAL = 9       # 检测间隔（秒）
+GROUP_ID = 673733353
+USER_ID = 3906199433
+DURATION = 86400          # 禁言时长，单位秒，1 天 = 86400
+CHECK_INTERVAL = 5        # 检测间隔（秒），稍微调大一点避免触发限制
+# ==========================================
 
 _lock = threading.Lock()
 _ws = None
@@ -20,25 +22,43 @@ _pending = {}
 
 
 def connect():
-    global _ws
+    global _ws, _echo_id
     header = [f"Authorization: Bearer {ACCESS_TOKEN}"] if ACCESS_TOKEN else []
     _ws = websocket.create_connection(WS_URL, header=header)
+    # 【关键修复】重连时清空旧的请求队列，重置 ID，防止拿到过期的返回
+    with _lock:
+        _pending.clear()
+        _echo_id = 0
     threading.Thread(target=_recv_loop, daemon=True).start()
     print(f"{datetime.now():%H:%M:%S} WebSocket 已连接：{WS_URL}")
 
 
 def _recv_loop():
+    """接收消息循环：处理 API 的返回，同时也顺带拦截群禁言事件"""
     while True:
         try:
             raw = _ws.recv()
             if not raw:
                 continue
             data = json.loads(raw)
+            
+            # 1. 处理 API 的返回结果
             echo = data.get("echo")
             if echo and echo in _pending:
                 _pending[echo] = data
+            
+            # 2. (可选) 顺带监听群事件，如果是该用户被解除禁言，直接打印出来
+            # 这能帮我们判断是 NapCat 没发事件，还是事件发了但列表没更新
+            if data.get("post_type") == "notice" and data.get("notice_type") == "group_ban":
+                if data.get("user_id") == USER_ID and data.get("group_id") == GROUP_ID:
+                    sub_type = data.get("sub_type")
+                    if sub_type == "lift_ban":
+                        print(f"{datetime.now():%H:%M:%S} [事件通知] 收到 QQ 系统的解除禁言事件！")
+                    elif sub_type == "ban":
+                        print(f"{datetime.now():%H:%M:%S} [事件通知] 收到 QQ 系统的被禁言事件！")
+                        
         except Exception as e:
-            print(f"[WS ERROR] {e}")
+            print(f"[WS ERROR] 连接断开: {e}")
             time.sleep(3)
             try:
                 connect()
@@ -57,10 +77,14 @@ def call(action: str, params: dict, timeout=10):
 
     start = time.time()
     while time.time() - start < timeout:
-        if _pending.get(echo) is not None:
-            return _pending.pop(echo)
+        with _lock:
+            res = _pending.get(echo)
+            if res is not None:
+                return _pending.pop(echo)
         time.sleep(0.05)
-    _pending.pop(echo, None)
+    
+    with _lock:
+        _pending.pop(echo, None)
     return None
 
 
@@ -86,18 +110,26 @@ def get_shut_list():
     return None
 
 
-def is_banned(shut_list) -> int:
+def get_remain_seconds(shut_list) -> int:
     """
     返回该用户的剩余禁言秒数；没被禁返回 0。
-    不同 OneBot 实现字段名可能不同，这里做兼容处理。
     """
     if not shut_list:
         return 0
+    now = time.time()
     for item in shut_list:
-        if item.get("user_id") == USER_ID:
-            # NapCat / Lagrange 常见字段：shut_up_time / duration
-            remain = item.get("shut_up_time") or item.get("duration") or 0
-            return int(remain)
+        # 兼容 user_id 是字符串或整数的情况
+        if int(item.get("user_id", 0)) == USER_ID:
+            expire_ts = item.get("shut_up_time") or 0
+            remain = int(expire_ts - now)
+            
+            # 【关键调试日志】把拿到的底层数据打印出来！
+            dt_str = datetime.fromtimestamp(expire_ts).strftime('%Y-%m-%d %H:%M:%S') if expire_ts else "无"
+            print(f"{datetime.now():%H:%M:%S} [DEBUG] 拿到该用户的到期时间戳: {expire_ts} ({dt_str})")
+            
+            return max(remain, 0)
+    
+    print(f"{datetime.now():%H:%M:%S} [DEBUG] 禁言列表中【没有找到】该用户")
     return 0
 
 
@@ -107,20 +139,19 @@ def main():
     while True:
         try:
             shut_list = get_shut_list()
-            remain = is_banned(shut_list) if shut_list is not None else -1
-
-            if remain == 0:
-                print(f"{datetime.now():%H:%M:%S} 用户 {USER_ID} 未被禁言，正在续上...")
-                if set_ban(USER_ID, DURATION):
+            if shut_list is None:
+                fail_count += 1
+            else:
+                remain = get_remain_seconds(shut_list)
+                if remain > 0:
+                    print(f"{datetime.now():%H:%M:%S} 用户 {USER_ID} 禁言中，剩余 {remain}s")
                     fail_count = 0
                 else:
-                    fail_count += 1
-            elif remain > 0:
-                print(f"{datetime.now():%H:%M:%S} 用户 {USER_ID} 禁言中，剩余 {remain}s")
-                fail_count = 0
-            else:
-                # 获取失败，等下一轮
-                fail_count += 1
+                    print(f"{datetime.now():%H:%M:%S} 用户 {USER_ID} 未被禁言，正在续上...")
+                    if set_ban(USER_ID, DURATION):
+                        fail_count = 0
+                    else:
+                        fail_count += 1
         except Exception as e:
             print(f"[LOOP ERROR] {e}")
             try:

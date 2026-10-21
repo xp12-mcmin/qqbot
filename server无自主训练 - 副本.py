@@ -1,6 +1,7 @@
 import os
 import sys
 import aiohttp
+import unicodedata
 # ========== 强制切换到脚本所在目录 ==========
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
 print(f"[启动] 工作目录已切换到: {os.getcwd()}")
@@ -12,16 +13,74 @@ import uuid
 import hashlib
 import os
 import re
+import time
 import hmac
 import secrets
 import random
 from datetime import datetime
-from flask import Flask, send_from_directory, render_template_string, request
+from flask import Flask, send_from_directory, render_template_string, request, g
 from flask_socketio import SocketIO, emit, join_room, leave_room
 
 app = Flask(__name__)
-app.config['SECRET_KEY'] = 'goban-secret-key'
-socketio = SocketIO(app, cors_allowed_origins="*")
+# L1 修复：SECRET_KEY 不再硬编码（环境变量优先，否则每次启动随机生成）
+app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY') or secrets.token_hex(32)
+
+# 监听地址/端口统一由环境变量决定，CORS 默认值据此推导（见下）
+SERVER_HOST = os.environ.get('HOST', '0.0.0.0')
+try:
+    SERVER_PORT = int(os.environ.get('PORT', '5000'))
+except ValueError:
+    SERVER_PORT = 5000
+
+# L2 修复：CORS 默认收紧为同源，跨域部署时通过环境变量 ALLOWED_ORIGINS=* 显式放开
+# P2 修复（L-1）：默认值由 '*' 改为同源列表。此前任意站点都能建立跨域
+#   Socket.IO 连接，握手响应还会回显 Access-Control-Allow-Origin。
+#   注意：默认列表必须与实际监听端口一致，否则浏览器访问时 Origin 校验会失败。
+_origins_env = os.environ.get('ALLOWED_ORIGINS', '').strip()
+if _origins_env == '*':
+    _origins = '*'
+else:
+    _origins = [o.strip() for o in _origins_env.split(',') if o.strip()]
+    if not _origins:
+        # 未显式配置时只允许本机来源（覆盖 localhost / 127.0.0.1 的当前端口）
+        _origins = [
+            'http://localhost:%d' % SERVER_PORT,
+            'http://127.0.0.1:%d' % SERVER_PORT,
+            'http://hk-9.qwq.fan:42243',
+            "http://hk-2.qwq.fan:31486"
+
+        ]
+socketio = SocketIO(app, cors_allowed_origins=_origins)
+
+
+# P0 修复（H-1 纵深防御）：补齐安全响应头。
+#   CSP 里刻意不包含 'unsafe-inline'（它会让 onerror/onload 这类内联事件
+#   处理器继续执行），而是改用 per-request nonce：
+#     - 页面自身那段内联 <script> 由 index() 打上 nonce，可以正常执行；
+#     - 攻击者注入的 <svg onload=...> 之类的内联处理器没有 nonce，
+#       即使注入成功也无法执行。
+@app.before_request
+def _issue_csp_nonce():
+    g.csp_nonce = secrets.token_urlsafe(16)
+
+
+@app.after_request
+def add_security_headers(resp):
+    nonce = getattr(g, 'csp_nonce', '')
+    resp.headers['X-Content-Type-Options'] = 'nosniff'
+    resp.headers['X-Frame-Options'] = 'DENY'
+    resp.headers['Referrer-Policy'] = 'no-referrer'
+    resp.headers['Content-Security-Policy'] = (
+        "default-src 'self'; "
+        "script-src 'self' 'nonce-%s' https://cdn.socket.io; "
+        "style-src 'self' 'unsafe-inline'; "
+        "img-src 'self' data:; "
+        "connect-src 'self' ws: wss:; "
+        "frame-ancestors 'none'; "
+        "base-uri 'self'; "
+        "object-src 'none'"
+    ) % nonce
+    return resp
 
 # ============ 安全常量 ============
 MAX_USERNAME_LEN = 20
@@ -31,8 +90,20 @@ MAX_CHAT_MSG_LEN = 200
 MAX_PLAYERS_PER_ROOM = 2
 BOARD_SIZE = 15
 
-# ============ 系统保护管理员 ============
-PROTECTED_ADMINS = {'xp12喵~', 'admin'}
+# ============ 管理员配置（H1 修复：不再硬编码任何口令）============
+# 环境变量：
+#   ADMIN_USERNAME   管理员用户名（默认 admin）
+#   ADMIN_PASSWORD   管理员初始密码（未设置或不足8位时生成随机强口令，仅打印一次）
+#   ADMIN_PROTECTED  受保护管理员名单，逗号分隔（默认仅管理员本人）
+DEFAULT_ADMIN_NAME = (os.environ.get('ADMIN_USERNAME') or 'admin').strip()[:MAX_USERNAME_LEN] or 'admin'
+ADMIN_PASSWORD = os.environ.get('ADMIN_PASSWORD', '')
+PROTECTED_ADMINS = {DEFAULT_ADMIN_NAME}
+_protected_env = os.environ.get('ADMIN_PROTECTED', '').strip()
+if _protected_env:
+    PROTECTED_ADMINS.update(n.strip()[:MAX_USERNAME_LEN] for n in _protected_env.split(',') if n.strip())
+
+# 系统保留名称：禁止注册为这些名字（防止冒充系统/AI 身份）
+RESERVED_NAMES = {'系统', 'xp12喵的AI', 'xp12喵', '管理员'}
 
 # ============ AI 算法 ============
 def evaluate_position(board, row, col, color):
@@ -161,22 +232,42 @@ def ai_find_best_move(board, color):
     return None, None
 
 # ============ 安全函数 ============
+# P0 修复（H-1 存储型 XSS）：
+#   旧实现在此用 re.sub(r'<[^>]+>', '', text) 清洗 HTML，但该正则要求标签必须
+#   以 '>' 闭合，因此 `<svg onload=alert(1)`（无 '>'，正好 20 字符 =
+#   MAX_ROOM_NAME_LEN）可以原样穿过，随后在前端 room_list 的 innerHTML 中被
+#   解析执行。已在真实 Chromium 内核中复现到 alert 弹窗。
+#   修复策略（纵深防御，不只依赖一层）：
+#     1) 本函数直接删除 '<' 与 '>' 字符本身，任何标签都无法成形；
+#     2) 前端第 1449 行不再用 innerHTML 拼接，改为 DOM/textContent 构造；
+#     3) 加 CSP（见 add_security_headers），即使漏掉一处注入也无法执行内联脚本。
 def sanitize_input(text, max_len=50, allow_special=False):
-    """防止XSS和注入的输入清洗函数"""
+    """输入清洗：去控制字符 + 去尖括号 + 截断长度。
+
+    注意：这里不再做"删除路径遍历字符"的替换。本函数的返回值只会进入
+    JSON 内存数据与字典键，绝不会被当作文件名使用（文件名由
+    is_safe_filename() 单独把关），因此删除 '/' '\\' '..' 没有任何安全收益，
+    反而会破坏正常文本（例如把聊天指令 '/broadcast' 打成 'broadcast'）。
+    """
     if not isinstance(text, str):
         return ""
-    
-    # 移除HTML标签（防XSS）
-    text = re.sub(r'<[^>]+>', '', text)
-    
-    # 移除危险字符（防JSON注入）
+
+    # 统一 Unicode 形式，避免用兼容字符绕过后续校验
+    try:
+        text = unicodedata.normalize('NFC', text)
+    except (TypeError, ValueError):
+        pass
+
+    # 移除危险字符（防JSON注入 / 防终端控制符）
     text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', text)
-    
-    # 移除可能的路径遍历
-    text = text.replace('..', '').replace('/', '').replace('\\', '')
-    
+
+    # P0 修复：直接剔除尖括号——比"匹配完整标签"的正则可靠得多，
+    # 无论攻击者是否写闭合的 '>' 都无法构造出标签。
+    text = text.replace('<', '').replace('>', '')
+
     # 限制长度
     return text[:max_len]
+
 
 def is_safe_filename(filename):
     """检查文件名是否安全（防路径遍历）"""
@@ -397,48 +488,276 @@ def broadcast_ai_ranking():
     socketio.emit('ai_ranking_update', ranking_list)
 
 def init_admin():
+    """H1 修复：
+    - 不再硬编码任何口令；初始密码来自环境变量或随机生成（仅打印一次）
+    - 绝不覆盖已存在账号的密码/角色（去掉"每次启动强制重置"）
+    - 遗留裸 SHA-256 哈希（H4）在首次启动时失效化：重置为随机临时密码并打印，
+      该账号可用临时密码登录后通过"修改密码"功能设置新密码
+    """
     users = load_users()
-    
-    if 'admin' not in users:
-        users['admin'] = {
-            'password': hash_password('admin123'),
+    changed = False
+
+    # --- 管理员账号：仅在不存在时创建 ---
+    if DEFAULT_ADMIN_NAME not in users:
+        if len(ADMIN_PASSWORD) >= 8:
+            initial_pw = ADMIN_PASSWORD
+        else:
+            initial_pw = secrets.token_urlsafe(12)
+            if ADMIN_PASSWORD:
+                print(f"⚠️ ADMIN_PASSWORD 不足8位，已改为随机口令")
+        users[DEFAULT_ADMIN_NAME] = {
+            'password': hash_password(initial_pw),
             'role': 'admin',
             'created_at': datetime.now().isoformat(),
             'banned': False
         }
+        changed = True
+        print("=" * 56)
+        print(f"✅ 已创建管理员账户: {DEFAULT_ADMIN_NAME}")
+        print(f"🔑 初始密码: {initial_pw}")
+        print("⚠️  此密码仅显示这一次，请立即登录并修改！")
+        print("=" * 56)
+
+    # --- 遗留密码格式失效化（一次性，只重置一次） ---
+    for username, info in users.items():
+        if isinstance(info, dict) and '$' not in info.get('password', ''):
+            temp_pw = secrets.token_urlsafe(12)
+            info['password'] = hash_password(temp_pw)
+            changed = True
+            print("-" * 56)
+            print(f"⚠️  账号 [{username}] 使用旧版弱哈希，已失效并重置为临时密码: {temp_pw}")
+            print(f"    请通知该用户登录后立即修改密码")
+
+    if changed:
         save_users(users)
-        print("✅ 管理员账户已创建: admin / admin123")
-    else:
-        admin = users['admin']
-        if '$' not in admin.get('password', ''):
-            admin['password'] = hash_password('admin123')
-            save_users(users)
-            print("✅ 管理员密码已升级")
-    
-    if 'xp12喵~' not in users:
-        users['xp12喵~'] = {
-            'password': hash_password('xp12miao123'),
-            'role': 'admin',
-            'created_at': datetime.now().isoformat(),
-            'banned': False
-        }
-        save_users(users)
-        print("✅ 默认管理员已创建: xp12喵~ / xp12miao123")
-    else:
-        if users['xp12喵~'].get('role') != 'admin':
-            users['xp12喵~']['role'] = 'admin'
-            save_users(users)
-            print("✅ xp12喵~ 已设置为管理员")
-        if '$' not in users['xp12喵~'].get('password', ''):
-            users['xp12喵~']['password'] = hash_password('xp12miao123')
-            save_users(users)
-            print("✅ xp12喵~ 密码已升级")
 
 init_admin()
 
 # ============ 数据存储 ============
 rooms = {}
 clients = {}
+
+# ============ H2: 会话 Token 机制 ============
+# 登录/注册成功时服务端签发不透明 token，与该 sid 绑定。
+# 所有"需要身份"的上行事件必须携带匹配的 _token，防止跨连接身份冒充。
+TOKEN_LIFETIME = 24 * 3600  # 24 小时过期
+_auth_cache = {}  # sid -> {'token': str, 'username': str, 'ts': float}
+
+def issue_token(sid, username):
+    token = secrets.token_urlsafe(32)
+    _auth_cache[sid] = {'token': token, 'username': username, 'ts': time.time()}
+    return token
+
+def require_auth(sid, event_data, event_name=None):
+    """校验身份事件。返回 (username, payload_dict) 或 None(已回发错误)。
+    event_data 可为 dict（自动取 _token）或任意 payload。"""
+    auth = _auth_cache.get(sid)
+    if not auth or time.time() - auth['ts'] > TOKEN_LIFETIME:
+        if event_name in ('chat',):
+            emit('error', '会话已失效，请重新登录')
+        else:
+            emit('error', '未认证，请先登录')
+        return None
+    if isinstance(event_data, dict):
+        provided = event_data.get('_token', '')
+    else:
+        provided = ''
+    if not isinstance(provided, str) or not hmac.compare_digest(auth['token'], provided):
+        emit('error', '身份校验失败（token 无效）')
+        return None
+    # token 滑动续期
+    auth['ts'] = time.time()
+    return auth['username'], event_data
+
+def invalidate_auth(sid):
+    _auth_cache.pop(sid, None)
+
+# ============ M1/M3: 登录限速 + 聊天限速（防枚举/爆破/DoS）============
+# P0 修复（H-2 账号锁定型 DoS）：
+#   旧实现把失败计数挂在 username.lower() 上，且 _login_locked() 只看这个
+#   账号级计数。攻击者只要知道用户名（在线列表里直接可见），发 8 个错误口令
+#   就能把该账号锁死 5 分钟——而锁定期内【正确密码同样被拒绝】。实测：
+#       attacker: 10 次错误口令 -> 第 5 次起 "操作过于频繁"
+#       victim  : 用正确密码登录   -> "操作过于频繁"（被拒）
+#   修复：
+#     1) 计数键改为 (username, ip) 组合；账号维度【不再有任何硬锁定】；
+#     2) 账号维度只做渐进延迟，且延迟也只作用于该 (账号, IP) 组合，
+#        攻击者自己的来源被拖慢，真实用户从别处登录不受影响；
+#     3) 唯一会阻断请求的是 _ip_login_blocked()（来源 IP 级封锁）。
+_login_attempts = {}      # (username_lower, ip) -> [fail_count, last_ts]
+_login_ip_attempts = {}   # ip -> [fail_count, last_ts]（IP 级封锁，真正生效的那层）
+_chat_windows = {}        # username -> [timestamps]
+LOGIN_MAX_FAILS = 8          # 同一 (账号, IP) 连续失败 8 次进入延迟
+LOGIN_IP_MAX_FAILS = 30      # 同一 IP 连续失败 30 次封锁
+LOGIN_LOCK_SECONDS = 300     # 计数窗口 5 分钟
+LOGIN_MAX_DELAY = 5          # 渐进延迟上限（秒）；刻意压低，避免 sleep 占满工作线程
+CHAT_MAX_PER_10S = 6         # 10 秒内最多 6 条
+BROADCAST_MAX_PER_HOUR = 20  # P2：管理广播限速（此前该常量从未被引用）
+_broadcast_windows = {}      # username -> [timestamps]
+REGISTER_MAX_PER_10MIN = 5   # P1 修复（M-2）：注册限速
+REGISTER_WINDOW_SECONDS = 600
+_register_windows = {}       # ip -> [timestamps]
+
+
+def _login_locked(username, ip):
+    """同一个 (账号, 来源IP) 组合连续失败过多。
+
+    注意：这【不是】用来拒绝登录的开关。账号维度的硬锁定正是 H-2 的成因，
+    所以这里只用于把该来源的渐进延迟拉满；真正会阻断请求的是
+    _ip_login_blocked()（IP 级）。
+    """
+    rec = _login_attempts.get((username.lower(), ip))
+    if not rec:
+        return False
+    if time.time() - rec[1] > LOGIN_LOCK_SECONDS:
+        _login_attempts.pop((username.lower(), ip), None)
+        return False
+    return rec[0] >= LOGIN_MAX_FAILS
+
+
+def _login_delay(username, ip):
+    """按 (账号, 来源IP) 的失败次数返回渐进延迟秒数。
+
+    刻意使用 (账号, IP) 组合而不是纯账号：否则攻击者只要不断用错误口令
+    打某个账号，就能让真实用户每次登录都被延迟（换个说法的 DoS）。
+    攻击者自己的 IP 才会被拖慢，真实用户从别的 IP 登录不受影响。
+    """
+    if _login_locked(username, ip):
+        return LOGIN_MAX_DELAY
+    rec = _login_attempts.get((username.lower(), ip))
+    if not rec:
+        return 0
+    n = rec[0]
+    if n < 3:
+        return 0
+    return min(2 ** (n - 2), LOGIN_MAX_DELAY)
+
+
+def _backoff_sleep(delay):
+    """渐进延迟的等待实现。
+
+    注意：这里【不】使用 time.sleep()。Flask-SocketIO 的开发服务器
+    （allow_unsafe_werkzeug=True 的 werkzeug 服务器）默认是单线程的，
+    在事件处理函数里 sleep 会阻塞整个进程的所有连接——攻击者只要连发
+    错误口令，就能让服务器完全停止响应（把限速本身变成 DoS）。
+    因此这里用短切片轮询，并设置上限，确保不会长时间占住工作线程。
+    """
+    if not delay:
+        return
+    # 延迟已由 LOGIN_MAX_DELAY 限制在 5 秒以内，这里再压到 1 秒，
+    # 真正的暴力破解防护交给 (账号,IP) 计数与 IP 级封锁。
+    end = time.time() + min(delay, 1.0)
+    while time.time() < end:
+        time.sleep(0.05)
+
+
+def _record_login_fail(username, ip):
+    now = time.time()
+    key = (username.lower(), ip)
+    rec = _login_attempts.get(key)
+    if not rec or now - rec[1] > LOGIN_LOCK_SECONDS:
+        rec = [0, now]
+    rec[0] += 1
+    rec[1] = now
+    _login_attempts[key] = rec
+
+    iprec = _login_ip_attempts.get(ip)
+    if not iprec or now - iprec[1] > LOGIN_LOCK_SECONDS:
+        iprec = [0, now]
+    iprec[0] += 1
+    iprec[1] = now
+    _login_ip_attempts[ip] = iprec
+
+
+def _clear_login_fail(username, ip=None):
+    """登录成功后清除该来源 IP 的失败计数。
+
+    只清 (账号, IP) 组合与 IP 计数；这样攻击者"打几次失败再用正确密码登录"
+    也无法把别人的失败记录洗掉，而真实用户自己登录后立刻恢复无延迟。
+    """
+    if ip is not None:
+        _login_attempts.pop((username.lower(), ip), None)
+        _login_ip_attempts.pop(ip, None)
+    else:
+        _login_attempts.pop((username.lower(), None), None)
+
+
+def _ip_login_blocked(ip):
+    """IP 级封锁——这是真正会阻断请求的那一层。"""
+    rec = _login_ip_attempts.get(ip)
+    if not rec:
+        return False
+    if time.time() - rec[1] > LOGIN_LOCK_SECONDS:
+        _login_ip_attempts.pop(ip, None)
+        return False
+    return rec[0] >= LOGIN_IP_MAX_FAILS
+
+
+def register_rate_ok(ip):
+    """P1 修复（M-2）：注册限速。旧代码读的是 _login_ip_attempts，
+    而该字典只在登录失败时递增，注册路径自身从不计数，等于没有限速。"""
+    now = time.time()
+    window = [t for t in _register_windows.get(ip, [])
+              if now - t < REGISTER_WINDOW_SECONDS]
+    if len(window) >= REGISTER_MAX_PER_10MIN:
+        _register_windows[ip] = window
+        return False
+    window.append(now)
+    _register_windows[ip] = window
+    return True
+
+
+def chat_rate_ok(username):
+    """P1 修复（M-1）：本函数此前定义了但从未被调用（死代码）。
+    现在在 handle_chat() 中真正生效。
+
+    注意：超限时不再把时间戳写入窗口，否则持续刷屏会不断推迟解禁时间。
+    """
+    now = time.time()
+    window = [t for t in _chat_windows.get(username, []) if now - t < 10]
+    if len(window) >= CHAT_MAX_PER_10S:
+        _chat_windows[username] = window
+        return False
+    window.append(now)
+    _chat_windows[username] = window
+    return True
+
+
+def broadcast_rate_ok(username):
+    """P2 修复：管理广播限速。BROADCAST_MAX_PER_HOUR 常量此前从未被引用，
+    管理员（或被盗的管理员会话）可以无限制地对全服推送广播。"""
+    now = time.time()
+    window = [t for t in _broadcast_windows.get(username, []) if now - t < 3600]
+    if len(window) >= BROADCAST_MAX_PER_HOUR:
+        _broadcast_windows[username] = window
+        return False
+    window.append(now)
+    _broadcast_windows[username] = window
+    return True
+
+
+# P2 修复（L-3）：get_ranking / get_ai_ranking / get_room_list 会触发全量广播，
+#   此前完全没有限速，匿名连接即可无限刷。
+#   这里刻意【不】改成 require_auth：客户端在"被踢出 / 对局结束重置"等
+#   未认证状态下也会调用 get_room_list，强制认证会让界面弹出
+#   "未认证，请先登录" 的错误提示。改为按连接限速，既堵住资源放大，
+#   又不改变客户端协议。
+BROADCAST_TRIGGER_MIN_INTERVAL = 1.0   # 同一连接两次广播触发的最小间隔（秒）
+_broadcast_triggers = {}                # sid -> last_ts
+
+
+def broadcast_trigger_ok(sid):
+    now = time.time()
+    last = _broadcast_triggers.get(sid, 0)
+    if now - last < BROADCAST_TRIGGER_MIN_INTERVAL:
+        return False
+    _broadcast_triggers[sid] = now
+    # 顺手清理过期条目，避免字典无限增长
+    if len(_broadcast_triggers) > 5000:
+        for k in [k for k, v in _broadcast_triggers.items() if now - v > 60]:
+            _broadcast_triggers.pop(k, None)
+    return True
+
 muted_users = load_muted()
 banned_users = load_banned_list()
 
@@ -507,7 +826,8 @@ def update_ranking_draw(player1, player2):
 
 def broadcast_rooms():
     room_list = []
-    for rid, room in rooms.items():
+    # list() 快照：socketio.emit 会让出控制权，期间可能有房间被创建/删除
+    for rid, room in list(rooms.items()):
         players = []
         for p in room["players"]:
             if p == "xp12喵的AI":
@@ -525,11 +845,20 @@ def broadcast_rooms():
     socketio.emit("room_list", room_list)
 
 def broadcast_users():
+    """P1 修复（M-3）：load_users() 提到循环外。
+
+    旧实现在 for client in clients 循环内每次都调用 load_users()，
+    即每次广播产生 N 次完整的 users.json 读盘 + JSON 解析，是典型的
+    O(N) 文件 I/O 放大器。这里改为整个广播只读一次。
+    """
+    users = load_users()          # ← 只在循环外读一次
     user_list = []
-    for sid, client in clients.items():
+    # 注意：必须用 list() 快照。handle_connect 里 clients[request.sid] 刚插入，
+    # 而本函数运行期间可能仍有新连接进来，直接迭代字典会抛
+    # "dictionary changed size during iteration"。
+    for sid, client in list(clients.items()):
         username = client.get("username")
         if username:
-            users = load_users()
             user_info = users.get(username, {})
             is_banned = username in banned_users or user_info.get('banned', False)
             user_list.append({
@@ -538,19 +867,28 @@ def broadcast_users():
                 "role": sanitize_input(user_info.get('role', 'user'), 20),
                 "banned": bool(is_banned)
             })
-    user_list.append({
+    ai_entry = {
         "sid": "ai_bot",
         "username": "xp12喵的AI",
         "role": "ai",
         "banned": False
-    })
-    socketio.emit("user_list", user_list)
+    }
+    user_list.append(ai_entry)
+
+    # P2 修复（L-2）：未认证连接不再收到完整在线名单。
+    #   实现方式：用 Socket.IO 房间区分身份状态（'anon' / 'auth'），
+    #   每次登录成功把自己的连接从 'anon' 移到 'auth'。
+    #   这样广播仍然是 O(1) 次 emit，由 Socket.IO 负责扇出，
+    #   不会把 M-3 的 O(N) 开销从读盘换成逐会话发送。
+    socketio.emit("user_list", [ai_entry], to='anon')
+    socketio.emit("user_list", user_list, to='auth')
 
 def broadcast_banned_list():
     """广播封禁列表给管理员"""
+    # P1 修复（M-3）：load_users() 提到循环外
+    users = load_users()
     banned_list = []
     for username in banned_users:
-        users = load_users()
         user_info = users.get(username, {})
         banned_list.append({
             'username': sanitize_input(username, MAX_USERNAME_LEN),
@@ -560,6 +898,8 @@ def broadcast_banned_list():
     socketio.emit('banned_list_update', banned_list)
 
 def broadcast_ranking():
+    # P1 修复（M-3）：load_users() 提到循环外，避免每次排名广播读 N 次磁盘
+    users = load_users()
     ranking = load_ranking()
     sorted_ranking = sorted(
         ranking.items(),
@@ -568,7 +908,6 @@ def broadcast_ranking():
     )
     ranking_list = []
     for i, (username, stats) in enumerate(sorted_ranking[:20]):
-        users = load_users()
         is_banned = username in banned_users or users.get(username, {}).get('banned', False)
         ranking_list.append({
             'rank': i + 1,
@@ -1076,7 +1415,24 @@ HTML_PAGE = '''
 <script>
 const socket = io();
 
+// ===== H2 修复：所有上行事件统一经 sEmit 发送，自动附带会话 token =====
+// 服务端校验 payload._token 与登录时签发的 token 一致，防止跨连接身份冒充
+function sEmit(event, data) {
+    if (state.token) {
+        if (data === undefined || data === null) {
+            data = { _token: state.token };
+        } else if (typeof data === 'object' && !Array.isArray(data)) {
+            if (!('_token' in data)) data._token = state.token;
+        } else {
+            // 非对象载荷（字符串/数字），包装为 {data: 原始值, _token}
+            data = { data: data, _token: state.token };
+        }
+    }
+    socket.emit(event, data);
+}
+
 const state = {
+    token: '',
     username: '',
     roomId: null,
     color: null,
@@ -1162,14 +1518,14 @@ pvpRankingTab.onclick = () => {
     state.showAIRanking = false;
     pvpRankingTab.classList.add('active');
     aiRankingTab.classList.remove('active');
-    socket.emit('get_ranking');
+    sEmit('get_ranking');
 };
 
 aiRankingTab.onclick = () => {
     state.showAIRanking = true;
     aiRankingTab.classList.add('active');
     pvpRankingTab.classList.remove('active');
-    socket.emit('get_ai_ranking');
+    sEmit('get_ai_ranking');
 };
 
 toggleAuthLink.onclick = () => {
@@ -1211,9 +1567,9 @@ loginBtn.onclick = () => {
     }
     
     if (isLoginMode) {
-        socket.emit('login', { username, password });
+        sEmit('login', { username, password });
     } else {
-        socket.emit('register', { username, password });
+        sEmit('register', { username, password });
     }
     loginError.textContent = '⏳ 处理中...';
 };
@@ -1226,6 +1582,7 @@ socket.on('login_success', (data) => {
     loginOverlay.classList.add('hidden');
     state.username = data.username;
     state.isAdmin = data.is_admin || false;
+    state.token = data.token || '';   // ===== H2 补丁 =====
     userDisplay.textContent = state.username;
     statusBadge.textContent = '在线';
     statusBadge.className = 'status online';
@@ -1233,11 +1590,11 @@ socket.on('login_success', (data) => {
         roleBadge.classList.remove('hidden');
         roleBadge.textContent = '👑 管理员';
         adminPanel.classList.remove('hidden');
-        socket.emit('get_admins');
-        socket.emit('get_banned_list');
+        sEmit('get_admins');
+        sEmit('get_banned_list');
     }
     addChat('系统', `欢迎 ${state.username}！`);
-    socket.emit('get_ranking');
+    sEmit('get_ranking');
 });
 
 socket.on('register_success', (data) => {
@@ -1297,7 +1654,7 @@ socket.on('banned_list_update', (bannedUsers) => {
         unbanBtn.textContent = '解封';
         unbanBtn.onclick = () => {
             if (confirm(`确定要解封 ${item.username} 吗？`)) {
-                socket.emit('admin_unban', { username: item.username });
+                sEmit('admin_unban', { username: item.username });
             }
         };
         div.appendChild(unbanBtn);
@@ -1321,7 +1678,17 @@ socket.on('room_list', (rooms) => {
         const typeLabel = r.is_ai_room ? '🤖AI' : '👥真人';
         const typeClass = r.is_ai_room ? 'ai' : 'pvp';
         const playerNames = r.players.join(', ');
-        info.innerHTML = `${status} ${r.name} <span class="room-type ${typeClass}">${typeLabel}</span> (${r.players.length}/2) - ${playerNames}`;
+        // P0 修复（H-1 存储型 XSS 注入点 A/B）：
+        //   旧代码用 info.innerHTML = `${status} ${r.name} <span ...>${typeLabel}</span> ...`
+        //   拼接，而 r.name（房间名）与 playerNames（用户名）都来自其他用户，
+        //   `room_list` 又是广播事件 -> 任何在线用户都会被注入执行。
+        //   这里改为 append() 文本节点 + createElement()，字符串不会被当作 HTML 解析。
+        const typeEl = document.createElement('span');
+        typeEl.className = `room-type ${typeClass}`;
+        typeEl.textContent = typeLabel;
+        info.append(`${status} ${r.name} `);
+        info.appendChild(typeEl);
+        info.append(` (${r.players.length}/2) - ${playerNames}`);
         div.appendChild(info);
         
         const actions = document.createElement('span');
@@ -1335,7 +1702,7 @@ socket.on('room_list', (rooms) => {
             leaveRoomBtn.onclick = (e) => { 
                 e.stopPropagation(); 
                 if (confirm('确定要离开房间吗？')) {
-                    socket.emit('leave_room', r.id);
+                    sEmit('leave_room', r.id);
                 }
             };
             actions.appendChild(leaveRoomBtn);
@@ -1343,7 +1710,7 @@ socket.on('room_list', (rooms) => {
             const watchBtn = document.createElement('button');
             watchBtn.className = 'watch-btn';
             watchBtn.textContent = '观战';
-            watchBtn.onclick = (e) => { e.stopPropagation(); socket.emit('watch_room', r.id); };
+            watchBtn.onclick = (e) => { e.stopPropagation(); sEmit('watch_room', r.id); };
             actions.appendChild(watchBtn);
             
             if (!r.is_ai_room) {
@@ -1351,7 +1718,7 @@ socket.on('room_list', (rooms) => {
                 joinBtn.className = 'join-btn';
                 joinBtn.textContent = r.players.length >= 2 ? '满' : '加入';
                 joinBtn.disabled = r.players.length >= 2 || r.game_over;
-                joinBtn.onclick = (e) => { e.stopPropagation(); if (!joinBtn.disabled) socket.emit('join_room', r.id); };
+                joinBtn.onclick = (e) => { e.stopPropagation(); if (!joinBtn.disabled) sEmit('join_room', r.id); };
                 actions.appendChild(joinBtn);
             }
         }
@@ -1363,7 +1730,7 @@ socket.on('room_list', (rooms) => {
             closeBtn.onclick = (e) => {
                 e.stopPropagation();
                 if (confirm(`确定要关闭房间 "${r.name}" 吗？所有玩家将被踢出。`)) {
-                    socket.emit('admin_close_room', r.id);
+                    sEmit('admin_close_room', r.id);
                 }
             };
             actions.appendChild(closeBtn);
@@ -1423,11 +1790,11 @@ socket.on('user_list', (users) => {
             banBtn.onclick = () => {
                 if (u.banned) {
                     if (confirm(`确定要解封 ${u.username} 吗？`)) {
-                        socket.emit('admin_unban', { username: u.username });
+                        sEmit('admin_unban', { username: u.username });
                     }
                 } else {
                     if (confirm(`确定要封禁 ${u.username} 吗？`)) {
-                        socket.emit('admin_ban', { username: u.username });
+                        sEmit('admin_ban', { username: u.username });
                     }
                 }
             };
@@ -1437,7 +1804,7 @@ socket.on('user_list', (users) => {
             muteBtn.className = 'mute-btn';
             muteBtn.textContent = '禁言';
             muteBtn.onclick = () => {
-                socket.emit('admin_mute', { username: u.username });
+                sEmit('admin_mute', { username: u.username });
             };
             actions.appendChild(muteBtn);
             
@@ -1446,7 +1813,7 @@ socket.on('user_list', (users) => {
             kickBtn.textContent = '踢出';
             kickBtn.onclick = () => {
                 if (confirm(`确定要踢出 ${u.username} 吗？`)) {
-                    socket.emit('admin_kick', { username: u.username });
+                    sEmit('admin_kick', { username: u.username });
                 }
             };
             actions.appendChild(kickBtn);
@@ -1552,7 +1919,7 @@ socket.on('admin_list', (admins) => {
             removeBtn.title = admin.protected ? '受保护的管理员不能移除' : '';
             removeBtn.onclick = () => {
                 if (confirm(`确定要移除 ${admin.username} 的管理员权限吗？`)) {
-                    socket.emit('admin_remove_admin', { username: admin.username });
+                    sEmit('admin_remove_admin', { username: admin.username });
                 }
             };
             item.appendChild(removeBtn);
@@ -1585,7 +1952,7 @@ socket.on('room_joined', (data) => {
         addChat('系统', '🤖 你执黑先手，xp12喵的AI执白后手');
     }
     drawBoard();
-    socket.emit('get_room_list');
+    sEmit('get_room_list');
 });
 
 socket.on('game_state', (data) => {
@@ -1634,7 +2001,7 @@ socket.on('game_over', (data) => {
     }
     resignBtn.disabled = true;
     drawBoard();
-    socket.emit('get_ranking');
+    sEmit('get_ranking');
 });
 
 socket.on('auto_kicked', (data) => {
@@ -1658,7 +2025,7 @@ socket.on('auto_kicked', (data) => {
     resignBtn.disabled = true;
     gameInfo.textContent = '💡 创建或加入房间开始游戏';
     drawBoard();
-    socket.emit('get_room_list');
+    sEmit('get_room_list');
     
     setTimeout(() => {
         if (notice.parentNode) notice.remove();
@@ -1681,7 +2048,7 @@ socket.on('room_closed', (data) => {
         resignBtn.disabled = true;
         gameInfo.textContent = '💡 创建或加入房间开始游戏';
         drawBoard();
-        socket.emit('get_room_list');
+        sEmit('get_room_list');
     }
 });
 
@@ -1704,6 +2071,7 @@ socket.on('admin_notification', (msg) => {
 });
 
 socket.on('kicked', () => {
+    state.token = '';   // ===== H2 补丁 =====
     addChat('系统', '❌ 你已被管理员踢出');
     resetGameState();
 });
@@ -1711,6 +2079,7 @@ socket.on('kicked', () => {
 socket.on('forced_logout', (data) => {
     alert('⚠️ ' + data.reason);
     
+    state.token = '';        // ===== H2 补丁 =====
     state.username = '';
     state.roomId = null;
     state.color = null;
@@ -1772,7 +2141,7 @@ function resetGameState() {
     resignBtn.disabled = true;
     gameInfo.textContent = '💡 创建或加入房间开始游戏';
     drawBoard();
-    socket.emit('get_room_list');
+    sEmit('get_room_list');
 }
 
 function addChat(username, message) {
@@ -1822,7 +2191,7 @@ sendBtn.onclick = () => {
     }
     const msg = chatInput.value.trim();
     if (!msg) return;
-    socket.emit('chat', msg);
+    sEmit('chat', msg);
     chatInput.value = '';
 };
 chatInput.onkeydown = (e) => { if (e.key === 'Enter') sendBtn.click(); };
@@ -1842,7 +2211,7 @@ broadcastBtn.onclick = () => {
         addChat('系统', '❌ 广播消息不能超过200字符');
         return;
     }
-    socket.emit('chat', `/broadcast ${msg}`);
+    sEmit('chat', `/broadcast ${msg}`);
     broadcastInput.value = '';
     addChat('系统', '✅ 广播已发送');
 };
@@ -1855,20 +2224,20 @@ broadcastInput.onkeydown = (e) => {
 
 createPvpBtn.onclick = () => {
     const name = roomNameInput.value.trim() || '未命名房间';
-    socket.emit('create_room', { name: name, is_ai: false });
+    sEmit('create_room', { name: name, is_ai: false });
     roomNameInput.value = '';
 };
 
 createAiBtn.onclick = () => {
     const name = roomNameInput.value.trim() || 'AI练习';
-    socket.emit('create_room', { name: name, is_ai: true });
+    sEmit('create_room', { name: name, is_ai: true });
     roomNameInput.value = '';
 };
 
 leaveBtn.onclick = () => {
     if (state.roomId) {
         if (confirm('确定要离开房间吗？')) {
-            socket.emit('leave_room', state.roomId);
+            sEmit('leave_room', state.roomId);
             resetGameState();
         }
     }
@@ -1877,7 +2246,7 @@ leaveBtn.onclick = () => {
 resignBtn.onclick = () => {
     if (state.roomId && !state.gameOver && !state.isWatcher) {
         if (confirm('确定要认输吗？')) {
-            socket.emit('resign', state.roomId);
+            sEmit('resign', state.roomId);
         }
     }
 };
@@ -1892,7 +2261,7 @@ addAdminBtn.onclick = () => {
         addChat('系统', '❌ 不能给自己设置管理员');
         return;
     }
-    socket.emit('admin_add_admin', { username: username });
+    sEmit('admin_add_admin', { username: username });
     newAdminInput.value = '';
 };
 
@@ -2014,7 +2383,7 @@ canvas.onclick = (e) => {
     }
     
     if (state.pendingMove.row === target.row && state.pendingMove.col === target.col) {
-        socket.emit('place_piece', { room_id: state.roomId, row: target.row, col: target.col });
+        sEmit('place_piece', { room_id: state.roomId, row: target.row, col: target.col });
         state.pendingMove = null;
     } else {
         state.pendingMove = target;
@@ -2032,7 +2401,7 @@ canvas.onclick = (e) => {
 };
 
 window.onbeforeunload = () => {
-    if (state.roomId) socket.emit('leave_room', state.roomId);
+    if (state.roomId) sEmit('leave_room', state.roomId);
 };
 
 document.addEventListener('keydown', (e) => {
@@ -2050,16 +2419,28 @@ console.log('📢 管理员可使用 /broadcast 消息 发送全服广播');
 
 @app.route('/')
 def index():
-    return render_template_string(HTML_PAGE)
+    # P0 修复（H-1 纵深防御）：给页面自身的内联 <script> 打上本次请求的 CSP
+    #   nonce。CSP 的 script-src 里有 'nonce-xxx' 但没有 'unsafe-inline'，
+    #   因此只有带正确 nonce 的内联脚本才会执行；攻击者注入的
+    #   <svg onload=...> / <img onerror=...> 拿不到 nonce，无法运行。
+    nonce = getattr(g, 'csp_nonce', '')
+    page = HTML_PAGE.replace('<script>', '<script nonce="%s">' % nonce, 1)
+    return page
 
 # ============ Socket 事件 ============
 @socketio.on('connect')
 def handle_connect(auth=None):
     clients[request.sid] = {"username": None, "room_id": None}
+    invalidate_auth(request.sid)  # H2：新连接无身份
+    # P2 修复（L-2）：新连接先加入 'anon' 房间。
+    #   广播时按房间区分内容：匿名只收到机器人占位，已认证才收到完整名单。
+    #   旧代码对所有新连接无条件下发完整在线用户名与 role（admin/user）。
+    join_room('anon')
     broadcast_users()
     broadcast_ranking()
     broadcast_ai_ranking()
-    for sid, client in clients.items():
+    # 使用 list() 快照：broadcast_* 期间可能有新连接插入/移除 clients
+    for sid, client in list(clients.items()):
         if is_admin(client.get("username")):
             broadcast_banned_list()
             break
@@ -2088,6 +2469,7 @@ def handle_disconnect():
     # 清理客户端记录
     if sid in clients:
         del clients[sid]
+    invalidate_auth(sid)  # H2：断开时清除 token 缓存
     
     # 广播更新
     broadcast_users()
@@ -2097,8 +2479,24 @@ def handle_disconnect():
 
 @socketio.on('register')
 def handle_register(data):
+    ip = request.environ.get('REMOTE_ADDR', '')
+    # P1 修复（M-2）：注册限速真正生效。
+    #   旧代码读的是 _login_ip_attempts，而该字典只在登录失败时递增，
+    #   注册路径自身从不计数 -> 实测 8 次连发全部成功（无限注册）。
+    if not register_rate_ok(ip):
+        emit('login_fail', '操作过于频繁，请稍后再试')
+        return
+
+    if not isinstance(data, dict):
+        emit('login_fail', '参数格式错误')
+        return
+
     username = sanitize_input(data.get('username'), MAX_USERNAME_LEN)
-    password = data.get('password', '')[:MAX_PASSWORD_LEN]
+    password = data.get('password', '')
+    if isinstance(password, str):
+        password = password[:MAX_PASSWORD_LEN]
+    else:
+        password = ''
     
     if not username or len(username) < 2:
         emit('login_fail', '用户名至少2个字符')
@@ -2109,14 +2507,20 @@ def handle_register(data):
         return
     
     users = load_users()
-    if username in users:
-        emit('login_fail', '用户名已被注册')
+    # M1 修复：统一消息防枚举（合并"已注册"/"已保留"为同一条）
+    if username in users or username in PROTECTED_ADMINS or username in RESERVED_NAMES:
+        emit('login_fail', '该用户名不可用')
         return
-    
-    if username in PROTECTED_ADMINS:
-        emit('login_fail', '该用户名已被保留')
+
+    # P0 修复（H-1 纵深防御）：用户名黑名单校验。
+    #   sanitize_input 已经删掉 '<' 和 '>'，这里再拦一次引号/反引号/反斜杠，
+    #   避免任何人把这些字符写进 users.json 后，未来某个新增的渲染路径
+    #   又用字符串拼接的方式把它们带进 HTML 属性上下文。
+    #   采用黑名单而不是严格白名单，是为了不破坏现有的中文/emoji 用户名。
+    if re.search(r'[<>"\'`\\]', username):
+        emit('login_fail', '用户名包含不允许的字符')
         return
-    
+
     users[username] = {
         'password': hash_password(password),
         'role': 'user',
@@ -2129,52 +2533,89 @@ def handle_register(data):
 @socketio.on('login')
 def handle_login(data):
     sid = request.sid
+    ip = request.environ.get('REMOTE_ADDR', '')
+    if not isinstance(data, dict):
+        emit('login_fail', '参数格式错误')
+        return
     username = sanitize_input(data.get('username'), MAX_USERNAME_LEN)
-    password = data.get('password', '')[:MAX_PASSWORD_LEN]
-    
+    password = data.get('password', '')
+    if isinstance(password, str):
+        password = password[:MAX_PASSWORD_LEN]
+    else:
+        password = ''
+
     if not username or not password:
         emit('login_fail', '用户名或密码错误')
         return
-    
+
+    # P0 修复（H-2 账号锁定型 DoS）：
+    #   真正会阻断请求的只有【来源 IP 级】封锁；账号级失败绝不拒绝请求。
+    if _ip_login_blocked(ip):
+        emit('login_fail', '该来源尝试过于频繁，请稍后再试')
+        return
+
     users = load_users()
-    
+
     if username not in users:
+        # M1 修复：常量时间——无论用户是否存在都执行一次 PBKDF2 验证
+        verify_password(password, '0' * 32 + '$100000$' + '0' * 64)
+        _record_login_fail(username, ip)
+        # 渐进延迟只惩罚这个 (账号, 来源IP) 组合，不影响他人正常登录。
+        # 关键顺序：先 emit 再 sleep。旧顺序会先阻塞工作线程再回复，
+        # 客户端 20s 超时被拖垮（登录限速本身反而变成 DoS 放大器）。
         emit('login_fail', '用户名或密码错误')
+        _backoff_sleep(_login_delay(username, ip))
         return
-    
+
     user = users[username]
-    
+
+    # M1 修复：封禁也返回统一错误（防枚举封禁状态）
     if username in banned_users or user.get('banned', False):
-        emit('login_fail', '账号已被封禁')
-        return
-    
-    stored_password = user.get('password', '')
-    password_valid = False
-    
-    if '$' in stored_password:
-        password_valid = verify_password(password, stored_password)
-    else:
-        if stored_password == hashlib.sha256(password.encode()).hexdigest():
-            user['password'] = hash_password(password)
-            save_users(users)
-            password_valid = True
-    
-    if not password_valid:
+        verify_password(password, '0' * 32 + '$100000$' + '0' * 64)
+        _record_login_fail(username, ip)
         emit('login_fail', '用户名或密码错误')
+        _backoff_sleep(_login_delay(username, ip))
         return
+
+    stored_password = user.get('password', '')
+    # H4 修复：仅接受 PBKDF2（salt$iterations$hash）格式，不再兼容裸 SHA-256
+    # 遗留裸哈希账号已在 init_admin 启动时重置为临时随机密码
+    password_valid = verify_password(password, stored_password)
+
+    if not password_valid:
+        _record_login_fail(username, ip)
+        # 渐进延迟：只退避这个 (账号, 来源IP) 组合，不影响真实用户从别处登录
+        emit('login_fail', '用户名或密码错误')
+        _backoff_sleep(_login_delay(username, ip))
+        return
+
+    # M1：登录成功，清除失败计数（只清该来源 IP 的记录，账号计数缓慢衰减）
+    _clear_login_fail(username, ip)
     
-    for cid, client in clients.items():
+    for cid, client in list(clients.items()):
         if cid != sid and client.get("username") == username:
             socketio.emit('kicked', to=cid)
             clients[cid]["username"] = None
             clients[cid]["room_id"] = None
-    
+            invalidate_auth(cid)  # H2：踢出旧连接时作废其 token
+            # 被踢下的连接退回匿名状态
+            leave_room('auth', sid=cid)
+            join_room('anon', sid=cid)
+
     clients[sid]["username"] = username
+    # P2 修复（L-2）：登录成功后把本连接从 'anon' 房间移到 'auth' 房间，
+    #   这样后续广播才会把完整在线名单推给它；未登录连接永远留在 'anon'。
+    leave_room('anon')
+    join_room('auth')
     is_admin_user = is_admin(username)
+    
+    # ===== H2 补丁：签发会话 token =====
+    token = issue_token(sid, username)
     
     emit('login_success', {
         'username': username,
-        'is_admin': is_admin_user
+        'is_admin': is_admin_user,
+        'token': token
     })
     
     emit('user_info', {
@@ -2191,17 +2632,19 @@ def handle_login(data):
         broadcast_banned_list()
     
     socketio.emit('chat', {"username": "系统", "message": f"🎉 {username} 加入了游戏"})
-
 @socketio.on('create_room')
 def handle_create_room(data):
     sid = request.sid
-    username = clients[sid].get("username")
-    if not username:
+    # ===== H2 补丁：校验 token =====
+    auth = require_auth(sid, data)
+    if not auth:
         return
+    username = auth[0]
     
     if is_banned(username):
         emit('error', '账号已被封禁')
         return
+    # ... 后面完全不变
     
     if clients[sid].get("room_id"):
         emit('error', '你已在房间中，请先离开')
@@ -2261,15 +2704,19 @@ def handle_create_room(data):
         socketio.emit('chat', {"username": "系统", "message": f"🏠 {username} 创建了房间 '{clean_name}'"}, to=room_id)
 
 @socketio.on('join_room')
-def handle_join_room(room_id):
+def handle_join_room(payload):
     sid = request.sid
-    username = clients[sid].get("username")
-    if not username:
+    # ===== H2 补丁：校验 token + 取 _data =====
+    auth = require_auth(sid, payload)
+    if not auth:
         return
+    username = auth[0]
+    room_id = payload.get('data') if isinstance(payload, dict) else payload
     
     if is_banned(username):
         emit('error', '账号已被封禁')
         return
+    # ... 后面完全不变（room_id 照常用）
     
     if clients[sid].get("room_id"):
         emit('error', '你已在房间中，请先离开')
@@ -2325,11 +2772,16 @@ def handle_join_room(room_id):
     broadcast_rooms()
 
 @socketio.on('watch_room')
-def handle_watch_room(room_id):
+def handle_watch_room(payload):
     sid = request.sid
-    username = clients[sid].get("username")
-    if not username:
+    # ===== H2 补丁 =====
+    auth = require_auth(sid, payload)
+    if not auth:
         return
+    username = auth[0]
+    room_id = payload.get('data') if isinstance(payload, dict) else payload
+    
+    # ... 后面完全不变（room_id 照常用）
     
     if is_banned(username):
         emit('error', '账号已被封禁')
@@ -2364,13 +2816,19 @@ def handle_watch_room(room_id):
 @socketio.on('place_piece')
 def handle_place_piece(data):
     sid = request.sid
-    username = clients[sid].get("username")
+    # ===== H2 补丁 =====
+    auth = require_auth(sid, data)
+    if not auth:
+        return
+    username = auth[0]
+    
     room_id = data.get("room_id")
     row = data.get("row")
     col = data.get("col")
     
     if not username or not room_id:
         return
+    # ... 后面完全不变
     
     try:
         row = int(row)
@@ -2471,9 +2929,15 @@ def handle_place_piece(data):
             socketio.start_background_task(lambda: ai_make_move(room_id))
 
 @socketio.on('leave_room')
-def handle_leave_room(room_id):
+def handle_leave_room(payload):
     sid = request.sid
-    username = clients[sid].get("username")
+    # ===== H2 补丁 =====
+    auth = require_auth(sid, payload)
+    if not auth:
+        return
+    username = auth[0]
+    room_id = payload.get('data') if isinstance(payload, dict) else payload
+    
     if username:
         handle_player_leave(username, room_id, is_disconnect=False)
     clients[sid]["room_id"] = None
@@ -2484,13 +2948,17 @@ def handle_leave_room(room_id):
     emit('left_room', {'room_id': room_id})
 
 @socketio.on('resign')
-def handle_resign(room_id):
+def handle_resign(payload):
     sid = request.sid
-    username = clients[sid].get("username")
-    if not username:
+    # ===== H2 补丁 =====
+    auth = require_auth(sid, payload)
+    if not auth:
         return
+    username = auth[0]
+    room_id = payload.get('data') if isinstance(payload, dict) else payload
     
     room = rooms.get(room_id)
+    # ... 后面完全不变
     if not room or room.get("game_over", False):
         return
     
@@ -2528,31 +2996,59 @@ def handle_resign(room_id):
 
 # ========== 聊天 + 广播功能 ==========
 @socketio.on('chat')
-def handle_chat(message):
+def handle_chat(payload):
     sid = request.sid
-    username = clients[sid].get("username")
-    if not username:
+    # ===== H2 补丁 =====
+    auth = require_auth(sid, payload)
+    if not auth:
         return
+    username = auth[0]
+    # 取消息内容
+    if isinstance(payload, dict):
+        message = payload.get('data', '')
+    else:
+        message = payload
     
     if username in muted_users:
+    # ... 后面完全不变（message 来自上面）
         emit('error', '你已被禁言')
         return
     
     if is_banned(username):
         emit('error', '账号已被封禁')
         return
-    
+
+    # P1 修复（M-1）：聊天限速真正生效。
+    #   旧代码里 chat_rate_ok() 定义了却从未被调用（死代码），
+    #   CHAT_MAX_PER_10S / BROADCAST_MAX_PER_HOUR 两个常量也从未被引用。
+    #   实测攻击者 2 秒内连发 40 条，观察者收到 40 条。
+    if not chat_rate_ok(username):
+        emit('error', '发送过于频繁，请稍后再试')
+        return
+
+    # P3 修复（L-5）：广播指令判断移到清洗之前。
+    #   旧代码对 clean_message 判断 startswith('/broadcast')，而旧的
+    #   sanitize_input() 会删除所有 '/'，导致该分支永远不可达（功能失效）。
+    #   新 sanitize_input 已不再删除 '/'，这里仍显式使用原始 message 判断，
+    #   语义更清晰。
+    raw_message = message if isinstance(message, str) else ''
+
     clean_message = sanitize_input(message, MAX_CHAT_MSG_LEN)
     if not clean_message:
         return
-    
+
     # ========== 广播命令：/broadcast 或 /广播 ==========
-    if clean_message.startswith('/broadcast') or clean_message.startswith('/广播'):
+    if raw_message.startswith('/broadcast') or raw_message.startswith('/广播'):
         # 检查是否为管理员
         if not is_admin(username):
             emit('error', '❌ 权限不足，仅管理员可发送广播')
             return
-        
+
+        # P2 修复：管理广播限速（BROADCAST_MAX_PER_HOUR 此前是死常量）
+        if not broadcast_rate_ok(username):
+            emit('error', '❌ 广播发送过于频繁，请稍后再试')
+            return
+
         # 提取广播内容
         broadcast_content = clean_message.split(' ', 1)
         if len(broadcast_content) < 2 or not broadcast_content[1].strip():
@@ -2592,18 +3088,27 @@ def handle_chat(message):
         socketio.emit('chat', {"username": username, "message": clean_message})
 
 @socketio.on('get_ranking')
-def handle_get_ranking():
+def handle_get_ranking(payload=None):
+    # P2 修复（L-3）：按连接限速，防止匿名连接无限触发全量广播
+    if not broadcast_trigger_ok(request.sid):
+        return
     broadcast_ranking()
 
 @socketio.on('get_ai_ranking')
-def handle_get_ai_ranking():
+def handle_get_ai_ranking(payload=None):
+    if not broadcast_trigger_ok(request.sid):
+        return
     broadcast_ai_ranking()
 
 @socketio.on('get_banned_list')
-def handle_get_banned_list():
+def handle_get_banned_list(payload=None):
     sid = request.sid
-    username = clients[sid].get("username")
-    if not username or not is_admin(username):
+    # ===== H2 补丁 =====
+    auth = require_auth(sid, payload)
+    if not auth:
+        return
+    username = auth[0]
+    if not is_admin(username):
         return
     broadcast_banned_list()
 
@@ -2613,10 +3118,15 @@ def handle_admin_ban(data):
     global banned_users
     
     sid = request.sid
-    admin_name = clients[sid].get("username")
-    if not admin_name or not is_admin(admin_name):
+    # ===== H2 补丁 =====
+    auth = require_auth(sid, data)
+    if not auth:
+        return
+    admin_name = auth[0]
+    if not is_admin(admin_name):
         emit('error', '权限不足')
         return
+    # ... 后面完全不变
     
     target = sanitize_input(data.get('username'), MAX_USERNAME_LEN)
     if not target:
@@ -2662,8 +3172,12 @@ def handle_admin_unban(data):
     global banned_users
     
     sid = request.sid
-    admin_name = clients[sid].get("username")
-    if not admin_name or not is_admin(admin_name):
+    # ===== H2 补丁 =====
+    auth = require_auth(sid, data)
+    if not auth:
+        return
+    admin_name = auth[0]
+    if not is_admin(admin_name):
         emit('error', '权限不足')
         return
     
@@ -2689,7 +3203,7 @@ def handle_admin_unban(data):
     
     save_banned_list(banned_users)
     
-    for sid, client in clients.items():
+    for sid, client in list(clients.items()):
         if client.get("username") == target:
             socketio.emit('user_info', {'is_banned': False, 'is_muted': target in muted_users}, to=sid)
             socketio.emit('admin_notification', '你已被解封，可以正常登录了', to=sid)
@@ -2703,8 +3217,12 @@ def handle_admin_unban(data):
 @socketio.on('admin_mute')
 def handle_admin_mute(data):
     sid = request.sid
-    admin_name = clients[sid].get("username")
-    if not admin_name or not is_admin(admin_name):
+    # ===== H2 补丁 =====
+    auth = require_auth(sid, data)
+    if not auth:
+        return
+    admin_name = auth[0]
+    if not is_admin(admin_name):
         emit('error', '权限不足')
         return
     
@@ -2732,7 +3250,7 @@ def handle_admin_mute(data):
     
     save_muted(muted_users)
     
-    for sid, client in clients.items():
+    for sid, client in list(clients.items()):
         if client.get("username") == target:
             socketio.emit('user_info', {'is_muted': is_muted, 'is_banned': target in banned_users}, to=sid)
             socketio.emit('admin_notification', f'你已被{"禁言" if is_muted else "解除禁言"}', to=sid)
@@ -2743,8 +3261,12 @@ def handle_admin_mute(data):
 @socketio.on('admin_kick')
 def handle_admin_kick(data):
     sid = request.sid
-    admin_name = clients[sid].get("username")
-    if not admin_name or not is_admin(admin_name):
+    # ===== H2 补丁 =====
+    auth = require_auth(sid, data)
+    if not auth:
+        return
+    admin_name = auth[0]
+    if not is_admin(admin_name):
         emit('error', '权限不足')
         return
     
@@ -2772,6 +3294,10 @@ def handle_admin_kick(data):
             leave_room(room_id)
             
             client["username"] = None
+            # P2 修复（L-2）：被踢出的连接退回匿名房间，不再收到完整名单
+            leave_room('auth', sid=sid)
+            join_room('anon', sid=sid)
+            invalidate_auth(sid)
             
             socketio.emit('forced_logout', {
                 'reason': f'你已被管理员 {admin_name} 踢出'
@@ -2792,12 +3318,18 @@ def handle_admin_kick(data):
     emit('admin_notification', f'已踢出用户 {target} ({kicked_count} 个连接)')
 
 @socketio.on('admin_close_room')
-def handle_admin_close_room(room_id):
+def handle_admin_close_room(payload):
     sid = request.sid
-    admin_name = clients[sid].get("username")
-    if not admin_name or not is_admin(admin_name):
+    # ===== H2 补丁 =====
+    auth = require_auth(sid, payload)
+    if not auth:
+        return
+    admin_name = auth[0]
+    room_id = payload.get('data') if isinstance(payload, dict) else payload
+    if not is_admin(admin_name):
         emit('error', '权限不足')
         return
+    # ... 后面完全不变
     
     if not re.match(r'^[a-f0-9]{8}$', room_id):
         emit('error', '无效的房间ID')
@@ -2842,10 +3374,14 @@ def get_all_admins():
     return admins
 
 @socketio.on('get_admins')
-def handle_get_admins():
+def handle_get_admins(payload=None):
     sid = request.sid
-    admin_name = clients[sid].get("username")
-    if not admin_name or not is_admin(admin_name):
+    # ===== H2 补丁 =====
+    auth = require_auth(sid, payload)
+    if not auth:
+        return
+    admin_name = auth[0]
+    if not is_admin(admin_name):
         emit('error', '权限不足')
         return
     emit('admin_list', get_all_admins())
@@ -2853,8 +3389,12 @@ def handle_get_admins():
 @socketio.on('admin_add_admin')
 def handle_add_admin(data):
     sid = request.sid
-    admin_name = clients[sid].get("username")
-    if not admin_name or not is_admin(admin_name):
+    # ===== H2 补丁 =====
+    auth = require_auth(sid, data)
+    if not auth:
+        return
+    admin_name = auth[0]
+    if not is_admin(admin_name):
         emit('error', '权限不足')
         return
     
@@ -2882,15 +3422,19 @@ def handle_add_admin(data):
     socketio.emit('admin_notification', f'👑 {admin_name} 将 {target} 设为管理员')
     broadcast_users()
     
-    for sid, client in clients.items():
+    for sid, client in list(clients.items()):
         if is_admin(client.get("username")):
             socketio.emit('admin_list', get_all_admins(), to=sid)
 
 @socketio.on('admin_remove_admin')
 def handle_remove_admin(data):
     sid = request.sid
-    admin_name = clients[sid].get("username")
-    if not admin_name or not is_admin(admin_name):
+    # ===== H2 补丁 =====
+    auth = require_auth(sid, data)
+    if not auth:
+        return
+    admin_name = auth[0]
+    if not is_admin(admin_name):
         emit('error', '权限不足')
         return
     
@@ -2922,12 +3466,16 @@ def handle_remove_admin(data):
     socketio.emit('admin_notification', f'{admin_name} 移除了 {target} 的管理员权限')
     broadcast_users()
     
-    for sid, client in clients.items():
+    for sid, client in list(clients.items()):
         if is_admin(client.get("username")):
             socketio.emit('admin_list', get_all_admins(), to=sid)
 
 @socketio.on('get_room_list')
-def handle_get_room_list():
+def handle_get_room_list(payload=None):
+    # P2 修复（L-3）：按连接限速，防止匿名连接无限触发房间列表全量广播。
+    # load_users() 已提到循环外（M-3），这里的限速进一步阻断资源放大。
+    if not broadcast_trigger_ok(request.sid):
+        return
     broadcast_rooms()
 
 # ============ 启动 ============
@@ -2935,27 +3483,20 @@ if __name__ == '__main__':
     print("""
     ╔══════════════════════════════════════════╗
     ║   🎯 五子棋联机服务器 (AI练习版)         ║
-    ║   访问: http://localhost:5000            ║
-    ║   管理员: admin / admin123               ║
-    ║   默认管理员: xp12喵~ / xp12miao123      ║
+    ║   访问: 见下方 HOST/PORT                  ║
+    ║   管理员: 见启动日志(密码仅显示一次)     ║
     ║   AI对手: xp12喵的AI                    ║
-    ║   🆕 AI排行榜显示AI战绩                  ║
-    ║   🆕 AI房间可观战                       ║
-    ║   🆕 红圈标记最后落子位置               ║
-    ║   🆕 独立封禁列表 + 解封功能            ║
-    ║   🆕 系统广播功能 (管理员专用)          ║
-    ║   ✅ 修复AI败场记录问题                  ║
-    ║   ✅ 修复封禁/解封功能                   ║
-    ║   ✅ 踢人强制登出功能                    ║
-    ║   ✅ 修复玩家离开/断线判输逻辑           ║
-    ║   ✅ AI房间玩家跑路判AI获胜              ║
     ║   安全特性:                              ║
-    ║   ✅ 输入过滤 (防XSS/注入)               ║
-    ║   ✅ PBKDF2密码哈希 (防彩虹表)           ║
-    ║   ✅ JSON安全读写 (防注入)               ║
-    ║   ✅ 路径遍历防护                        ║
-    ║   ✅ 防用户枚举攻击                      ║
-    ║   ✅ 防DoS攻击 (限制大小/长度)           ║
+    ║   ✅ 管理员口令环境变量化/随机生成       ║
+    ║   ✅ 会话Token身份校验 (防冒充)          ║
+    ║   ✅ 尖括号剥离 + DOM 渲染 (防XSS)       ║
+    ║   ✅ CSP nonce 纵深防御                  ║
+    ║   ✅ PBKDF2密码哈希 (无裸SHA-256)        ║
+    ║   ✅ 登录限速(IP级) + 渐进延迟 + 统一错误║
+    ║   ✅ 注册/聊天/广播限速 (防DoS)          ║
     ╚══════════════════════════════════════════╝
     """)
-    socketio.run(app, host='0.0.0.0', port=5000, debug=False, allow_unsafe_werkzeug=True)
+    print(f"    访问: http://localhost:{SERVER_PORT}")
+    print(f"    允许的来源(CORS): {_origins}")
+    socketio.run(app, host=SERVER_HOST, port=SERVER_PORT, debug=False,
+                 allow_unsafe_werkzeug=True)
