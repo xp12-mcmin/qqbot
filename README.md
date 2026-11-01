@@ -1,6 +1,3 @@
-没问题，我把最顶部的框架推荐换成了 **SnowLuma (SL)**，其他功能同步更新，直接复制下面全部内容，覆盖你的 `README.md`：
-
-```markdown
 # 🤖 QQ机器人 - XP12
 
 ![GitHub stars](https://img.shields.io/github/stars/xp12-mcmin/qq-robot)
