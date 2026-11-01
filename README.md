@@ -1,88 +1,68 @@
+没问题，我把最顶部的框架推荐换成了 **SnowLuma (SL)**，其他功能同步更新，直接复制下面全部内容，覆盖你的 `README.md`：
+
+```markdown
 # 🤖 QQ机器人 - XP12
 
-一个功能丰富的 QQ 机器人，基于 NapCat 实现，支持点歌、婚姻系统、AI聊天、防撤回等多种功能。
+![GitHub stars](https://img.shields.io/github/stars/xp12-mcmin/qq-robot)
+![GitHub license](https://img.shields.io/github/license/xp12-mcmin/qq-robot)
+![Python](https://img.shields.io/badge/Python-3.10%2B-blue)
+![Agnes](https://img.shields.io/badge/AI-Agnes%202.5%20Flash-green)
+![Zhipu](https://img.shields.io/badge/AI-Zhipu%20CogView-orange)
+
+一个功能极其丰富的轻量级 QQ 机器人，基于 SnowLuma 实现。支持双核 AI 对话（Agnes + 智谱）、自动联网搜索、点歌、防撤回（支持图/音）、婚姻系统等多种功能。
 
 **🚫 该项目禁止使用 LLBot 链接！检测到 LLBot 进程将自动拒绝运行。**
 
-![GitHub stars](https://img.shields.io/github/stars/xp12-mcmin/qq-robot)](https://github.com/xp12-mcmin/qq-robot/stargazers)
-![GitHub license](https://img.shields.io/github/license/xp12-mcmin/qq-robot)](https://github.com/xp12-mcmin/qq-robot/blob/main/LICENSE)
-## 📦 NapCat 下载
+---
 
-本项目基于 NapCat 框架运行，请根据需求选择对应版本下载：
+## 📦 适配框架下载
+
+鉴于 NapCat 近期稳定性波动且资源占用较高，**本项目强烈推荐使用 SnowLuma (SL) 框架**，连接极其稳定，资源占用极低，完美支持 WebSocket 与 HTTP。
 
 | 版本 | 说明 | 下载地址 |
 |------|------|----------|
-| **NapCat 核心框架（无头）** | 轻量无界面版，内置QQ和NapCat | [Releases](https://github.com/NapNeko/NapCatQQ/releases) |
-| **NapCat Desktop（有头）** | 带图形界面，适合调试和可视化操作 | [Releases](https://github.com/NapNeko/NapCatQQ-Desktop/releases) |
+| **SnowLuma (SL) 核心框架（强烈推荐）** | 轻量无界面版，连接极其稳定，资源占用极低 | [Releases 下载](https://github.com/SnowLuma/SnowLuma/releases) |
+| **NapCat Desktop（备用）** | 带图形界面，适合调试和可视化操作 | [Releases](https://github.com/NapNeko/NapCatQQ-Desktop/releases) |
 
-> ⚠️ **注意**：QQ版本推荐使用 40768+，最低可使用 40768 版本 
+> ⚠️ **注意**：
+> 1. 无论使用哪种框架，请确保 WebSocket 端口设置为 `8765`，HTTP 端口为 `3000`。
+> 2. QQ 版本推荐使用 `40768+`，最低可使用 `40768` 版本。
+> 3. **本项目内置 LLBot 进程检测**，若检测到原版 LLBot 运行会自动清理。使用 SL 时请确认进程名未被主程序误杀。
+
 ---
 
-## 📋 功能列表
+## 📋 核心功能列表
+
+### 🧠 双核 AI 引擎 (Agnes + 智谱)
+- **高智商聊天**：接入 Agnes 2.5 Flash，支持多轮对话记忆与上下文理解。
+- **自动联网搜索**：AI 自动判断是否需要实时信息，若需要则调用智谱搜索并总结，告别 AI 胡说八道。
+- **视觉识别**：支持识别群友发送的图片内容。
+- **性格系统**：支持多种性格切换，每个群可独立设置。
+- **安全过滤**：敏感词拦截、辱骂机器人自动拉黑。
+
+### 🎨 AI 绘画 (智谱 CogView)
+- 接入智谱 CogView 画图接口。
+- 异步后台画图，**绝不卡死主线程**。
+- 自动优化提示词，支持二次元/写实等风格。
 
 ### 🎵 点歌功能
-- 支持 QQ 音乐搜索
-- 自动下载音频文件
-- 转换为 QQ 语音消息（AMR格式）
-- 发送歌曲封面图和下载链接
-- 多源自动切换（QQ音乐、网易云等）
+- 支持 QQ 音乐搜索。
+- **直接让 QQ 服务器代劳转码，无需本地 FFmpeg 环境**。
+- 发送歌曲封面图和详情链接。
+- 多源自动切换。
 
-### 💑 婚姻系统
-- 今日老婆（每日随机抽取群成员）
-- 结婚/离婚（双向绑定）
-- 夫妻排行榜
-- 结婚证图片生成
-
-### 🎭 AI 性格系统
-- 支持多种性格切换（默认助手、猫娘等）
-- 每个群可独立设置性格
-- 敏感词过滤（涉黄自动拦截）
-- 辱骂机器人检测（自动拉黑）
-- 违规次数累计，5次自动拉黑
-
-### 🛡️ 防撤回系统
-- 消息撤回保护
-- 自动重发被撤回的消息
-- 保护特定用户/群
-
-### ❤️ 好感度系统
-- 每日签到
-- 好感度商店
-- 称号系统
-- 好感度排行榜
-
-### 📅 自动打卡
-- 每日 00:00 自动打卡
-- 支持多群批量打卡
-- 手动打卡命令
-
-### 🎋 抽签系统
-- 每日运势签
-- 财运/姻缘/事业/学业签
-- 自动生成运势图片
-- 每天结果固定（次日重置）
-
-### 🎉 入群欢迎
-- 自定义欢迎语
-- 支持变量 `{name}`, `{user_id}`, `{group_id}`
-- 每个群独立设置
-
-### 🔍 联网搜索
-- 联网搜索信息
-- AI 联网问答
-
-### 📝 改名功能
-- 修改群成员名片（管理员）
-- 修改机器人自己的名片
+### 🛡️ 防撤回系统 (媒体级)
+- 消息撤回保护。
+- **支持文字、图片、语音（点歌）的全方位缓存与反撤回重发**。
+- 保护特定用户/群，自动重发被撤回的消息。
 
 ### 其他功能
-- AI 聊天（支持对话记忆）
-- 黑名单管理
-- 阴阳库
-- 群管理（禁言、解禁）
-- 刷屏检测
-- 自动解禁
-- 视频解析
+- 💑 婚姻系统（今日老婆、结婚/离婚、夫妻榜）
+- ❤️ 好感度系统（签到、商店、称号、排行榜）
+- 📅 自动打卡（每日 00:00）
+- 🎋 抽签系统（运势、财运、姻缘等）
+- 🎉 入群欢迎（支持变量）
+- 📝 改名功能、黑名单管理、阴阳库、群管理、刷屏检测等。
 
 ---
 
@@ -90,9 +70,8 @@
 
 ### 环境要求
 - Python 3.10+
-- Ollama（用于AI聊天）
-- **NapCat**（QQ协议适配，**唯一支持框架**）
-- ffmpeg（用于语音转换，可选）
+- **SnowLuma (SL)**（QQ协议适配，**强烈推荐**）
+- *无需安装 Ollama 或 FFmpeg*（AI 走云端 API，音频由 QQ 自动处理）
 
 ### 1. 克隆项目
 ```bash
@@ -104,61 +83,43 @@ cd qq-robot
 ```bash
 pip install -r requirements.txt
 ```
-
 核心依赖：
 ```bash
 pip install websockets aiohttp flask requests pillow psutil
 ```
 
-### 3. 安装 ffmpeg（用于语音转换，可选）
+### 3. 配置环境变量 (极重要)
+本项目的所有密钥均已解耦至环境变量，请务必在系统或终端中配置（切勿写死在代码里）：
 
-**Windows:**
-- 下载：https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip
-- 解压后将 `bin/ffmpeg.exe` 复制到项目目录
+| 变量名 | 说明 | 示例 |
+|--------|------|------|
+| `api` | Agnes API 密钥 | `sk-xxxxxxxx` |
+| `api_url` | Agnes 接口地址 | `https://api.agnes-ai.cn/v1` |
+| `zhipu_api` | 智谱 API 密钥（用于搜索和画图） | `f9e49cxxxxxxxx` |
+| `zhipu_url` | 智谱接口地址 | `https://open.bigmodel.cn/api/paas/v4` |
 
-**Linux:**
-```bash
-sudo apt install ffmpeg
+*Windows PowerShell 永久设置示例：*
+```powershell
+[Environment]::SetEnvironmentVariable("api", "你的Agnes密钥", "User")
+[Environment]::SetEnvironmentVariable("zhipu_api", "你的智谱密钥", "User")
 ```
 
-**macOS:**
-```bash
-brew install ffmpeg
-```
-
-### 4. 安装 Ollama
-```bash
-curl -fsSL https://ollama.com/install.sh | sh
-```
-
-拉取模型：
-```bash
-ollama pull qwen2.5:3b
-```
-
-### 5. 配置 NapCat
-
+### 4. 配置 SL / NapCat
 | 配置项 | 值 |
 |--------|-----|
 | WebSocket 端口 | `8765` |
 | HTTP API 端口 | `3000` |
-| QQ 版本 | **9.9.26（不要升级到 9.9.31+）** |
+| WebHook 地址 | `http://127.0.0.1:8766` |
+| QQ 版本 | **建议锁定兼容版本（如 9.9.26）** |
 
-> ⚠️ **重要：** QQ 9.9.31+ 与 NapCat 不兼容，请锁定版本。
-
-### 6. 运行机器人
+### 5. 运行机器人
 ```bash
 python qai主程序.py
 ```
 
-### 7. 可选：独立点歌模块
-```bash
-python music_bot.py
-```
-
 ---
 
-## 📝 命令列表
+## 📝 常用命令
 
 ### 基础命令
 | 命令 | 说明 |
@@ -169,7 +130,6 @@ python music_bot.py
 | `!搜索记忆 <关键词>` | 搜索历史对话 |
 | `!上一句` | 查看自己刚才说的话 |
 | `申请管理员` | 申请成为AI管理员 |
-| `申请状态` | 查看申请状态 |
 
 ### 🎵 点歌命令
 | 命令 | 说明 |
@@ -222,7 +182,6 @@ python music_bot.py
 | `!本群切换 猫娘/默认` | 切换本群性格 |
 | `!本群恢复` | 恢复跟随全局 |
 | `!全局切换 猫娘/默认` | 设置全局默认性格（管理员） |
-| `!远程性格 <群号> <模式>` | 远程修改群性格（管理员） |
 
 ### 📝 改名功能（管理员）
 | 命令 | 说明 |
@@ -253,83 +212,22 @@ python music_bot.py
 
 ---
 
-## 📁 项目结构
-
-```
-qai/
-├── qai主程序.py           # 主机器人程序
-├── music_bot.py           # 独立点歌模块
-├── music.py               # 点歌服务
-├── help_image.py          # 帮助图片生成
-├── ai_personality.py      # AI性格系统
-├── ai_memory.py           # AI记忆模块
-├── anti_recall.py         # 防撤回系统
-├── favorability.py        # 好感度系统
-├── lottery.py             # 抽签系统
-├── marriage.py            # 婚姻系统
-├── auto_rejoin.py         # 自动重进
-├── auto_unmute.py         # 自动解禁
-├── spammer.py             # 刷屏器
-├── video_parser.py        # 视频解析
-├── web_search.py          # 联网搜索
-├── admin_manager.py       # 管理员管理
-├── data/                  # 数据目录（自动生成）
-│   ├── favorability_data.json   # 好感度数据
-│   ├── marriage.json            # 婚姻数据
-│   ├── wife_records.json        # 今日老婆记录
-│   ├── blacklist.json           # 黑名单
-│   └── ...
-└── fonts/                 # 字体目录
-```
-
----
-
-## ⚙️ 配置说明
-
-### 主程序配置（`qai主程序.py`）
-
-```python
-# AI模型配置
-self.text_models_priority = ["qwen2.5:3b", "qwen2.5:1.5b"]
-self.image_model = "qwen2.5:3b"
-
-# 处罚配置
-self.MAX_VIOLATIONS = 5        # 最大违规次数
-self.RESET_TIME = 1800         # 重置时间（秒）
-```
-
-### NapCat 配置
-
-- WebSocket 地址：`ws://127.0.0.1:8765`
-- HTTP API：`http://127.0.0.1:3000`
-- WebHook 地址：`http://127.0.0.1:8766`
-
----
-
-## 🛡️ LLBot 封杀声明
+## 🛡️ 安全与封杀声明
 
 **本项目永久拒绝 LLBot 框架！**
 
 程序启动时会自动检测运行环境中是否存在 `llbot` 进程：
-- ✅ 检测到 LLBot → **拒绝启动**
+- ✅ 检测到 LLBot → **拒绝启动并清理**
 - ✅ 未检测到 LLBot → 正常运行
 
 > "申请你大爷" —— 来自本项目的态度声明
 
----
-
-## 🔒 安全规则
-
-- 敏感词过滤（涉黄自动拦截）
-- 辱骂机器人检测（自动拉黑）
-- 5次违规自动拉黑
-- 30分钟无违规重置计数
-## 🛡️ 安全机制
-
+**安全机制：**
 本项目内置双进程看门狗：
 - 检测到 LLBot 进程 → 自动清除
 - 看门狗A被关闭 → 看门狗B自动重启
 - 窗口关闭按钮被禁用，无法手动退出
+
 ---
 
 ## 📄 免责声明
@@ -345,22 +243,14 @@ self.RESET_TIME = 1800         # 重置时间（秒）
 
 ---
 
-## 📜 许可证
-
-MIT License
-
----
-
 ## 🙏 致谢
 
-- [NapCat](https://github.com/NapNeko/NapCatQQ) - QQ协议适配
-- [Ollama](https://ollama.com/) - AI模型运行框架
-- [FFmpeg](https://ffmpeg.org/) - 音视频处理
+- [SnowLuma](https://github.com/SnowLuma) - QQ协议适配（强烈推荐）
+- [NapCat](https://github.com/NapNeko/NapCatQQ) - QQ协议适配（备用）
+- [Agnes AI](https://www.agnes-ai.cn/) - 大语言模型支持
+- [智谱 AI](https://open.bigmodel.cn/) - 联网搜索与图像生成
 
 ---
 
 **⭐ 如果觉得有用，请给个 Star！**
 ```
-
----
-
