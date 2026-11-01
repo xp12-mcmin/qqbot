@@ -1,0 +1,11 @@
+colorama
+aiohttp
+requests
+websockets
+Pillow
+flask
+flask_socketio
+psutil
+schedule
+pywin32
+bilibili-api-python
