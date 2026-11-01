@@ -1,15 +1,10 @@
-
-
-
 import sys
 import os
 import json
 import time
 import builtins
-from datetime import datetime
-from typing import Dict, Optional, List
-import asyncio
-
+import aiohttp
+from typing import Optional
 
 # ==================== 授权验证 ====================
 def _verify_module():
@@ -18,9 +13,7 @@ def _verify_module():
     
     try:
         license_key = getattr(builtins, 'XP12_LICENSE_KEY', '')
-        print(f"[调试] 从 builtins 读取密钥: {license_key}")
-    except Exception as e:
-        print(f"[调试] 读取 builtins 异常: {e}")
+    except Exception:
         license_key = ''
     
     expected_key = ''
@@ -29,134 +22,109 @@ def _verify_module():
             with open("data/.module_license", "r") as f:
                 data = json.load(f)
                 expected_key = data.get("license_key", '')
-                print(f"[调试] 从文件读取密钥: {expected_key}")
-    except Exception as e:
-        print(f"[调试] 读取文件异常: {e}")
+    except Exception:
         pass
     
-    print(f"[调试] 对比: license_key={license_key}, expected_key={expected_key}")
-    
     if license_key != expected_key or not expected_key:
-        print(f"❌ 模块 [{module_name}] 授权失败！")
-        print(f"   请通过主程序调用本模块")
+        print(f"❌ 模块 [{module_name}] 授权失败！请通过主程序调用本模块")
         sys.exit(1)
     
     print(f"✅ 模块 [{module_name}] 授权通过")
 
 _verify_module()
 
-# ==================== 正常代码 ====================
-"""
-模块名：web_search
-功能：待补充
-"""
-
-# ==================== 正常代码 ====================
-
-
-
 
 class WebSearch:
     def __init__(self):
-        # 从环境变量读取 API Key
-        self.api_key = os.environ.get("OLLAMA_API_KEY", "")
-        self.ollama_url = "http://127.0.0.1:11434/api/generate"
+        # 读取环境变量
+        self.zhipu_key = os.environ.get("zhipu_api", "").strip()
+        self.agnes_key = os.environ.get("api", "").strip()
+        self.agnes_url = os.environ.get("api_url", "https://api.agnes-ai.cn/v1").strip()
     
     async def search(self, query: str) -> str:
-        """使用 Ollama 进行联网搜索，返回图片路径"""
-        if not self.api_key:
-            print("[搜索] 未设置 OLLAMA_API_KEY 环境变量")
-            return None
+        """执行搜索并调用 AI 总结"""
+        if not self.zhipu_key:
+            return "❌ 未配置智谱 API 密钥（环境变量 zhipu_api），无法搜索"
+
+        # 1. 调用智谱联网搜索
+        url = "https://open.bigmodel.cn/api/paas/v4/tools"
+        headers = {
+            "Authorization": f"Bearer {self.zhipu_key}",
+            "Content-Type": "application/json"
+        }
+        payload = {
+            "tool": "web-search-pro",
+            "messages": [{"role": "user", "content": query}]
+        }
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(url, json=payload, headers=headers, timeout=30) as resp:
+                    if resp.status != 200:
+                        return f"❌ 搜索接口报错: HTTP {resp.status}"
+                    
+                    data = await resp.json()
+                    choices = data.get("choices", [])
+                    if not choices:
+                        return "🔍 没有找到相关结果"
+                    
+                    tool_calls = choices[0].get("message", {}).get("tool_calls", [])
+                    
+                    search_results = []
+                    for call in tool_calls:
+                        if call.get("type") == "search_result":
+                            search_results = call.get("search_result", [])
+                            break
+                            
+                    if not search_results:
+                        return "🔍 没有找到相关结果"
+                    
+                    # 提取前 3 条的摘要文本
+                    raw_text = ""
+                    for i, item in enumerate(search_results[:3], 1):
+                        title = item.get("title", "无标题")
+                        content = item.get("content", "无内容")
+                        raw_text += f"【{title}】\n{content}\n\n"
+
+        except Exception as e:
+            return f"❌ 搜索网络异常: {e}"
+
+        # 2. 如果配置了 Agnes，调用它来总结
+        if self.agnes_key:
+            summary = await self._summarize_with_ai(query, raw_text)
+            if summary:
+                return summary
+                
+        # 如果 Agnes 没配置或者挂了，就直接返回原始摘要（截断一下）
+        return f"🌐 关于「{query}」的搜索结果：\n\n{raw_text[:800]}..."
+
+    async def _summarize_with_ai(self, query: str, raw_text: str) -> Optional[str]:
+        """调用 Agnes 将搜索结果总结成人话"""
+        prompt = f"请根据以下网页摘要，简练、准确地回答用户的问题：“{query}”。\n\n网页摘要内容：\n{raw_text}\n\n请直接输出最终回答，字数控制在150字以内，不要包含“根据搜索结果”等废话。"
+        
+        headers = {
+            "Authorization": f"Bearer {self.agnes_key}",
+            "Content-Type": "application/json"
+        }
+        payload = {
+            "model": "agnes-2.5-flash",
+            "messages": [{"role": "user", "content": prompt}],
+            "stream": False,
+            "temperature": 0.3
+        }
         
         try:
-            # 构建搜索提示词
-            prompt = f"""请搜索以下问题并给出答案，需要联网获取实时信息：
-问题：{query}
-
-要求：
-1. 如果能够获取到实时信息，请给出准确的答案
-2. 如果无法获取实时信息，请说明无法获取
-3. 答案要简洁明了
-4. 如果有相关链接，可以附上"""
-            
-            payload = {
-                "model": "qwen2.5:3b",  # 使用本地模型
-                "prompt": prompt,
-                "stream": False,
-                "options": {
-                    "temperature": 0.7,
-                    "num_predict": 500
-                }
-            }
-            
-            headers = {
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json"
-            }
-            
             async with aiohttp.ClientSession() as session:
-                async with session.post(self.ollama_url, json=payload, headers=headers, timeout=30) as resp:
+                async with session.post(f"{self.agnes_url}/chat/completions", json=payload, headers=headers, timeout=30) as resp:
                     if resp.status == 200:
                         data = await resp.json()
-                        result = data.get("response", "")
-                        
-                        # 生成图片（如果需要）
-                        img_path = await self._generate_result_image(query, result)
-                        return img_path
-                    else:
-                        print(f"[搜索] HTTP {resp.status}")
-                        return None
+                        summary = data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+                        if summary:
+                            return f"🔍 搜索并总结：\n\n{summary}"
         except Exception as e:
-            print(f"[搜索] 错误: {e}")
-            return None
-    
-    async def _generate_result_image(self, query: str, result: str) -> str:
-        """生成搜索结果图片"""
-        try:
-            
-            # 创建图片
-            width, height = 600, 400
-            img = Image.new('RGB', (width, height), color='#1a1a2e')
-            draw = ImageDraw.Draw(img)
-            
-            # 加载字体
-            try:
-                font_title = ImageFont.truetype("simhei.ttf", 20)
-                font_text = ImageFont.truetype("simhei.ttf", 16)
-            except:
-                font_title = ImageFont.load_default()
-                font_text = ImageFont.load_default()
-            
-            # 绘制标题
-            draw.text((20, 20), f"🔍 搜索结果：{query[:30]}", fill='#00ff88', font=font_title)
-            
-            # 分割线
-            draw.line((20, 55, width-20, 55), fill='#333333', width=1)
-            
-            # 绘制结果（限制长度）
-            lines = []
-            max_len = 35
-            for i in range(0, len(result), max_len):
-                lines.append(result[i:i+max_len])
-            
-            y = 80
-            for line in lines[:10]:  # 最多10行
-                draw.text((20, y), line, fill='#ffffff', font=font_text)
-                y += 25
-            
-            # 底部提示
-            draw.line((20, y+10, width-20, y+10), fill='#333333', width=1)
-            draw.text((20, y+30), "💡 数据来自AI搜索", fill='#aaaaaa', font=font_text)
-            
-            # 保存图片
-            os.makedirs("data/temp_images", exist_ok=True)
-            img_path = f"data/temp_images/search_{int(time.time())}.png"
-            img.save(img_path)
-            
-            return img_path
-        except Exception as e:
-            print(f"[生成图片] 错误: {e}")
-            return None
+            print(f"[搜索] AI总结失败: {e}")
+        
+        return None
 
 
 _web_search = None

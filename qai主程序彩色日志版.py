@@ -5340,8 +5340,24 @@ class MessageHandler:
                     return self._create_reply(message_type, user_id, group_id, reply)
             
             # 联网搜索
+            # 联网搜索
             if text.lower().startswith(("!搜索", "！搜索", "!搜", "！搜")):
-                pass
+                # 提取搜索关键词
+                query = text
+                for prefix in ["!搜索", "！搜索", "!搜", "！搜"]:
+                    if query.startswith(prefix):
+                        query = query[len(prefix):].strip()
+                        break
+                
+                if not query:
+                    return self._create_reply(message_type, user_id, group_id, "❌ 请指定搜索内容\n示例: !搜索 今日新闻")
+                
+                # 发送搜索中提示（可选，体验更好）
+                # await self.websocket.send(...)
+                
+                # 调用我们刚写好的 web_search 模块
+                result = await self.web_search.search(query)
+                return self._create_reply(message_type, user_id, group_id, result)
 
             # 绿茶反击检测
             if hasattr(self, 'green_tea') and message_type == "group" and group_id:
@@ -9591,24 +9607,56 @@ class MessageHandler:
             traceback.print_exc()
             return self._get_text_help(message_type, user_id, group_id)
     async def _handle_ai_chat(self, text: str, user_id: str, message_type: str, group_id: str, raw_message=None) -> Dict:
-        """处理AI聊天 - 支持好感度影响，传递原始消息用于图片检测"""
         try:
-            # 获取用户好感度（全局）
             favor = None
             if hasattr(self, 'favorability') and self.favorability:
                 favor = self.favorability.get_favor(user_id)
-                print(f"[AI] 用户 {user_id} 好感度: {favor}")
-        
-            # 处理原始消息：如果是 list 则转换为字符串
-            ai_input = text  # 默认用纯文本
+
+            ai_input = text
             if raw_message:
                 if isinstance(raw_message, list):
-                    # 将消息段列表转换为字符串（保留 CQ 码）
                     ai_input = self._convert_message_to_string(raw_message)
-                    print(f"[AI调试] 原始消息已转换: {ai_input[:100]}...")
                 elif isinstance(raw_message, str):
                     ai_input = raw_message
-        
+
+            # ==============================================================
+            # 🆕 第一步：让 Agnes 做“意图判断”，决定是否联网
+            # ==============================================================
+            need_search = False
+            if hasattr(self, 'web_search') and self.web_search:
+                # 用非常极简的提示词，让它只输出 YES 或 NO
+                check_prompt = (
+                    f"你是一个意图识别助手。请判断用户的话是否需要联网搜索才能准确回答（比如问新闻、实时天气、股票、最新事件等）。\n"
+                    f"如果不需要联网（比如普通的闲聊、问你是谁、算个数学题等），请回复 NO。\n"
+                    f"如果需要联网，请回复 YES。\n"
+                    f"用户的话：{text}\n"
+                    f"请只输出 YES 或 NO，不要任何多余的解释。"
+                )
+                
+                # 请求 Agnes
+                check_res = await self.ai.chat(check_prompt, use_personality=False)
+                
+                # 看看它是不是说了 YES
+                if check_res and "YES" in check_res.upper():
+                    need_search = True
+                    print(f"[AI智能路由] Agnes 判断需要联网: {text}")
+
+            # ==============================================================
+            # 🆕 第二步：如果判断需要联网，就去搜
+            # ==============================================================
+            if need_search:
+                search_result = await self.web_search.search(text)
+                if search_result and not search_result.startswith("❌"):
+                    # 强制注入搜索结果
+                    ai_input = (
+                        f"【系统提示：这是为你实时联网获取的信息，请结合以下内容回答用户】\n"
+                        f"{search_result}\n\n"
+                        f"【用户刚才说】\n{text}"
+                    )
+                    print(f"[AI智能路由] 搜索成功，已注入背景知识")
+            # ==============================================================
+
+            # 第三步：正式回答
             reply_text = await self.ai.chat(
                 ai_input,
                 use_personality=True,
@@ -9617,7 +9665,6 @@ class MessageHandler:
                 favor=favor
             )
         
-            # 保存对话到记忆
             if user_id and reply_text and "AI服务暂时不可用" not in reply_text:
                 if hasattr(self.ai, 'memory_module'):
                     self.ai.memory_module.add_conversation(user_id, text, reply_text)
