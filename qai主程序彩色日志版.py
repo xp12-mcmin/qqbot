@@ -5821,34 +5821,12 @@ class MessageHandler:
             if not keyword:
                 return self._create_reply(message_type, user_id, group_id, "❌ 请指定关键词\n示例: 画图 猫娘")
             
-            return await self._ai_draw(group_id, user_id, keyword)
+                        # 启动后台画图
+            await self._ai_draw(group_id, user_id, keyword)
+            # 🆕 强行告诉主程序：我处理完了，别往下走了！
+            return {"_handled": True}
 
-        # 添加 _ai_draw 方法
-        async def _ai_draw(self, group_id: int, user_id: str, keyword: str) -> Dict:
-            """AI 绘画"""
-            await self.websocket.send(json.dumps({
-                "action": "send_msg",
-                "params": {
-                    "message_type": "group",
-                    "group_id": int(group_id),
-                    "message": f"[CQ:at,qq={user_id}] 🎨 正在生成图片：{keyword}，请稍候..."
-                }
-            }))
-            
-            draw = get_ai_draw()
-            success, result = await draw.draw(keyword)
-            
-            if success:
-                return {
-                    "action": "send_msg",
-                    "params": {
-                        "message_type": "group",
-                        "group_id": int(group_id),
-                        "message": f"[CQ:image,file=file:///{os.path.abspath(result)}]"
-                    }
-                }
-            else:
-                return self._create_reply("group", user_id, group_id, f"❌ 绘画失败：{result}")
+
     
         # ========== 4. 好感度查看 ==========
         # ========== 4. 好感度查看（修复版：支持@用户 + 显示昵称）==========
@@ -7878,6 +7856,89 @@ class MessageHandler:
             print(f"[树洞错误] {e}")
             return "🌳 树洞今天打烊了，明天再来吧~"
     import subprocess
+        # 添加 _ai_draw 方法
+    async def _ai_draw(self, group_id: int, user_id: str, keyword: str) -> Dict:
+        """AI 绘画（智能搜索 + 后台防卡死版）"""
+        import time
+        
+        # 防重复执行锁
+        lock_key = f"ai_draw_{group_id}"
+        now = time.time()
+        
+        if not hasattr(self, '_ai_draw_locks'):
+            self._ai_draw_locks = {}
+        
+        if lock_key in self._ai_draw_locks:
+            if now - self._ai_draw_locks[lock_key] < 10:
+                print(f"[AI绘画] 群{group_id} 触发冷却，跳过")
+                return self._create_reply("group", user_id, group_id, "⏰ 画画有冷却时间，请稍后再试哦~")
+        self._ai_draw_locks[lock_key] = now
+        
+        # 1. 先发提示消息
+        await self.websocket.send(json.dumps({
+            "action": "send_msg",
+            "params": {
+                "message_type": "group",
+                "group_id": int(group_id),
+                "message": f"[CQ:at,qq={user_id}] 🎨 正在查阅资料并努力作画，请稍候..."
+            }
+        }))
+        
+        # 2. 核心：放到后台异步执行，绝不卡主线程
+        async def draw_task():
+            try:
+                final_prompt = keyword
+                
+                # === 第一步：联网搜索并让 Agnes 改写 Prompt ===
+                if hasattr(self, 'web_search') and self.web_search:
+                    print(f"[AI绘画] 正在联网搜索角色特征: {keyword}")
+                    search_query = f"动漫角色 {keyword} 长什么样 外貌特征 发色 服装"
+                    search_res = await self.web_search.search(search_query)
+                    
+                    if search_res and not search_res.startswith("❌"):
+                        print(f"[AI绘画] 让 AI 提取画面特征...")
+                        prompt_gen = (
+                            f"请根据以下搜索到的信息，提取出【{keyword}】的外貌特征（发色、服装、性别等），"
+                            f"并写成一段适合用于 AI 绘画的英文 Prompt。"
+                            f"要求：直接输出英文 Prompt，包含 'anime style, masterpiece, best quality' 等画质词，不要任何废话。\n"
+                            f"搜索信息：{search_res}"
+                        )
+                        final_prompt = await self.ai.chat(prompt_gen, use_personality=False)
+                        print(f"[AI绘画] AI 优化后的提示词: {final_prompt}")
+                    else:
+                        print(f"[AI绘画] 搜索失败，使用原始词")
+                
+                # === 第二步：调用画图接口 ===
+                from ai_draw import get_ai_draw
+                draw = get_ai_draw()
+                success, result = await draw.draw(final_prompt)
+                
+                # === 第三步：发送结果 ===
+                if success:
+                    await self.websocket.send(json.dumps({
+                        "action": "send_msg",
+                        "params": {
+                            "message_type": "group",
+                            "group_id": int(group_id),
+                            "message": f"[CQ:image,file=file:///{os.path.abspath(result)}]"
+                        }
+                    }))
+                    print(f"[AI绘画] ✅ 生成成功: {result}")
+                else:
+                    await self.websocket.send(json.dumps({
+                        "action": "send_msg",
+                        "params": {
+                            "message_type": "group",
+                            "group_id": int(group_id),
+                            "message": f"[CQ:at,qq={user_id}] ❌ 绘画失败：{result}"
+                        }
+                    }))
+            except Exception as e:
+                print(f"[AI绘画] 💥 后台任务异常: {e}")
+
+        # 启动后台任务，直接返回
+        asyncio.create_task(draw_task())
+        return None
     async def _music(self, group_id: int, user_id: str, keyword: str) -> Dict:
         """点歌 - 发详情 + 语音两条"""
         import aiohttp
@@ -8280,49 +8341,7 @@ class MessageHandler:
                 try: os.remove(pcm_path)
                 except: pass
             return None
-    async def _ai_draw(self, group_id: int, user_id: str, keyword: str) -> Dict:
-        """AI 绘画"""
-        import time
-        
-        # 防重复执行锁
-        lock_key = f"ai_draw_{group_id}"
-        now = time.time()
-        
-        if not hasattr(self, '_ai_draw_locks'):
-            self._ai_draw_locks = {}
-        
-        if lock_key in self._ai_draw_locks:
-            if now - self._ai_draw_locks[lock_key] < 5:
-                print(f"[AI绘画] 群{group_id} 触发冷却，跳过")
-                return None
-        self._ai_draw_locks[lock_key] = now
-        
-        from ai_draw import get_ai_draw
-        
-        # 只发一次提示
-        await self.websocket.send(json.dumps({
-            "action": "send_msg",
-            "params": {
-                "message_type": "group",
-                "group_id": int(group_id),
-                "message": f"[CQ:at,qq={user_id}] 正在生成图片,请稍候..."
-            }
-        }))
-        d=keyword
-        draw = get_ai_draw()
-        success, result = await draw.draw(keyword)
-        
-        if success:
-            return {
-                "action": "send_msg",
-                "params": {
-                    "message_type": "group",
-                    "group_id": int(group_id),
-                    "message": f"[CQ:image,file=file:///{os.path.abspath(result)}]"
-                }
-            }
-        else:
-            return self._create_reply("group", user_id, group_id, f"? 绘画失败：{result}")
+
     async def _get_member_name(self, group_id: int, user_id: str) -> str:
         """获取群成员昵称（优先返回群名片）"""
         try:
