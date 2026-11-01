@@ -3373,28 +3373,44 @@ class MarriageData:
 # ==================== Ollama 云端/本地自动检测 ====================
 import os as _os
 
+import os
+
+import os
+
 def get_ollama_config():
     """
-    自动检测是否配置了 Ollama 云密钥
-    - 有 OLLAMA_API_KEY → 直连云端 https://ollama.com
-    - 没有             → 走本地 http://127.0.0.1:11434
-    返回 (base_url, headers, is_cloud)
+    获取 AI 配置（彻底改为从环境变量读取，支持随时切换后端）
     """
-    api_key = _os.environ.get("OLLAMA_API_KEY", "").strip()
-    if api_key:
-        return (
-            "https://ollama.com",
-            {
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-            True,
-        )
-    return (
-        "http://127.0.0.1:11434",
-        {"Content-Type": "application/json"},
-        False,
-    )
+    # 1. 优先从环境变量读取 API Key 和 Base URL
+    api_key = os.environ.get("api", "")
+    base_url = os.environ.get("api_url", "https://api.agnes-ai.cn/v1")
+
+    # 检查是否配置了密钥
+    if not api_key:
+        print("="*50)
+        print("❌ [AI配置严重警告] 未在环境变量中找到 'api' 密钥！")
+        print("👉 请执行: [Environment]::SetEnvironmentVariable('api', '你的密钥', 'User')")
+        print("="*50)
+
+    # 2. 模型优先级配置
+    # 因为你要用 Agnes，这里默认填 Agnes 的模型
+    text_models_priority = [
+        "agnes-2.5-flash",
+        "agnes-3.0-flash"
+    ]
+    
+    # 图像识别专用的模型
+    image_model = "agnes-2.5-flash"
+
+    # 3. 返回配置字典
+    return {
+        "base_url": base_url,
+        "api_key": api_key,
+        "text_models_priority": text_models_priority,
+        "image_model": image_model,
+        "timeout": 120,
+        "max_tokens": 500
+    }
 
 def strip_cloud_suffix(model_name: str, is_cloud: bool) -> str:
     """
@@ -3405,21 +3421,16 @@ def strip_cloud_suffix(model_name: str, is_cloud: bool) -> str:
         return model_name[:-6]
     return model_name
 class OllamaAI:
+
     def __init__(self):
-        self.base_url, self.api_headers, self.is_cloud = get_ollama_config()
-        print(f"[AI] Ollama 模式: {'云端' if self.is_cloud else '本地'} | 地址: {self.base_url}")
+        # 获取配置
+        config = get_ollama_config()
         
-        # ========== 纯文本模型优先级列表 ==========
-        self.text_models_priority = [
-            "gemma4:31b-cloud",# 第一优先
-            "gpt-oss:120b-cloud"# 第二优先 
-            "nemotron-3-super:cloud",# 第三优先          
-            "gpt-oss:20b-cloud"#第四优先        
-              
-        ]
-        
-        # 图像识别专用模型
-        self.image_model = "gemma4:31b-cloud"
+        # 初始化基本参数
+        self.base_url = config["base_url"]
+        self.api_key = config["api_key"]
+        self.text_models_priority = config["text_models_priority"]
+        self.image_model = config["image_model"]
         
         # 当前使用的模型
         self.current_model_index = 0
@@ -3455,8 +3466,8 @@ class OllamaAI:
             "low": {"tone": "冷淡简短", "extra": "回复简短", "greeting": "嗯"},
             "hostile": {"tone": "冷漠", "extra": "回复极简", "greeting": "..."}
         }
-        
-        print(f"[调试] AI模块初始化完成")
+
+        print(f"[调试] AI模块初始化完成 (引擎: Agnes)")
         print(f"[调试] 纯文本模型列表: {self.text_models_priority}")
         print(f"[调试] 图像模型: {self.image_model}")
         print(f"[调试] AI当前性格: {self.personality_mgr.get_current_name()}")
@@ -3576,65 +3587,34 @@ class OllamaAI:
 
         has_image = '[图片:' in message_str
 
-        # 有图片时优先多模态
+        # 有图片时优先走多模态（Agnes 的 2.5-flash 支持看图）
         if has_image:
-            print(f"[AI] 检测到图片，使用多模态模型")
-            multimodal_models = ["llava:7b", "llava-phi3:latest", "gemma4:31b-cloud"]
-            for mm_model in multimodal_models:
-                result = await self._chat_with_model(
-                    message_str, mm_model, use_personality, group_id, user_id, favor
-                )
-                if result and result.strip():
-                    return result
-            print(f"[AI] 多模态模型均失败，降级到纯文本")
+            print(f"[AI] 检测到图片，使用多模态模型: {self.image_model}")
+            result = await self._chat_with_model(
+                message_str, self.image_model, use_personality, group_id, user_id, favor
+            )
+            if result and result.strip():
+                return result
+            print(f"[AI] 图像识别失败，降级到文本模型")
 
-        # ========== 第一轮：当前模式 ==========
-        print(f"[AI] 当前模式: {'云端' if self.is_cloud else '本地'} | 模型: {self.current_model}")
+        # ========== 正常文本聊天 ==========
+        print(f"[AI] 当前模式: ☁️ API 云端 | 模型: {self.current_model}")
+        
+        # 遍历我们设置好的模型列表（agnes-2.5-flash -> agnes-3.0-flash）
         for attempt in range(len(self.text_models_priority)):
             result = await self._chat_with_model(
                 message_str, self.current_model, use_personality, group_id, user_id, favor
             )
             if result and result.strip():
-                self._reset_text_model_index()
+                self._reset_text_model_index() # 成功了重置模型索引
                 return result
+                
+            # 如果当前模型失败，切换到下一个模型
             if not self._switch_to_next_text_model():
                 break
 
-        # ========== 第二轮：自动切换模式重试 ==========
-        if self.is_cloud:
-            print("[AI切换] 云端全部失败，自动降级到本地 Ollama")
-            self.base_url = "http://127.0.0.1:11434"
-            self.api_headers = {"Content-Type": "application/json"}
-            self.is_cloud = False
-        else:
-            # 本地失败，如果之前设了 API Key，可以再试试云端
-            api_key = os.environ.get("OLLAMA_API_KEY", "").strip()
-            if api_key:
-                print("[AI切换] 本地全部失败，尝试切换到云端")
-                self.base_url = "https://ollama.com"
-                self.api_headers = {
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                }
-                self.is_cloud = True
-            else:
-                return "AI服务暂时不可用"
-
-        self._reset_text_model_index()
-        for attempt in range(len(self.text_models_priority)):
-            result = await self._chat_with_model(
-                message_str, self.current_model, use_personality, group_id, user_id, favor
-            )
-            if result and result.strip():
-                # 成功后把模式恢复回去，下次请求优先走原模式
-                self._restore_original_mode()
-                self._reset_text_model_index()
-                return result
-            if not self._switch_to_next_text_model():
-                break
-
-        # 两边都失败，恢复原模式
-        self._restore_original_mode()
+        # 所有模型都失败了
+        print("[AI错误] 所有云端模型请求均失败")
         return "AI服务暂时不可用"
 
     def _restore_original_mode(self):
@@ -3652,7 +3632,6 @@ class OllamaAI:
                             favor: int = None, raw_message: list = None) -> Optional[str]:
         import re
         import aiohttp
-        import base64
 
         try:
             has_image = '[图片:' in message_str
@@ -3672,54 +3651,56 @@ class OllamaAI:
             if not clean_text.strip():
                 clean_text = "请描述这张图片"
 
-            # ===== 新增：根据模式处理模型名 =====
-            final_model = strip_cloud_suffix(model, self.is_cloud)
-
-            # 如果有图片，使用 /api/generate 接口
-            if image_base64:
-                payload = {
-                    "model": final_model,
-                    "prompt": clean_text,
-                    "images": [image_base64],
-                    "stream": False,
-                    "options": {
-                        "temperature": 0.8,
-                        "top_p": 0.9,
-                        "num_predict": 500
-                    }
-                }
-                api_endpoint = f"{self.base_url}/api/generate"
-            else:
-                # 纯文本使用 /api/chat 接口
-                messages = []
-                if use_personality:
-                    if group_id:
-                        system_prompt = self.personality_mgr.get_group_prompt(group_id)
-                    else:
-                        system_prompt = self.personality_mgr.get_personality_prompt("default")
-                    messages.append({"role": "system", "content": system_prompt})
-
-                if favor is not None and user_id is not None:
-                    favor_prompt = self._build_favor_prompt(favor, user_id)
-                    messages.append({"role": "system", "content": favor_prompt})
-
-                if user_id:
-                    context_message = self.memory_module.get_conversation_context(user_id, clean_text)
-                    messages.append({"role": "user", "content": context_message})
+            # ===== 构建 OpenAI 兼容格式的 messages =====
+            messages = []
+            
+            # 1. 系统提示词（性格）
+            if use_personality:
+                if group_id:
+                    system_prompt = self.personality_mgr.get_group_prompt(group_id)
                 else:
-                    messages.append({"role": "user", "content": clean_text})
+                    system_prompt = self.personality_mgr.get_personality_prompt("default")
+                messages.append({"role": "system", "content": system_prompt})
 
-                payload = {
-                    "model": final_model,
-                    "messages": messages,
-                    "stream": False,
-                    "options": {
-                        "temperature": 0.8,
-                        "top_p": 0.9,
-                        "num_predict": 500
-                    }
-                }
-                api_endpoint = f"{self.base_url}/api/chat"
+            # 2. 好感度提示词
+            if favor is not None and user_id is not None:
+                favor_prompt = self._build_favor_prompt(favor, user_id)
+                messages.append({"role": "system", "content": favor_prompt})
+
+            # 3. 拼接用户文本上下文
+            if user_id:
+                context_message = self.memory_module.get_conversation_context(user_id, clean_text)
+            else:
+                context_message = clean_text
+
+            # 4. 构建最终的 user 消息（区分是否带图）
+            if image_base64:
+                # 🆕 Agnes (OpenAI兼容) 传图格式
+                messages.append({
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": context_message},
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_base64}"}}
+                    ]
+                })
+            else:
+                messages.append({"role": "user", "content": context_message})
+
+            # ===== 发送请求 (Agnes /chat/completions 端点) =====
+            api_endpoint = f"{self.base_url}/chat/completions"
+            
+            headers = {
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json"
+            }
+            
+            payload = {
+                "model": model,  # 👈 直接用传进来的模型名
+                "messages": messages,
+                "stream": False,
+                "temperature": 0.8,
+                "max_tokens": 500
+            }
 
             timeout = aiohttp.ClientTimeout(total=120, connect=30)
 
@@ -3727,18 +3708,15 @@ class OllamaAI:
                 async with session.post(
                     api_endpoint,
                     json=payload,
-                    headers=self.api_headers,
+                    headers=headers,  # 👈 用新的 headers
                     timeout=timeout
                 ) as response:
                     if response.status == 200:
                         result = await response.json()
-
-                        # 根据接口不同，提取响应
-                        if api_endpoint.endswith("/generate"):
-                            response_text = result.get("response", "").strip()
-                        else:
-                            response_text = result.get("message", {}).get("content", "").strip()
-
+                        
+                        # 🆕 提取 OpenAI 格式的返回结果
+                        response_text = result.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+                        
                         if response_text:
                             response_text = re.sub(r'\d{5,11}', '', response_text)
                             return response_text
@@ -12073,25 +12051,32 @@ def main():
         print("[看门狗] 已独立启动")
     
     _check()
-    # ===== Ollama 模式提示 =====
-    # ===== Ollama 模式提示 =====
-    _ollama_key = os.environ.get("OLLAMA_API_KEY", "").strip()
+
+    # ===== AI 引擎模式提示 =====
+    _api_key = os.environ.get("api", "").strip()
+    _api_url = os.environ.get("api_url", "https://api.agnes-ai.cn/v1").strip()
+    
     print("=" * 50)
-    if _ollama_key:
-        _masked = _ollama_key[:8] + "..." + _ollama_key[-6:]
-        print(f"🧠 Ollama: ☁️  云端模式 (密钥 {_masked})")
-        print("   💡 想切回本地？删除环境变量 OLLAMA_API_KEY 后重开窗口")
+    if _api_key:
+        _masked = _api_key[:8] + "..." + _api_key[-6:]
+        print(f"🧠 AI 引擎: ☁️  API 云端模式")
+        print(f"   🔗 接口地址: {_api_url}")
+        print(f"   🔑 当前密钥: {_masked}")
+        print("   💡 想换接口？修改环境变量 'api_url' 后重开窗口")
     else:
-        print("🧠 Ollama: 💻 本地模式")
-        print("   💡 想用云端？设置环境变量 OLLAMA_API_KEY")
+        print("🧠 AI 引擎: ⚠️ 未检测到 API 密钥")
+        print("   💡 请设置环境变量 'api' 才能正常使用 AI 功能")
         print("   ┌─────────────────────────────────────────")
         print("   │ 永久设置（推荐，重开窗口生效）:")
-        print("   │   setx OLLAMA_API_KEY \"你的密钥\"")
+        print("   │   setx api \"你的密钥\"")
+        print("   │   setx api_url \"https://api.agnes-ai.cn/v1\"")
         print("   │")
         print("   │ 临时设置（只对当前窗口有效）:")
-        print("   │   $env:OLLAMA_API_KEY = \"你的密钥\"")
+        print("   │   $env:api = \"你的密钥\"")
+        print("   │   $env:api_url = \"https://api.agnes-ai.cn/v1\"")
         print("   └─────────────────────────────────────────")
     print("=" * 50)
+    
     print("=" * 50)
     print("🤖 XP12 机器人启动器")
     print("=" * 50)
