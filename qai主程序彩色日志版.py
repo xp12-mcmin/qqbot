@@ -8144,9 +8144,13 @@ class MessageHandler:
             try:
                 import os
                 import shutil
+                import glob
 
-                os.makedirs("data/temp_video", exist_ok=True)
-                target = "data/temp_video"
+                # 输出目录用绝对路径，避免 cwd 不一致导致双目录冲突
+                target_abs = os.path.abspath("data/temp_video")
+                os.makedirs(target_abs, exist_ok=True)
+                # 项目根目录（主进程 cwd 不一定是根目录，子进程统一用根目录）
+                project_root = os.path.dirname(os.path.abspath(__file__))
 
                 # ===== 智能查找 ffmpeg：本地目录优先，再查系统 PATH =====
                 ffmpeg = None
@@ -8193,11 +8197,10 @@ class MessageHandler:
                     print("[B站视频] 未获取到 BVID，无法命名文件")
                     self._bili_send_bg(group_id, user_id, "❌ 未获取到视频ID，无法下载")
                     return
-                base_name = bvid
-                out_tmpl = os.path.join(target, f"{bvid}.%(ext)s").replace("\\", "/")
+                # -o 输出模板用绝对路径，与 cwd 无关
+                out_tmpl = os.path.join(target_abs, f"{bvid}.%(ext)s")
 
                 # ===== 组装 yt-dlp 命令 =====
-                target_abs = os.path.abspath(target)
                 ytdlp_args = [
                     *ytdlp_cmd,
                     "--newline",
@@ -8211,12 +8214,12 @@ class MessageHandler:
                 print(f"[B站视频] 开始异步下载: {link or bvid}")
                 print(f"[B站视频] ffmpeg={ffmpeg}, yt-dlp={' '.join(ytdlp_cmd)}, 输出文件={bvid}")
 
-                # ===== 异步子进程下载（绝不卡主线程，机器人仍可正常响应其他消息） =====
+                # ===== 异步子进程下载（cwd 用项目根目录，不再用 target_abs） =====
                 proc = await asyncio.create_subprocess_exec(
                     *ytdlp_args,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.STDOUT,
-                    cwd=target_abs,
+                    cwd=project_root,
                 )
                 last_progress = ""
                 async for raw_line in proc.stdout:
@@ -8233,20 +8236,13 @@ class MessageHandler:
                     self._bili_send_bg(group_id, user_id, "❌ 视频下载失败，请稍后再试")
                     return
 
-                # 直接用 BVID 拼接路径找下载产物（无需再 listdir 猜文件名）
-                filepath = os.path.join("data/temp_video", f"{bvid}.mp4")
+                # ===== 文件检查全部用绝对路径 =====
+                filepath = os.path.join(target_abs, f"{bvid}.mp4")
                 print(f"[B站视频] 检查文件是否存在: {filepath}")
                 if not os.path.exists(filepath):
-                    # 兜底：扫目录找 BVID 开头的非 .part 文件（万一个别视频扩展名不是 mp4）
-                    try:
-                        files = [
-                            os.path.join("data/temp_video", f)
-                            for f in os.listdir("data/temp_video")
-                            if f.startswith(bvid) and not f.endswith(".part")
-                        ]
-                        filepath = max(files, key=os.path.getsize) if files else None
-                    except OSError:
-                        filepath = None
+                    # 兜底：glob 找 BVID.* 扩展名，过滤 .part，取体积最大的
+                    candidates = [f for f in glob.glob(os.path.join(target_abs, f"{bvid}.*")) if not f.endswith(".part")]
+                    filepath = max(candidates, key=os.path.getsize) if candidates else None
                 if not filepath or not os.path.exists(filepath):
                     print(f"[B站视频] 下载后未找到文件: {bvid}")
                     self._bili_send_bg(group_id, user_id, "❌ 下载失败，请稍后再试")
