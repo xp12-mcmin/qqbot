@@ -3,6 +3,7 @@ init(autoreset=True)  # 自动重置颜色
 import os
 import sys
 import aiohttp
+from notify_manager import KickNotifyManager
 # ========== 强制切换到脚本所在目录 ==========
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
 print(f"[启动] 工作目录已切换到: {os.getcwd()}")
@@ -3372,28 +3373,44 @@ class MarriageData:
 # ==================== Ollama 云端/本地自动检测 ====================
 import os as _os
 
+import os
+
+import os
+
 def get_ollama_config():
     """
-    自动检测是否配置了 Ollama 云密钥
-    - 有 OLLAMA_API_KEY → 直连云端 https://ollama.com
-    - 没有             → 走本地 http://127.0.0.1:11434
-    返回 (base_url, headers, is_cloud)
+    获取 AI 配置（彻底改为从环境变量读取，支持随时切换后端）
     """
-    api_key = _os.environ.get("OLLAMA_API_KEY", "").strip()
-    if api_key:
-        return (
-            "https://ollama.com",
-            {
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-            True,
-        )
-    return (
-        "http://127.0.0.1:11434",
-        {"Content-Type": "application/json"},
-        False,
-    )
+    # 1. 优先从环境变量读取 API Key 和 Base URL
+    api_key = os.environ.get("api", "")
+    base_url = os.environ.get("api_url", "https://api.agnes-ai.cn/v1")
+
+    # 检查是否配置了密钥
+    if not api_key:
+        print("="*50)
+        print("❌ [AI配置严重警告] 未在环境变量中找到 'api' 密钥！")
+        print("👉 请执行: [Environment]::SetEnvironmentVariable('api', '你的密钥', 'User')")
+        print("="*50)
+
+    # 2. 模型优先级配置
+    # 因为你要用 Agnes，这里默认填 Agnes 的模型
+    text_models_priority = [
+        "agnes-2.5-flash",
+        "agnes-3.0-flash"
+    ]
+    
+    # 图像识别专用的模型
+    image_model = "agnes-2.5-flash"
+
+    # 3. 返回配置字典
+    return {
+        "base_url": base_url,
+        "api_key": api_key,
+        "text_models_priority": text_models_priority,
+        "image_model": image_model,
+        "timeout": 120,
+        "max_tokens": 500
+    }
 
 def strip_cloud_suffix(model_name: str, is_cloud: bool) -> str:
     """
@@ -3404,21 +3421,16 @@ def strip_cloud_suffix(model_name: str, is_cloud: bool) -> str:
         return model_name[:-6]
     return model_name
 class OllamaAI:
+
     def __init__(self):
-        self.base_url, self.api_headers, self.is_cloud = get_ollama_config()
-        print(f"[AI] Ollama 模式: {'云端' if self.is_cloud else '本地'} | 地址: {self.base_url}")
+        # 获取配置
+        config = get_ollama_config()
         
-        # ========== 纯文本模型优先级列表 ==========
-        self.text_models_priority = [
-            "gemma4:31b-cloud",# 第一优先
-            "gpt-oss:120b-cloud"# 第二优先 
-            "nemotron-3-super:cloud",# 第三优先          
-            "gpt-oss:20b-cloud"#第四优先        
-              
-        ]
-        
-        # 图像识别专用模型
-        self.image_model = "gemma4:31b-cloud"
+        # 初始化基本参数
+        self.base_url = config["base_url"]
+        self.api_key = config["api_key"]
+        self.text_models_priority = config["text_models_priority"]
+        self.image_model = config["image_model"]
         
         # 当前使用的模型
         self.current_model_index = 0
@@ -3454,8 +3466,8 @@ class OllamaAI:
             "low": {"tone": "冷淡简短", "extra": "回复简短", "greeting": "嗯"},
             "hostile": {"tone": "冷漠", "extra": "回复极简", "greeting": "..."}
         }
-        
-        print(f"[调试] AI模块初始化完成")
+
+        print(f"[调试] AI模块初始化完成 (引擎: Agnes)")
         print(f"[调试] 纯文本模型列表: {self.text_models_priority}")
         print(f"[调试] 图像模型: {self.image_model}")
         print(f"[调试] AI当前性格: {self.personality_mgr.get_current_name()}")
@@ -3575,65 +3587,34 @@ class OllamaAI:
 
         has_image = '[图片:' in message_str
 
-        # 有图片时优先多模态
+        # 有图片时优先走多模态（Agnes 的 2.5-flash 支持看图）
         if has_image:
-            print(f"[AI] 检测到图片，使用多模态模型")
-            multimodal_models = ["llava:7b", "llava-phi3:latest", "gemma4:31b-cloud"]
-            for mm_model in multimodal_models:
-                result = await self._chat_with_model(
-                    message_str, mm_model, use_personality, group_id, user_id, favor
-                )
-                if result and result.strip():
-                    return result
-            print(f"[AI] 多模态模型均失败，降级到纯文本")
+            print(f"[AI] 检测到图片，使用多模态模型: {self.image_model}")
+            result = await self._chat_with_model(
+                message_str, self.image_model, use_personality, group_id, user_id, favor
+            )
+            if result and result.strip():
+                return result
+            print(f"[AI] 图像识别失败，降级到文本模型")
 
-        # ========== 第一轮：当前模式 ==========
-        print(f"[AI] 当前模式: {'云端' if self.is_cloud else '本地'} | 模型: {self.current_model}")
+        # ========== 正常文本聊天 ==========
+        print(f"[AI] 当前模式: ☁️ API 云端 | 模型: {self.current_model}")
+        
+        # 遍历我们设置好的模型列表（agnes-2.5-flash -> agnes-3.0-flash）
         for attempt in range(len(self.text_models_priority)):
             result = await self._chat_with_model(
                 message_str, self.current_model, use_personality, group_id, user_id, favor
             )
             if result and result.strip():
-                self._reset_text_model_index()
+                self._reset_text_model_index() # 成功了重置模型索引
                 return result
+                
+            # 如果当前模型失败，切换到下一个模型
             if not self._switch_to_next_text_model():
                 break
 
-        # ========== 第二轮：自动切换模式重试 ==========
-        if self.is_cloud:
-            print("[AI切换] 云端全部失败，自动降级到本地 Ollama")
-            self.base_url = "http://127.0.0.1:11434"
-            self.api_headers = {"Content-Type": "application/json"}
-            self.is_cloud = False
-        else:
-            # 本地失败，如果之前设了 API Key，可以再试试云端
-            api_key = os.environ.get("OLLAMA_API_KEY", "").strip()
-            if api_key:
-                print("[AI切换] 本地全部失败，尝试切换到云端")
-                self.base_url = "https://ollama.com"
-                self.api_headers = {
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                }
-                self.is_cloud = True
-            else:
-                return "AI服务暂时不可用"
-
-        self._reset_text_model_index()
-        for attempt in range(len(self.text_models_priority)):
-            result = await self._chat_with_model(
-                message_str, self.current_model, use_personality, group_id, user_id, favor
-            )
-            if result and result.strip():
-                # 成功后把模式恢复回去，下次请求优先走原模式
-                self._restore_original_mode()
-                self._reset_text_model_index()
-                return result
-            if not self._switch_to_next_text_model():
-                break
-
-        # 两边都失败，恢复原模式
-        self._restore_original_mode()
+        # 所有模型都失败了
+        print("[AI错误] 所有云端模型请求均失败")
         return "AI服务暂时不可用"
 
     def _restore_original_mode(self):
@@ -3651,7 +3632,6 @@ class OllamaAI:
                             favor: int = None, raw_message: list = None) -> Optional[str]:
         import re
         import aiohttp
-        import base64
 
         try:
             has_image = '[图片:' in message_str
@@ -3671,54 +3651,56 @@ class OllamaAI:
             if not clean_text.strip():
                 clean_text = "请描述这张图片"
 
-            # ===== 新增：根据模式处理模型名 =====
-            final_model = strip_cloud_suffix(model, self.is_cloud)
-
-            # 如果有图片，使用 /api/generate 接口
-            if image_base64:
-                payload = {
-                    "model": final_model,
-                    "prompt": clean_text,
-                    "images": [image_base64],
-                    "stream": False,
-                    "options": {
-                        "temperature": 0.8,
-                        "top_p": 0.9,
-                        "num_predict": 500
-                    }
-                }
-                api_endpoint = f"{self.base_url}/api/generate"
-            else:
-                # 纯文本使用 /api/chat 接口
-                messages = []
-                if use_personality:
-                    if group_id:
-                        system_prompt = self.personality_mgr.get_group_prompt(group_id)
-                    else:
-                        system_prompt = self.personality_mgr.get_personality_prompt("default")
-                    messages.append({"role": "system", "content": system_prompt})
-
-                if favor is not None and user_id is not None:
-                    favor_prompt = self._build_favor_prompt(favor, user_id)
-                    messages.append({"role": "system", "content": favor_prompt})
-
-                if user_id:
-                    context_message = self.memory_module.get_conversation_context(user_id, clean_text)
-                    messages.append({"role": "user", "content": context_message})
+            # ===== 构建 OpenAI 兼容格式的 messages =====
+            messages = []
+            
+            # 1. 系统提示词（性格）
+            if use_personality:
+                if group_id:
+                    system_prompt = self.personality_mgr.get_group_prompt(group_id)
                 else:
-                    messages.append({"role": "user", "content": clean_text})
+                    system_prompt = self.personality_mgr.get_personality_prompt("default")
+                messages.append({"role": "system", "content": system_prompt})
 
-                payload = {
-                    "model": final_model,
-                    "messages": messages,
-                    "stream": False,
-                    "options": {
-                        "temperature": 0.8,
-                        "top_p": 0.9,
-                        "num_predict": 500
-                    }
-                }
-                api_endpoint = f"{self.base_url}/api/chat"
+            # 2. 好感度提示词
+            if favor is not None and user_id is not None:
+                favor_prompt = self._build_favor_prompt(favor, user_id)
+                messages.append({"role": "system", "content": favor_prompt})
+
+            # 3. 拼接用户文本上下文
+            if user_id:
+                context_message = self.memory_module.get_conversation_context(user_id, clean_text)
+            else:
+                context_message = clean_text
+
+            # 4. 构建最终的 user 消息（区分是否带图）
+            if image_base64:
+                # 🆕 Agnes (OpenAI兼容) 传图格式
+                messages.append({
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": context_message},
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_base64}"}}
+                    ]
+                })
+            else:
+                messages.append({"role": "user", "content": context_message})
+
+            # ===== 发送请求 (Agnes /chat/completions 端点) =====
+            api_endpoint = f"{self.base_url}/chat/completions"
+            
+            headers = {
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json"
+            }
+            
+            payload = {
+                "model": model,  # 👈 直接用传进来的模型名
+                "messages": messages,
+                "stream": False,
+                "temperature": 0.8,
+                "max_tokens": 500
+            }
 
             timeout = aiohttp.ClientTimeout(total=120, connect=30)
 
@@ -3726,18 +3708,15 @@ class OllamaAI:
                 async with session.post(
                     api_endpoint,
                     json=payload,
-                    headers=self.api_headers,
+                    headers=headers,  # 👈 用新的 headers
                     timeout=timeout
                 ) as response:
                     if response.status == 200:
                         result = await response.json()
-
-                        # 根据接口不同，提取响应
-                        if api_endpoint.endswith("/generate"):
-                            response_text = result.get("response", "").strip()
-                        else:
-                            response_text = result.get("message", {}).get("content", "").strip()
-
+                        
+                        # 🆕 提取 OpenAI 格式的返回结果
+                        response_text = result.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+                        
                         if response_text:
                             response_text = re.sub(r'\d{5,11}', '', response_text)
                             return response_text
@@ -4082,12 +4061,25 @@ class MessageHandler:
             self._load_scolding_config()
         else:
             print("[骂人模块] _load_scolding_config 方法未找到，使用默认值")
+        self.kick_notify = KickNotifyManager()
+        self.kick_notify = KickNotifyManager()
         # 同样保护所有可能有问题的调用
         # ========== 防御性检查：好感度辅助方法 ==========
         for method_name in ['_extract_at_target_from_raw', '_extract_target_user', '_extract_delta_value']:
             if not hasattr(self, method_name):
                 print(f"[好感度修复] {method_name} 方法未找到")
-
+        # ===== 违禁词检测器 =====
+        from banned_word_detector import get_banned_word_detector
+        self.banned_word_detector = get_banned_word_detector()
+        # ===== 进群审核 =====
+        from group_audit import get_group_audit
+        self.group_audit = get_group_audit(
+            blacklist=self.blacklist,
+            banned_word_detector=self.banned_word_detector,
+            ai=self.ai
+        )
+        print("[调试] 进群审核模块加载成功")
+        print("[调试] 违禁词检测器加载成功")
         # 初始化 AI 性格（传入黑名单）
         self.ai = OllamaAI()
         if hasattr(self.ai, 'personality_mgr'):
@@ -4623,38 +4615,97 @@ class MessageHandler:
                         print(f"[自动解禁全体] ❌ 解禁失败: {resp.status} - {text}")
         except Exception as e:
             print(f"[自动解禁全体] ❌ HTTP 异常: {e}")
-    def _handle_non_message(self, data: Dict) -> Optional[Dict]:
+    async def _handle_non_message(self, data: Dict) -> Optional[Dict]:
         post_type = data.get("post_type")
         if post_type == "notice":
             notice_type = data.get("notice_type")
-            
+
             if notice_type == "group_recall":
                 return self.anti_recall.handle_recall_event(data)
-            
             elif notice_type == "group_ban":
                 print("[禁言] 收到群禁言事件")
                 return self._handle_group_ban(data)
-            
-            # ========== 新增：处理入群事件 ==========
             elif notice_type == "group_increase":
                 print("[入群] 收到新人入群事件")
                 return self._handle_group_increase(data)
-            
-        return None
+            # 🆕
+            elif notice_type == "group_decrease":
+                return await self.kick_notify.handle_group_decrease(data, self)
 
+        return None
+    async def _handle_group_request(self, data: Dict) -> Optional[Dict]:
+        """处理加群申请事件（OneBot 11）"""
+        try:
+            # 调试：打印原始事件
+            print(f"[进群审核] 原始事件: {json.dumps(data, ensure_ascii=False)}")
+            
+            group_id = str(data.get("group_id", ""))
+            user_id = str(data.get("user_id", ""))
+            comment = data.get("comment", "") or ""
+            sub_type = data.get("sub_type", "add")
+            flag = data.get("flag", "")
+            
+            # 只处理主动申请
+            if sub_type != "add":
+                print(f"[进群审核] 非主动申请 (sub_type={sub_type})，跳过")
+                return None
+            
+            if not hasattr(self, 'group_audit') or not self.group_audit:
+                return None
+            
+            nickname = data.get("nickname", "") or user_id
+            
+            print(f"[进群审核] 群{group_id} 用户{nickname}({user_id}) 申请加群，留言: {comment}")
+            
+            result, reason = await self.group_audit.audit_request(
+                group_id, user_id, nickname, comment
+            )
+            
+            approve = (result == "approve")
+            print(f"[进群审核] {'✅ 同意' if approve else '❌ 拒绝'} {user_id}，原因: {reason}")
+            
+            params = {
+                "flag": flag,
+                "sub_type": "add",
+                "approve": approve
+            }
+            if not approve and reason:
+                params["reason"] = reason
+            
+            return {
+                "action": "set_group_add_request",
+                "params": params
+            }
+        except Exception as e:
+            print(f"[进群审核] 处理异常: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
     def _handle_group_increase(self, data: Dict) -> Optional[Dict]:
-        """处理新人入群事件"""
+        """处理新人入群事件（含黑名单拦截）"""
         try:
             group_id = data.get("group_id")
             user_id = data.get("user_id")
-            
-            # 获取用户昵称（优先使用群名片，其次昵称）
             user_name = data.get("user_name", str(user_id))
-            
-            # 发送欢迎消息
+
+            # ===== 🆕 黑名单检查 =====
+            if hasattr(self, 'banned_word_detector') and self.banned_word_detector:
+                det = self.banned_word_detector
+                if det.config.get("blacklist_kick_on_join", True) and \
+                   det.is_blacklisted(str(group_id), str(user_id)):
+                    info = det.get_blacklist(str(group_id)).get(str(user_id), {})
+                    reason = info.get("reason", "违规记录")
+                    print(f"[黑名单] 🚫 用户 {user_id} 在本群黑名单中，自动踢出")
+                    asyncio.create_task(self._kick_and_notify(
+                        group_id, user_id,
+                        f"🚫 检测到黑名单用户 {user_name}({user_id}) 尝试进群\n"
+                        f"原因: {reason}\n已自动踢出。"
+                    ))
+                    return None
+
+            # ===== 原有欢迎逻辑 =====
             self._send_welcome_message(group_id, user_id, user_name)
-            
-            return None  # 不返回回复，只发送欢迎消息
+            return None
         except Exception as e:
             print(f"[入群欢迎] 处理事件失败: {e}")
             return None
@@ -4744,7 +4795,179 @@ class MessageHandler:
             return False
         except Exception:
             return False
-    
+    async def _check_banned_word(self, group_id: str, user_id: str, data: Dict) -> Optional[Dict]:
+        """
+        违禁词检测处理：撤回 + 累计禁言 + 黑名单踢出（每群独立开关）
+        """
+        print(f"[违禁词🔍] 进入检测: 群={group_id}, 用户={user_id}")
+
+        try:
+            # ==================== 1. 检查检测器是否存在 ====================
+            if not hasattr(self, 'banned_word_detector') or not self.banned_word_detector:
+                print(f"[违禁词🔍] ❌ detector 不存在")
+                return None
+
+            print(f"[违禁词🔍] 全局开关={self.banned_word_detector.is_global_enabled()}")
+            print(f"[违禁词🔍] 本群启用={self.banned_word_detector.is_group_enabled(group_id)}")
+            print(f"[违禁词🔍] 启用群列表={self.banned_word_detector.get_enabled_groups()}")
+
+            if not self.banned_word_detector.is_group_enabled(group_id):
+                print(f"[违禁词🔍] ❌ 本群未启用，跳过")
+                return None
+
+            # ==================== 2. 提取文本 ====================
+            text = self._extract_pure_text(data)
+            print(f"[违禁词🔍] 提取文本={repr(text[:80])}")
+
+            if not text or text in ["（空消息）", "（提取失败）"]:
+                print(f"[违禁词🔍] ❌ 文本为空，跳过")
+                return None
+
+            # ==================== 3. 调用检测 ====================
+            result = self.banned_word_detector.check_message(group_id, user_id, text)
+            print(f"[违禁词🔍] 检测结果={result}")
+
+            if not result:
+                print(f"[违禁词🔍] 无违禁词")
+                return None
+
+            # ==================== 4. 提取检测结果 ====================
+            matched_word    = result["matched_word"]
+            count           = result["count"]
+            threshold       = result["threshold"]
+            should_mute     = result["should_mute"]
+            mute_duration   = result["mute_duration"]
+            delete_message  = result["delete_message"]
+            notify          = result["notify"]
+            should_blacklist = result.get("should_blacklist", False)
+            total_strikes    = result.get("total_strikes", 0)
+
+            # 获取原始 message_id（用于撤回）
+            raw_message_id = data.get("message_id")
+
+            # ==================== 5. 构造 actions 列表 ====================
+            actions = []
+
+            # ---------- 5.1 撤回消息 ----------
+            if delete_message and raw_message_id:
+                actions.append({
+                    "action": "delete_msg",
+                    "params": {"message_id": raw_message_id}
+                })
+                print(f"[违禁词🔍] 🗑️ 加入撤回: message_id={raw_message_id}")
+
+            # ---------- 5.2 禁言 ----------
+            if should_mute:
+                actions.append({
+                    "action": "set_group_ban",
+                    "params": {
+                        "group_id": int(group_id),
+                        "user_id": int(user_id),
+                        "duration": mute_duration
+                    }
+                })
+                print(f"[违禁词🔍] 🔨 加入禁言: {user_id} {mute_duration}秒")
+
+            # ---------- 5.3 黑名单 → 踢出 ----------
+            if should_blacklist:
+                # 踢出
+                actions.append({
+                    "action": "set_group_kick",
+                    "params": {
+                        "group_id": int(group_id),
+                        "user_id": int(user_id),
+                        "reject_add_request": False
+                    }
+                })
+
+                # 提示（黑名单专属）
+                window_hours = self.banned_word_detector.config.get("blacklist_window_hours", 3)
+                blacklist_tip = (
+                    f"🚫 [CQ:at,qq={user_id}] 已被加入本群黑名单\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\n"
+                    f"⚠️ {window_hours}h 内累计违规 {total_strikes} 次\n"
+                    f"🔨 已自动踢出本群\n"
+                    f"📝 如有异议请联系管理员"
+                )
+                actions.append({
+                    "action": "send_msg",
+                    "params": {
+                        "message_type": "group",
+                        "group_id": int(group_id),
+                        "message": blacklist_tip
+                    }
+                })
+                print(f"[违禁词🔍] 🚫 加入黑名单踢出 + 提示")
+
+            # ---------- 5.4 普通提示（非黑名单）----------
+            elif notify:
+                if should_mute:
+                    mute_desc = self._format_duration(mute_duration)
+                    tip = (f"[CQ:at,qq={user_id}] 🚫 检测到违禁词\n"
+                           f"⚠️ 已累计 {threshold} 次，禁言 {mute_desc}")
+                else:
+                    tip = (f"[CQ:at,qq={user_id}] 🚫 检测到违禁词\n"
+                           f"⚠️ 警告 {count}/{threshold} 次")
+                actions.append({
+                    "action": "send_msg",
+                    "params": {
+                        "message_type": "group",
+                        "group_id": int(group_id),
+                        "message": tip
+                    }
+                })
+                print(f"[违禁词🔍] 💬 加入普通提示")
+
+            # ==================== 6. 发送所有 action ====================
+            print(f"[违禁词🔍] websocket={self.websocket is not None}")
+            if actions:
+                print(f"[违禁词🔍] 准备发送 {len(actions)} 个 action")
+                if hasattr(self, 'websocket') and self.websocket:
+                    for act in actions:
+                        try:
+                            await self.websocket.send(json.dumps(act))
+                            print(f"[违禁词🔍] ✅ 已发送: {act.get('action')}")
+                        except Exception as e:
+                            print(f"[违禁词🔍] ❌ 发送失败: {e}")
+                else:
+                    print(f"[违禁词🔍] ❌ websocket 为 None，action 发不出去！")
+                return {"_handled": True}
+
+            return None
+
+        except Exception as e:
+            print(f"[违禁词🔍] 💥 异常: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+    async def _kick_and_notify(self, group_id, user_id, message: str):
+        """先发提示，再踢人（异步任务）"""
+        try:
+            if not hasattr(self, 'websocket') or not self.websocket:
+                return
+            # 1. 发提示
+            await self.websocket.send(json.dumps({
+                "action": "send_msg",
+                "params": {
+                    "message_type": "group",
+                    "group_id": int(group_id),
+                    "message": message
+                }
+            }))
+            # 2. 等一下再踢（让提示先发出去）
+            await asyncio.sleep(1)
+            # 3. 踢人
+            await self.websocket.send(json.dumps({
+                "action": "set_group_kick",
+                "params": {
+                    "group_id": int(group_id),
+                    "user_id": int(user_id),
+                    "reject_add_request": False
+                }
+            }))
+            print(f"[黑名单] ✅ 已踢出 {user_id} (群 {group_id})")
+        except Exception as e:
+            print(f"[黑名单] ❌ 踢出失败: {e}")
     def _check_at_spam(self, user_id: str) -> bool:
         """@刷屏检测 - 保持原有逻辑"""
         try:
@@ -4972,7 +5195,11 @@ class MessageHandler:
             
             # 处理非消息事件
             if post_type != "message":
-                return self._handle_non_message(data)
+                # 加群申请（OneBot 11 request 事件）
+                if post_type == "request" and data.get("request_type") == "group":
+                    return await self._handle_group_request(data)
+                # 其他 notice 事件
+                return await self._handle_non_message(data)
             
             # ===== 刷屏检测 =====
             if message_type == "group" and group_id:
@@ -4981,7 +5208,14 @@ class MessageHandler:
                 )
                 if spam_result:
                     return spam_result
-            
+            # ===== 违禁词检测 =====
+            if message_type == "group" and group_id:
+                banned_result = await self._check_banned_word(
+                    str(group_id), str(user_id), data
+                )
+                if banned_result:
+                    # 有违禁词，返回处理结果（撤回/禁言）
+                    return banned_result            
             # ====== 互斥骂人逻辑 ======
             new_system_triggered = False
             scolding_msg = None
@@ -5106,8 +5340,24 @@ class MessageHandler:
                     return self._create_reply(message_type, user_id, group_id, reply)
             
             # 联网搜索
+            # 联网搜索
             if text.lower().startswith(("!搜索", "！搜索", "!搜", "！搜")):
-                pass
+                # 提取搜索关键词
+                query = text
+                for prefix in ["!搜索", "！搜索", "!搜", "！搜"]:
+                    if query.startswith(prefix):
+                        query = query[len(prefix):].strip()
+                        break
+                
+                if not query:
+                    return self._create_reply(message_type, user_id, group_id, "❌ 请指定搜索内容\n示例: !搜索 今日新闻")
+                
+                # 发送搜索中提示（可选，体验更好）
+                # await self.websocket.send(...)
+                
+                # 调用我们刚写好的 web_search 模块
+                result = await self.web_search.search(query)
+                return self._create_reply(message_type, user_id, group_id, result)
 
             # 绿茶反击检测
             if hasattr(self, 'green_tea') and message_type == "group" and group_id:
@@ -5571,34 +5821,12 @@ class MessageHandler:
             if not keyword:
                 return self._create_reply(message_type, user_id, group_id, "❌ 请指定关键词\n示例: 画图 猫娘")
             
-            return await self._ai_draw(group_id, user_id, keyword)
+                        # 启动后台画图
+            await self._ai_draw(group_id, user_id, keyword)
+            # 🆕 强行告诉主程序：我处理完了，别往下走了！
+            return {"_handled": True}
 
-        # 添加 _ai_draw 方法
-        async def _ai_draw(self, group_id: int, user_id: str, keyword: str) -> Dict:
-            """AI 绘画"""
-            await self.websocket.send(json.dumps({
-                "action": "send_msg",
-                "params": {
-                    "message_type": "group",
-                    "group_id": int(group_id),
-                    "message": f"[CQ:at,qq={user_id}] 🎨 正在生成图片：{keyword}，请稍候..."
-                }
-            }))
-            
-            draw = get_ai_draw()
-            success, result = await draw.draw(keyword)
-            
-            if success:
-                return {
-                    "action": "send_msg",
-                    "params": {
-                        "message_type": "group",
-                        "group_id": int(group_id),
-                        "message": f"[CQ:image,file=file:///{os.path.abspath(result)}]"
-                    }
-                }
-            else:
-                return self._create_reply("group", user_id, group_id, f"❌ 绘画失败：{result}")
+
     
         # ========== 4. 好感度查看 ==========
         # ========== 4. 好感度查看（修复版：支持@用户 + 显示昵称）==========
@@ -5920,6 +6148,500 @@ class MessageHandler:
             }))
             
             return self._create_reply(message_type, user_id, group_id, f"✅ 已将机器人名字改为：{new_name}")
+        # ========== 违禁词检测管理 ==========
+        # ========== 违禁词检测管理 ==========
+        # ========== 违禁词检测管理 ==========
+        if text_lower.startswith(("!违禁词", "！违禁词")):
+            if not is_admin:
+                return self._create_reply(message_type, user_id, group_id, "❌ 只有AI管理员可以管理违禁词")
+
+            if not hasattr(self, 'banned_word_detector') or not self.banned_word_detector:
+                return self._create_reply(message_type, user_id, group_id, "❌ 违禁词模块未初始化")
+
+            detector = self.banned_word_detector
+            parts = text.split()
+
+            # ==================== 无参数：帮助 ====================
+            # ==================== 无参数：帮助 ====================
+            # ==================== 无参数：帮助 ====================
+            # ==================== 无参数：帮助（图片版）====================
+            if len(parts) < 2:
+                try:
+                    img = detector.render_help_image(is_admin=is_admin)
+                    if img is not None:
+                        # 保存为临时图片并发送
+                        import tempfile
+                        from help_image import HelpImageGenerator
+                        gen = HelpImageGenerator()
+                        filepath = gen.save_to_temp(img)
+                        if filepath:
+                            result = await self._send_help_image_async(
+                                message_type, user_id, group_id, filepath
+                            )
+                            if result:
+                                return result
+                            # 已发送（_send_help_image_async 返回 None 表示已发）
+                            return {"_handled": True}
+                except Exception as e:
+                    print(f"[违禁词] 帮助图片生成失败: {e}")
+                    import traceback
+                    traceback.print_exc()
+
+                # ---------- 图片失败 → 降级为文字 ----------
+                help_text = (
+                    "📝 【违禁词检测 · 命令帮助】\n"
+                    "━━━━━━━━━━━━━━━━━━━━\n"
+                    "🔌 开关：\n"
+                    "  !违禁词 全局 开/关\n"
+                    "  !违禁词 启用 / 禁用\n"
+                    "  !违禁词 启用群 / 禁用群 <群号>\n"
+                    "  !违禁词 群列表\n"
+                    "\n"
+                    "📚 词库：\n"
+                    "  !违禁词 添加 / 删除 <词>\n"
+                    "  !违禁词 列表\n"
+                    "\n"
+                    "⚙️ 参数（纯数字）：\n"
+                    "  !违禁词 阈值 <次数>\n"
+                    "  !违禁词 时长 <秒>\n"
+                    "  !违禁词 重置 <小时>\n"
+                    "  !违禁词 撤回 开/关\n"
+                    "\n"
+                    "🚫 黑名单（每群独立 + 全局共享）：\n"
+                    "  !违禁词 黑名单启用 / 禁用 / 恢复\n"
+                    "  !违禁词 远程黑名单启用/禁用/恢复 <群号>\n"
+                    "  !违禁词 黑名单群状态\n"
+                    "  !违禁词 黑名单开关 开/关\n"
+                    "  !违禁词 黑名单阈值 <次数>\n"
+                    "  !违禁词 黑名单窗口 <小时>\n"
+                    "  !违禁词 进群踢 开/关\n"
+                    "  !违禁词 加入黑名单 <QQ> [原因]\n"
+                    "  !违禁词 移出黑名单 <QQ>\n"
+                    "  !违禁词 清空黑名单\n"
+                    "  !违禁词 加入全局黑名单 <QQ> [原因]\n"
+                    "  !违禁词 移出全局黑名单 <QQ>\n"
+                    "  !违禁词 清空全局黑名单\n"
+                    "  !违禁词 远程加黑 <群号> <QQ> [原因]\n"
+                    "  !违禁词 远程移黑 <群号> <QQ>\n"
+                    "  !违禁词 黑名单 / 全局黑名单\n"
+                    "\n"
+                    "🗂 记录：\n"
+                    "  !违禁词 清除记录 <QQ>\n"
+                    "  !违禁词 清空本群\n"
+                    "  !违禁词 状态\n"
+                    "━━━━━━━━━━━━━━━━━━━━\n"
+                    "💡 参数只写数字：!违禁词 黑名单窗口 3（不要写 3小时）\n"
+                )
+                return self._create_reply(message_type, user_id, group_id, help_text)
+            cmd = parts[1].lower() 
+            # ============================================================
+            # 🚫 黑名单命令（必须放最前面）
+            # ============================================================
+            if cmd in ["黑名单开关", "bl开关"]:
+                if len(parts) >= 3:
+                    enabled = parts[2] in ["开", "on", "开启", "启用"]
+                else:
+                    enabled = not detector.config.get("blacklist_enabled", True)
+                detector.set_blacklist_enabled(enabled)
+                return self._create_reply(message_type, user_id, group_id,
+                    f"✅ 黑名单功能已{'开启' if enabled else '关闭'}")
+
+            if cmd in ["黑名单阈值", "bl阈值"]:
+                if len(parts) < 3:
+                    return self._create_reply(message_type, user_id, group_id,
+                        f"当前: {detector.config['blacklist_window_hours']}h 内 "
+                        f"{detector.config['blacklist_threshold']} 次\n"
+                        f"格式: !违禁词 黑名单阈值 <次数>")
+                import re as _re
+                m = _re.match(r'^(\d+)', parts[2])
+                if not m:
+                    return self._create_reply(message_type, user_id, group_id,
+                        "❌ 格式: !违禁词 黑名单阈值 <次数>")
+                detector.set_blacklist_threshold(int(m.group(1)))
+                return self._create_reply(message_type, user_id, group_id,
+                    f"✅ 黑名单阈值已设为 {m.group(1)} 次")
+
+            if cmd in ["黑名单窗口", "bl窗口"]:
+                if len(parts) < 3:
+                    return self._create_reply(message_type, user_id, group_id,
+                        f"当前窗口: {detector.config['blacklist_window_hours']} 小时\n"
+                        f"格式: !违禁词 黑名单窗口 <小时>")
+                import re as _re
+                m = _re.match(r'^(\d+)', parts[2])
+                if not m:
+                    return self._create_reply(message_type, user_id, group_id,
+                        "❌ 格式: !违禁词 黑名单窗口 <小时>")
+                detector.set_blacklist_window_hours(int(m.group(1)))
+                return self._create_reply(message_type, user_id, group_id,
+                    f"✅ 黑名单统计窗口已设为 {m.group(1)} 小时")
+
+            if cmd in ["进群踢", "kickonjoin"]:
+                if len(parts) >= 3:
+                    enabled = parts[2] in ["开", "on", "开启", "启用"]
+                else:
+                    enabled = not detector.config.get("blacklist_kick_on_join", True)
+                detector.set_blacklist_kick_on_join(enabled)
+                return self._create_reply(message_type, user_id, group_id,
+                    f"✅ 黑名单用户进群即踢已{'开启' if enabled else '关闭'}")
+
+            # ---------- 查看：本群黑名单（含全局）----------
+            if cmd in ["黑名单", "bl列表", "黑名单列表"]:
+                merged = detector.get_blacklist_with_global(str(group_id))
+                if not merged:
+                    return self._create_reply(message_type, user_id, group_id,
+                        "📭 本群黑名单为空（全局也是空的）")
+                lines = [f"🚫 本群黑名单 (共{len(merged)}人，含全局):"]
+                for i, (uid, info) in enumerate(merged.items(), 1):
+                    reason = info.get("reason", "无")
+                    strikes = info.get("strikes", 0)
+                    scope = "🌐全局" if info.get("_scope") == "global" else "🏠本群"
+                    lines.append(f"  {i}. [{scope}] {uid} - {reason} (违规{strikes}次)")
+                return self._create_reply(message_type, user_id, group_id, "\n".join(lines))
+
+            # ---------- 查看：全局黑名单 ----------
+            if cmd in ["全局黑名单", "bl全局", "globalbl"]:
+                bl = detector.get_global_blacklist()
+                if not bl:
+                    return self._create_reply(message_type, user_id, group_id,
+                        "📭 全局黑名单为空")
+                lines = [f"🌐 全局黑名单 (共{len(bl)}人):"]
+                for i, (uid, info) in enumerate(bl.items(), 1):
+                    reason = info.get("reason", "无")
+                    strikes = info.get("strikes", 0)
+                    lines.append(f"  {i}. {uid} - {reason} (违规{strikes}次)")
+                return self._create_reply(message_type, user_id, group_id, "\n".join(lines))
+
+            # ---------- 加入：本群黑名单 ----------
+            if cmd in ["加入黑名单", "bl添加"]:
+                if len(parts) < 3:
+                    return self._create_reply(message_type, user_id, group_id,
+                        "❌ 格式: !违禁词 加入黑名单 <QQ> [原因]")
+                target = parts[2]
+                reason = " ".join(parts[3:]) if len(parts) > 3 else f"管理员 {user_id} 手动添加"
+                if detector.add_to_blacklist(str(group_id), target, reason, is_global=False):
+                    asyncio.create_task(self._kick_and_notify(group_id, target,
+                        f"🚫 已被管理员加入本群黑名单\n原因: {reason}"))
+                    return self._create_reply(message_type, user_id, group_id,
+                        f"✅ 已将 {target} 加入本群黑名单并踢出")
+                return self._create_reply(message_type, user_id, group_id,
+                    f"ℹ️ {target} 已在本群黑名单中")
+
+            # ---------- 加入：全局黑名单 ----------
+            if cmd in ["加入全局黑名单", "bl全局添加", "全局加黑"]:
+                if len(parts) < 3:
+                    return self._create_reply(message_type, user_id, group_id,
+                        "❌ 格式: !违禁词 加入全局黑名单 <QQ> [原因]")
+                target = parts[2]
+                reason = " ".join(parts[3:]) if len(parts) > 3 else f"管理员 {user_id} 全局拉黑"
+                if detector.add_to_blacklist("", target, reason, is_global=True):
+                    # 直接踢出当前群（如果在本群）
+                    asyncio.create_task(self._kick_and_notify(group_id, target,
+                        f"🌐 已被管理员加入全局黑名单\n原因: {reason}"))
+                    return self._create_reply(message_type, user_id, group_id,
+                        f"✅ 已将 {target} 加入全局黑名单（所有启用群都会踢）")
+                return self._create_reply(message_type, user_id, group_id,
+                    f"ℹ️ {target} 已在全局黑名单中")
+
+            # ---------- 远程加黑：往指定群黑名单加人 ----------
+            if cmd in ["远程加黑", "远程添加黑名单", "bl远程添加"]:
+                if len(parts) < 4:
+                    return self._create_reply(message_type, user_id, group_id,
+                        "❌ 格式: !违禁词 远程加黑 <群号> <QQ> [原因]\n"
+                        "💡 例: !违禁词 远程加黑 123456789 987654321 违规")
+                target_group = parts[2]
+                target_user = parts[3]
+                reason = " ".join(parts[4:]) if len(parts) > 4 else f"管理员 {user_id} 远程拉黑"
+                if not target_group.isdigit() or not target_user.isdigit():
+                    return self._create_reply(message_type, user_id, group_id,
+                        "❌ 群号和QQ都必须是纯数字")
+                if detector.add_to_blacklist_remote(target_group, target_user, reason):
+                    # 尝试在目标群踢出
+                    asyncio.create_task(self._kick_and_notify(target_group, target_user,
+                        f"🚫 已被管理员远程加入本群黑名单\n原因: {reason}"))
+                    return self._create_reply(message_type, user_id, group_id,
+                        f"✅ 已将 {target_user} 加入群 {target_group} 黑名单并尝试踢出")
+                return self._create_reply(message_type, user_id, group_id,
+                    f"ℹ️ {target_user} 已在群 {target_group} 黑名单中")
+
+            # ---------- 远程移除：从指定群黑名单移除 ----------
+            if cmd in ["远程移黑", "远程移除黑名单", "bl远程移除"]:
+                if len(parts) < 4:
+                    return self._create_reply(message_type, user_id, group_id,
+                        "❌ 格式: !违禁词 远程移黑 <群号> <QQ>")
+                target_group = parts[2]
+                target_user = parts[3]
+                if not target_group.isdigit() or not target_user.isdigit():
+                    return self._create_reply(message_type, user_id, group_id,
+                        "❌ 群号和QQ都必须是纯数字")
+                if detector.remove_from_blacklist_remote(target_group, target_user):
+                    return self._create_reply(message_type, user_id, group_id,
+                        f"✅ 已将 {target_user} 从群 {target_group} 黑名单移除")
+                return self._create_reply(message_type, user_id, group_id,
+                    f"❌ {target_user} 不在群 {target_group} 黑名单中")
+
+            # ---------- 移出：本群黑名单 ----------
+            if cmd in ["移出黑名单", "bl移除", "bl解除"]:
+                if len(parts) < 3:
+                    return self._create_reply(message_type, user_id, group_id,
+                        "❌ 格式: !违禁词 移出黑名单 <QQ>")
+                target = parts[2]
+                if detector.remove_from_blacklist(str(group_id), target, is_global=False):
+                    return self._create_reply(message_type, user_id, group_id,
+                        f"✅ 已将 {target} 移出本群黑名单")
+                return self._create_reply(message_type, user_id, group_id,
+                    f"❌ {target} 不在本群黑名单中（也可能是全局拉黑的，用「移出全局黑名单」）")
+
+            # ---------- 移出：全局黑名单 ----------
+            if cmd in ["移出全局黑名单", "bl全局移除", "全局解黑"]:
+                if len(parts) < 3:
+                    return self._create_reply(message_type, user_id, group_id,
+                        "❌ 格式: !违禁词 移出全局黑名单 <QQ>")
+                target = parts[2]
+                if detector.remove_from_global_blacklist(target):
+                    return self._create_reply(message_type, user_id, group_id,
+                        f"✅ 已将 {target} 移出全局黑名单")
+                return self._create_reply(message_type, user_id, group_id,
+                    f"❌ {target} 不在全局黑名单中")
+
+            # ---------- 清空 ----------
+            if cmd in ["清空黑名单", "bl清空"]:
+                count = detector.clear_group_blacklist(str(group_id))
+                return self._create_reply(message_type, user_id, group_id,
+                    f"✅ 已清空本群黑名单，共 {count} 人（不影响全局黑名单）")
+
+            if cmd in ["清空全局黑名单", "bl全局清空"]:
+                count = detector.clear_global_blacklist()
+                return self._create_reply(message_type, user_id, group_id,
+                    f"✅ 已清空全局黑名单，共 {count} 人")
+            # ---------- 每群黑名单开关 ----------
+            if cmd in ["黑名单启用", "bl启用"]:
+                if message_type != "group":
+                    return self._create_reply(message_type, user_id, group_id,
+                        "❌ 只能在群聊中使用，远程请用「!违禁词 远程黑名单启用 <群号>」")
+                if detector.set_blacklist_group(str(group_id), True):
+                    return self._create_reply(message_type, user_id, group_id,
+                        f"✅ 本群黑名单已启用")
+                return self._create_reply(message_type, user_id, group_id,
+                    f"ℹ️ 本群黑名单本来就是启用的")
+
+            if cmd in ["黑名单禁用", "bl禁用"]:
+                if message_type != "group":
+                    return self._create_reply(message_type, user_id, group_id,
+                        "❌ 只能在群聊中使用，远程请用「!违禁词 远程黑名单禁用 <群号>」")
+                if detector.set_blacklist_group(str(group_id), False):
+                    return self._create_reply(message_type, user_id, group_id,
+                        f"✅ 本群黑名单已禁用")
+                return self._create_reply(message_type, user_id, group_id,
+                    f"ℹ️ 本群黑名单本来就是禁用的")
+
+            if cmd in ["黑名单恢复", "bl恢复"]:
+                if message_type != "group":
+                    return self._create_reply(message_type, user_id, group_id,
+                        "❌ 只能在群聊中使用")
+                if detector.reset_blacklist_group(str(group_id)):
+                    return self._create_reply(message_type, user_id, group_id,
+                        f"✅ 本群黑名单已恢复默认（启用）")
+                return self._create_reply(message_type, user_id, group_id,
+                    f"ℹ️ 本群本来就没单独设置过")
+
+            # ---------- 远程每群黑名单开关 ----------
+            if cmd in ["远程黑名单启用", "远程黑名单开", "bl远程启用"]:
+                if len(parts) < 3 or not parts[2].isdigit():
+                    return self._create_reply(message_type, user_id, group_id,
+                        "❌ 格式: !违禁词 远程黑名单启用 <群号>")
+                target_group = parts[2]
+                if detector.set_blacklist_group(target_group, True):
+                    return self._create_reply(message_type, user_id, group_id,
+                        f"✅ 已远程启用群 {target_group} 的黑名单")
+                return self._create_reply(message_type, user_id, group_id,
+                    f"ℹ️ 群 {target_group} 黑名单本来就是启用的")
+
+            if cmd in ["远程黑名单禁用", "远程黑名单关", "bl远程禁用"]:
+                if len(parts) < 3 or not parts[2].isdigit():
+                    return self._create_reply(message_type, user_id, group_id,
+                        "❌ 格式: !违禁词 远程黑名单禁用 <群号>")
+                target_group = parts[2]
+                if detector.set_blacklist_group(target_group, False):
+                    return self._create_reply(message_type, user_id, group_id,
+                        f"✅ 已远程禁用群 {target_group} 的黑名单")
+                return self._create_reply(message_type, user_id, group_id,
+                    f"ℹ️ 群 {target_group} 黑名单本来就是禁用的")
+
+            if cmd in ["远程黑名单恢复", "bl远程恢复"]:
+                if len(parts) < 3 or not parts[2].isdigit():
+                    return self._create_reply(message_type, user_id, group_id,
+                        "❌ 格式: !违禁词 远程黑名单恢复 <群号>")
+                target_group = parts[2]
+                if detector.reset_blacklist_group(target_group):
+                    return self._create_reply(message_type, user_id, group_id,
+                        f"✅ 群 {target_group} 黑名单已恢复默认")
+                return self._create_reply(message_type, user_id, group_id,
+                    f"ℹ️ 群 {target_group} 没单独设置过")
+
+            # ---------- 查看所有群的黑名单开关 ----------
+            if cmd in ["黑名单群状态", "bl群状态"]:
+                groups = detector.config.get("blacklist_groups", {})
+                global_on = detector.config.get("blacklist_enabled", True)
+                lines = [
+                    f"🌐 全局黑名单总开关: {'✅ 开' if global_on else '❌ 关'}",
+                    f"📋 单独设置过的群 ({len(groups)}个):",
+                ]
+                if groups:
+                    for i, (g, v) in enumerate(groups.items(), 1):
+                        status = "✅ 启用" if v else "❌ 禁用"
+                        lines.append(f"  {i}. {g}  →  {status}")
+                else:
+                    lines.append("  （无，所有群都按默认=启用）")
+                return self._create_reply(message_type, user_id, group_id, "\n".join(lines))
+            # ============================================================
+            # ============================================================
+
+            # ========== 全局开关 ==========
+            if cmd in ["全局", "global"]:
+                if len(parts) >= 3:
+                    enabled = parts[2] in ["开", "on", "开启", "启用"]
+                    return self._create_reply(message_type, user_id, group_id, detector.set_global_enabled(enabled))
+                return self._create_reply(message_type, user_id, group_id,
+                    f"全局状态: {'开启' if detector.is_global_enabled() else '关闭'}\n"
+                    f"用法: !违禁词 全局 开/关")
+
+            # ========== 启用本群 ==========
+            if cmd in ["启用", "开", "on"]:
+                if message_type != "group":
+                    return self._create_reply(message_type, user_id, group_id, "❌ 该命令只能在群聊中使用")
+                if detector.enable_group(str(group_id)):
+                    return self._create_reply(message_type, user_id, group_id, f"✅ 已启用本群（{group_id}）的违禁词检测")
+                return self._create_reply(message_type, user_id, group_id, "ℹ️ 本群已经在启用列表中")
+
+            # ========== 禁用本群 ==========
+            if cmd in ["禁用", "关", "off"]:
+                if message_type != "group":
+                    return self._create_reply(message_type, user_id, group_id, "❌ 该命令只能在群聊中使用")
+                if detector.disable_group(str(group_id)):
+                    return self._create_reply(message_type, user_id, group_id, f"✅ 已禁用本群（{group_id}）的违禁词检测")
+                return self._create_reply(message_type, user_id, group_id, "ℹ️ 本群不在启用列表中")
+
+            # ========== 启用指定群 ==========
+            if cmd in ["启用群", "enable"]:
+                if len(parts) < 3 or not parts[2].isdigit():
+                    return self._create_reply(message_type, user_id, group_id, "❌ 格式: !违禁词 启用群 <群号>")
+                target_group = parts[2]
+                if detector.enable_group(target_group):
+                    return self._create_reply(message_type, user_id, group_id, f"✅ 已启用群 {target_group} 的违禁词检测")
+                return self._create_reply(message_type, user_id, group_id, f"ℹ️ 群 {target_group} 已在启用列表中")
+
+            # ========== 禁用指定群 ==========
+            if cmd in ["禁用群", "disable"]:
+                if len(parts) < 3 or not parts[2].isdigit():
+                    return self._create_reply(message_type, user_id, group_id, "❌ 格式: !违禁词 禁用群 <群号>")
+                target_group = parts[2]
+                if detector.disable_group(target_group):
+                    return self._create_reply(message_type, user_id, group_id, f"✅ 已禁用群 {target_group} 的违禁词检测")
+                return self._create_reply(message_type, user_id, group_id, f"ℹ️ 群 {target_group} 不在启用列表中")
+
+            # ========== 查看已启用群 ==========
+            if cmd in ["群列表", "grouplist", "groups"]:
+                groups = detector.get_enabled_groups()
+                if not groups:
+                    return self._create_reply(message_type, user_id, group_id, "📭 暂无启用的群")
+                lines = [f"📋 已启用违禁词检测的群 (共{len(groups)}个):"]
+                for i, g in enumerate(groups, 1):
+                    lines.append(f"  {i}. {g}")
+                return self._create_reply(message_type, user_id, group_id, "\n".join(lines))
+
+            # ========== 状态 ==========
+            if cmd in ["状态", "status"]:
+                return self._create_reply(message_type, user_id, group_id,
+                    detector.get_status(str(group_id) if message_type == "group" else None))
+
+            # ========== 添加违禁词 ==========
+            if cmd in ["添加", "add"]:
+                if len(parts) < 3:
+                    return self._create_reply(message_type, user_id, group_id, "❌ 格式: !违禁词 添加 <词>")
+                word = parts[2]
+                if detector.add_word(word):
+                    return self._create_reply(message_type, user_id, group_id, f"✅ 已添加违禁词: {word}")
+                return self._create_reply(message_type, user_id, group_id, f"❌ 添加失败（可能已存在）")
+
+            # ========== 删除违禁词 ==========
+            if cmd in ["删除", "remove", "del"]:
+                if len(parts) < 3:
+                    return self._create_reply(message_type, user_id, group_id, "❌ 格式: !违禁词 删除 <词>")
+                word = parts[2]
+                if detector.remove_word(word):
+                    return self._create_reply(message_type, user_id, group_id, f"✅ 已删除违禁词: {word}")
+                return self._create_reply(message_type, user_id, group_id, f"❌ 未找到该词")
+
+            # ========== 违禁词列表 ==========
+            if cmd in ["列表", "list"]:
+                words = detector.list_words()
+                if not words:
+                    return self._create_reply(message_type, user_id, group_id, "📭 违禁词列表为空")
+                lines = [f"📋 违禁词列表 (共{len(words)}个):"]
+                for i, w in enumerate(words[:50], 1):
+                    lines.append(f"  {i}. {w}")
+                if len(words) > 50:
+                    lines.append(f"  ... 共 {len(words)} 个")
+                return self._create_reply(message_type, user_id, group_id, "\n".join(lines))
+
+            # ========== 禁言阈值 ==========
+            if cmd in ["阈值", "threshold"]:
+                if len(parts) < 3 or not parts[2].isdigit():
+                    return self._create_reply(message_type, user_id, group_id,
+                        f"当前阈值: {detector.config['mute_threshold']} 次\n格式: !违禁词 阈值 <次数>")
+                if detector.set_mute_threshold(int(parts[2])):
+                    return self._create_reply(message_type, user_id, group_id,
+                        f"✅ 禁言阈值已设为 {parts[2]} 次")
+                return self._create_reply(message_type, user_id, group_id, "❌ 设置失败")
+
+            # ========== 禁言时长 ==========
+            if cmd in ["时长", "duration"]:
+                if len(parts) < 3 or not parts[2].isdigit():
+                    return self._create_reply(message_type, user_id, group_id,
+                        f"当前禁言时长: {detector.config['mute_duration']}秒\n格式: !违禁词 时长 <秒>")
+                if detector.set_mute_duration(int(parts[2])):
+                    return self._create_reply(message_type, user_id, group_id,
+                        f"✅ 禁言时长已设为 {parts[2]} 秒")
+                return self._create_reply(message_type, user_id, group_id, "❌ 设置失败")
+
+            # ========== 重置时间 ==========
+            if cmd in ["重置", "reset"]:
+                if len(parts) < 3 or not parts[2].isdigit():
+                    return self._create_reply(message_type, user_id, group_id,
+                        f"当前重置时间: {detector.config['reset_hours']}小时\n格式: !违禁词 重置 <小时>")
+                if detector.set_reset_hours(int(parts[2])):
+                    return self._create_reply(message_type, user_id, group_id,
+                        f"✅ 重置时间已设为 {parts[2]} 小时")
+                return self._create_reply(message_type, user_id, group_id, "❌ 设置失败")
+
+            # ========== 撤回开关 ==========
+            if cmd in ["撤回", "delete"]:
+                if len(parts) >= 3:
+                    enabled = parts[2] in ["开", "on", "开启", "启用"]
+                else:
+                    enabled = not detector.config.get("delete_message", True)
+                if detector.set_delete_message(enabled):
+                    return self._create_reply(message_type, user_id, group_id,
+                        f"✅ 撤回消息已{'开启' if enabled else '关闭'}")
+                return self._create_reply(message_type, user_id, group_id, "❌ 设置失败")
+
+            # ========== 清除单个用户记录 ==========
+            if cmd in ["清除记录", "清除", "clear"]:
+                if len(parts) < 3:
+                    return self._create_reply(message_type, user_id, group_id, "❌ 格式: !违禁词 清除记录 <QQ>")
+                target = parts[2]
+                if detector.clear_user_record(str(group_id), target):
+                    return self._create_reply(message_type, user_id, group_id, f"✅ 已清除用户 {target} 的违禁记录")
+                return self._create_reply(message_type, user_id, group_id, f"❌ 用户 {target} 无记录")
+
+            # ========== 清空本群记录 ==========
+            if cmd in ["清空本群", "清空"]:
+                count = detector.clear_group_records(str(group_id))
+                return self._create_reply(message_type, user_id, group_id, f"✅ 已清空本群 {count} 个用户的违禁记录")
+
+            # ========== 未知命令 ==========
+            return self._create_reply(message_type, user_id, group_id, "❌ 未知命令，发送 !违禁词 查看帮助")
+            
         # ---------- 13.12 全局性格 ----------
         if text_lower.startswith(("!全局切换", "！全局切换")):
             parts = text.split()
@@ -6221,37 +6943,101 @@ class MessageHandler:
                     return self._create_reply(message_type, user_id, group_id, "📭 暂无保护账号")
         # ========== 刷屏检测管理（仅本群） ==========
         # ========== 刷屏检测管理（仅本群） ==========
+        # ========== 刷屏检测管理（支持远程操作指定群） ==========
         if text_lower.startswith(("!刷屏检测", "！刷屏检测")):
             if not is_admin:
                 return self._create_reply(message_type, user_id, group_id, "❌ 只有管理员可以管理刷屏检测")
             
-            if message_type != "group":
-                return self._create_reply(message_type, user_id, group_id, "❌ 该命令只能在群聊中使用")
-            
             parts = text.split()
+            
+            # ===== 无参数 =====
             if len(parts) < 2:
-                return self._create_reply(message_type, user_id, group_id, self.spam_detector.get_status(str(group_id)))
+                if message_type == "group" and group_id:
+                    return self._create_reply(message_type, user_id, group_id, self.spam_detector.get_status(str(group_id)))
+                return self._create_reply(message_type, user_id, group_id,
+                    "📝 刷屏检测命令:\n"
+                    "  ── 本群 ──\n"
+                    "  !刷屏检测 启用\n"
+                    "  !刷屏检测 禁用\n"
+                    "  !刷屏检测 状态\n"
+                    "  ── 远程 ──\n"
+                    "  !刷屏检测 启用群 <群号>\n"
+                    "  !刷屏检测 禁用群 <群号>\n"
+                    "  !刷屏检测 状态群 <群号>\n"
+                    "  !刷屏检测 群列表")
             
             cmd = parts[1].lower()
             
+            # ===== 本群操作（只能群聊） =====
             if cmd in ["启用", "开", "on"]:
+                if message_type != "group" or not group_id:
+                    return self._create_reply(message_type, user_id, group_id, 
+                        "❌ 本群操作只能在群聊中使用，远程请用「启用群 <群号>」")
                 if self.spam_detector.enable_group(str(group_id)):
                     return self._create_reply(message_type, user_id, group_id, f"✅ 本群刷屏检测已启用")
-                return self._create_reply(message_type, user_id, group_id, "本群已在启用列表中")
+                return self._create_reply(message_type, user_id, group_id, "ℹ️ 本群已在启用列表中")
             
             if cmd in ["禁用", "关", "off"]:
+                if message_type != "group" or not group_id:
+                    return self._create_reply(message_type, user_id, group_id, 
+                        "❌ 本群操作只能在群聊中使用，远程请用「禁用群 <群号>」")
                 if self.spam_detector.disable_group(str(group_id)):
                     return self._create_reply(message_type, user_id, group_id, f"✅ 本群刷屏检测已禁用")
-                return self._create_reply(message_type, user_id, group_id, "本群不在启用列表中")
+                return self._create_reply(message_type, user_id, group_id, "ℹ️ 本群不在启用列表中")
             
             if cmd in ["状态", "status"]:
+                if message_type != "group" or not group_id:
+                    return self._create_reply(message_type, user_id, group_id, 
+                        "❌ 本群操作只能在群聊中使用，远程请用「状态群 <群号>」")
                 return self._create_reply(message_type, user_id, group_id, self.spam_detector.get_status(str(group_id)))
             
+            # ===== 远程启用指定群 =====
+            if cmd in ["启用群", "enable"]:
+                if len(parts) < 3 or not parts[2].isdigit():
+                    return self._create_reply(message_type, user_id, group_id, "❌ 格式: !刷屏检测 启用群 <群号>")
+                target_group = parts[2]
+                if self.spam_detector.enable_group(target_group):
+                    return self._create_reply(message_type, user_id, group_id, f"✅ 已远程启用群 {target_group} 的刷屏检测")
+                return self._create_reply(message_type, user_id, group_id, f"ℹ️ 群 {target_group} 已在启用列表中")
+            
+            # ===== 远程禁用指定群 =====
+            if cmd in ["禁用群", "disable"]:
+                if len(parts) < 3 or not parts[2].isdigit():
+                    return self._create_reply(message_type, user_id, group_id, "❌ 格式: !刷屏检测 禁用群 <群号>")
+                target_group = parts[2]
+                if self.spam_detector.disable_group(target_group):
+                    return self._create_reply(message_type, user_id, group_id, f"✅ 已远程禁用群 {target_group} 的刷屏检测")
+                return self._create_reply(message_type, user_id, group_id, f"ℹ️ 群 {target_group} 不在启用列表中")
+            
+            # ===== 远程查看指定群状态 =====
+            if cmd in ["状态群", "statusgroup"]:
+                if len(parts) < 3 or not parts[2].isdigit():
+                    return self._create_reply(message_type, user_id, group_id, "❌ 格式: !刷屏检测 状态群 <群号>")
+                target_group = parts[2]
+                return self._create_reply(message_type, user_id, group_id, self.spam_detector.get_status(target_group))
+            
+            # ===== 查看所有已启用群 =====
+            if cmd in ["群列表", "grouplist", "groups"]:
+                groups = list(getattr(self.spam_detector, "enabled_groups", []) or [])
+                if not groups:
+                    return self._create_reply(message_type, user_id, group_id, "📭 暂无启用的群")
+                lines = [f"📋 已启用刷屏检测的群 (共{len(groups)}个):"]
+                for i, g in enumerate(groups, 1):
+                    lines.append(f"  {i}. {g}")
+                return self._create_reply(message_type, user_id, group_id, "\n".join(lines))
+            
+            # ===== 兜底帮助 =====
             return self._create_reply(message_type, user_id, group_id, 
                 "📝 刷屏检测命令:\n"
-                "  !刷屏检测 启用 - 本群开启\n"
-                "  !刷屏检测 禁用 - 本群关闭\n"
-                "  !刷屏检测 状态 - 查看本群状态")
+                "  ── 本群 ──\n"
+                "  !刷屏检测 启用\n"
+                "  !刷屏检测 禁用\n"
+                "  !刷屏检测 状态\n"
+                "  ── 远程 ──\n"
+                "  !刷屏检测 启用群 <群号>\n"
+                "  !刷屏检测 禁用群 <群号>\n"
+                "  !刷屏检测 状态群 <群号>\n"
+                "  !刷屏检测 群列表")
 
 
         # ---------- 13.4 刷屏 ----------
@@ -6357,7 +7143,7 @@ class MessageHandler:
                         break
             
             if duration_text:
-                duration = self._parse_duration_advanced(duration_text)
+                duration = self._parse_duration_ban(duration_text)
             
             reason = " ".join(reason_parts) if reason_parts else "连坐封禁（群封禁）"
             
@@ -6452,7 +7238,7 @@ class MessageHandler:
                     reason_parts.append(part)
                 
                 if duration_text:
-                    duration = self._parse_duration_advanced(duration_text)
+                    duration = self._parse_duration_ban(duration_text)
                 
                 reason = " ".join(reason_parts) if reason_parts else "管理员封禁"
                 
@@ -6581,7 +7367,183 @@ class MessageHandler:
             parts = text.split()
             if len(parts) >= 2:
                 return self._create_reply(message_type, user_id, group_id, f"打卡时间已更新为 {parts[1]}")
-        
+        # ========== 进群审核管理 ==========
+        if text_lower.startswith(("!审核", "！审核")):
+            if not is_admin:
+                return self._create_reply(message_type, user_id, group_id, "❌ 只有AI管理员可以操作")
+            
+            if not hasattr(self, 'group_audit') or not self.group_audit:
+                return self._create_reply(message_type, user_id, group_id, "❌ 进群审核模块未初始化")
+            
+            audit = self.group_audit
+            parts = text.split()
+            
+            if len(parts) < 2:
+                return self._create_reply(message_type, user_id, group_id,
+                    "📝 进群审核命令:\n"
+                    "  ── 开关 ──\n"
+                    "  !审核 全局 开/关          模块总开关\n"
+                    "  !审核 启用                本群加入白名单\n"
+                    "  !审核 禁用                本群移出白名单\n"
+                    "  !审核 启用群 <群号>       远程启用\n"
+                    "  !审核 禁用群 <群号>       远程禁用\n"
+                    "  !审核 群列表              查看白名单\n"
+                    "  ── 诉求 ──\n"
+                    "  !审核 添加诉求 <文本>     设置本群AI审批标准\n"
+                    "  !审核 查看诉求\n"
+                    "  !审核 删除诉求\n"
+                    "  ── 关键词 ──\n"
+                    "  !审核 添加关键词 <词>\n"
+                    "  !审核 删除关键词 <词>\n"
+                    "  !审核 关键词列表\n"
+                    "  ── 其他 ──\n"
+                    "  !审核 状态\n"
+                    "  !审核 记录")
+            
+            cmd = parts[1].lower()
+            
+            # 全局开关
+            if cmd in ["全局", "global"]:
+                if len(parts) >= 3:
+                    enabled = parts[2] in ["开", "on", "开启", "启用"]
+                    return self._create_reply(message_type, user_id, group_id, audit.set_global_enabled(enabled))
+                return self._create_reply(message_type, user_id, group_id,
+                    f"全局状态: {'开启' if audit.is_global_enabled() else '关闭'}\n用法: !审核 全局 开/关")
+            
+            # 启用本群
+            if cmd in ["启用", "开", "on"]:
+                if message_type != "group":
+                    return self._create_reply(message_type, user_id, group_id, "❌ 只能在群聊中使用")
+                gid = str(group_id)
+                if audit.enable_group(gid):
+                    # 启用后检查是否设置诉求
+                    prompt = audit.get_group_prompt(gid)
+                    if not prompt:
+                        tip = (
+                            f"✅ 已启用本群进群审核\n\n"
+                            f"⚠️ 提醒：你还没设置本群审核诉求！\n"
+                            f"建议立即设置，否则 AI 将按默认标准审核。\n\n"
+                            f"📝 设置命令:\n"
+                            f"!审核 添加诉求 <你想说给AI的审核标准>\n\n"
+                            f"💡 示例:\n"
+                            f"!审核 添加诉求 本群只收玩MC的，拒绝广告、骚扰、卖号"
+                        )
+                        return self._create_reply(message_type, user_id, group_id, tip)
+                    return self._create_reply(message_type, user_id, group_id, f"✅ 已启用本群进群审核\n本群诉求: {prompt}")
+                return self._create_reply(message_type, user_id, group_id, "ℹ️ 本群已在白名单中")
+            
+            # 禁用本群
+            if cmd in ["禁用", "关", "off"]:
+                if message_type != "group":
+                    return self._create_reply(message_type, user_id, group_id, "❌ 只能在群聊中使用")
+                if audit.disable_group(str(group_id)):
+                    return self._create_reply(message_type, user_id, group_id, f"✅ 已禁用本群进群审核")
+                return self._create_reply(message_type, user_id, group_id, "ℹ️ 本群不在白名单中")
+            
+            # 启用指定群
+            if cmd in ["启用群", "enable"]:
+                if len(parts) < 3 or not parts[2].isdigit():
+                    return self._create_reply(message_type, user_id, group_id, "❌ 格式: !审核 启用群 <群号>")
+                target = parts[2]
+                if audit.enable_group(target):
+                    prompt = audit.get_group_prompt(target)
+                    if not prompt:
+                        tip = (
+                            f"✅ 已启用群 {target} 的进群审核\n\n"
+                            f"⚠️ 提醒：该群还没设置审核诉求！\n"
+                            f"请到群 {target} 里发送:\n"
+                            f"!审核 添加诉求 <审核标准>"
+                        )
+                        return self._create_reply(message_type, user_id, group_id, tip)
+                    return self._create_reply(message_type, user_id, group_id, f"✅ 已启用群 {target}")
+                return self._create_reply(message_type, user_id, group_id, f"ℹ️ 群 {target} 已在白名单中")
+            
+            # 禁用指定群
+            if cmd in ["禁用群", "disable"]:
+                if len(parts) < 3 or not parts[2].isdigit():
+                    return self._create_reply(message_type, user_id, group_id, "❌ 格式: !审核 禁用群 <群号>")
+                if audit.disable_group(parts[2]):
+                    return self._create_reply(message_type, user_id, group_id, f"✅ 已禁用群 {parts[2]}")
+                return self._create_reply(message_type, user_id, group_id, f"ℹ️ 群 {parts[2]} 不在白名单中")
+            
+            # 群列表
+            if cmd in ["群列表", "grouplist", "groups"]:
+                groups = audit.config["enabled_groups"]
+                if not groups:
+                    return self._create_reply(message_type, user_id, group_id, "📭 白名单为空")
+                lines = [f"📋 已启用进群审核的群 (共{len(groups)}个):"]
+                for i, g in enumerate(groups, 1):
+                    has_prompt = "✅" if audit.get_group_prompt(g) else "⚠️"
+                    lines.append(f"  {i}. {g} {has_prompt}")
+                lines.append("\n💡 ✅=已设诉求 ⚠️=未设诉求")
+                return self._create_reply(message_type, user_id, group_id, "\n".join(lines))
+            
+            # 添加诉求
+            if cmd in ["添加诉求", "addprompt"]:
+                if message_type != "group":
+                    return self._create_reply(message_type, user_id, group_id, "❌ 只能在群聊中使用")
+                parts_full = text.split(maxsplit=2)
+                if len(parts_full) < 3:
+                    return self._create_reply(message_type, user_id, group_id, 
+                        "❌ 格式: !审核 添加诉求 <文本>\n"
+                        "💡 示例: !审核 添加诉求 本群只收玩MC的，拒绝广告骚扰")
+                prompt_text = parts_full[2].strip()
+                if not prompt_text:
+                    return self._create_reply(message_type, user_id, group_id, "❌ 诉求不能为空")
+                return self._create_reply(message_type, user_id, group_id, audit.set_group_prompt(str(group_id), prompt_text))
+            
+            # 查看诉求
+            if cmd in ["查看诉求", "getprompt"]:
+                if message_type != "group":
+                    return self._create_reply(message_type, user_id, group_id, "❌ 只能在群聊中使用")
+                p = audit.get_group_prompt(str(group_id))
+                return self._create_reply(message_type, user_id, group_id,
+                    f"📝 本群诉求:\n{p if p else '（未设置，AI按默认标准审核）'}")
+            
+            # 删除诉求
+            if cmd in ["删除诉求", "delprompt"]:
+                if message_type != "group":
+                    return self._create_reply(message_type, user_id, group_id, "❌ 只能在群聊中使用")
+                if audit.remove_group_prompt(str(group_id)):
+                    return self._create_reply(message_type, user_id, group_id, "✅ 已删除本群诉求")
+                return self._create_reply(message_type, user_id, group_id, "ℹ️ 本群未设置诉求")
+            
+            # 添加关键词
+            if cmd in ["添加关键词", "addkw"]:
+                if len(parts) < 3:
+                    return self._create_reply(message_type, user_id, group_id, "❌ 格式: !审核 添加关键词 <词>")
+                if audit.add_keyword(parts[2]):
+                    return self._create_reply(message_type, user_id, group_id, f"✅ 已添加审核关键词: {parts[2]}")
+                return self._create_reply(message_type, user_id, group_id, "❌ 添加失败（可能已存在）")
+            
+            # 删除关键词
+            if cmd in ["删除关键词", "delkw"]:
+                if len(parts) < 3:
+                    return self._create_reply(message_type, user_id, group_id, "❌ 格式: !审核 删除关键词 <词>")
+                if audit.remove_keyword(parts[2]):
+                    return self._create_reply(message_type, user_id, group_id, f"✅ 已删除审核关键词: {parts[2]}")
+                return self._create_reply(message_type, user_id, group_id, "❌ 未找到该词")
+            
+            # 关键词列表
+            if cmd in ["关键词列表", "kwlist"]:
+                kws = audit.config["extra_keywords"]
+                if not kws:
+                    return self._create_reply(message_type, user_id, group_id, "📭 审核关键词为空")
+                lines = [f"📋 审核关键词 (共{len(kws)}个):"]
+                for i, w in enumerate(kws, 1):
+                    lines.append(f"  {i}. {w}")
+                return self._create_reply(message_type, user_id, group_id, "\n".join(lines))
+            
+            # 状态
+            if cmd in ["状态", "status"]:
+                return self._create_reply(message_type, user_id, group_id,
+                    audit.get_status(str(group_id) if message_type == "group" else None))
+            
+            # 记录
+            if cmd in ["记录", "records"]:
+                return self._create_reply(message_type, user_id, group_id, audit.get_recent_records(10))
+            
+            return self._create_reply(message_type, user_id, group_id, "❌ 未知命令，发送 !审核 查看帮助")        
         # ---------- 13.10 骂人系统 ----------
         if text_lower.startswith("!骂人开关"):
             parts = text.split()
@@ -6788,6 +7750,15 @@ class MessageHandler:
                     status = "开启" if self.favorability.config.get("ai_enabled", True) else "关闭"
                     return self._create_reply(message_type, user_id, group_id, f"🤖 好感度AI分析状态: {status}")
             return self._create_reply(message_type, user_id, group_id, "格式: !好感度AI 开/关/状态")
+        # ========== 被踢通知 / 退群群发 ==========
+        if is_admin:
+            handled, reply = self.kick_notify.handle_command(
+                text, group_id=group_id, user_id=user_id, is_admin=True
+            )
+            if handled:
+                if reply:
+                    return self._create_reply(message_type, user_id, group_id, reply)
+                return {"_handled": True}
         # ========== 视频解析命令 ==========
         # ========== 视频解析命令 ==========
         if text_lower.startswith(("!视频解析", "！视频解析")):
@@ -6885,6 +7856,88 @@ class MessageHandler:
             print(f"[树洞错误] {e}")
             return "🌳 树洞今天打烊了，明天再来吧~"
     import subprocess
+        # 添加 _ai_draw 方法
+    async def _ai_draw(self, group_id: int, user_id: str, keyword: str) -> Dict:
+        """AI 绘画（智能搜索 + 后台防卡死版）"""
+        import time
+        
+        # 防重复执行锁
+        lock_key = f"ai_draw_{group_id}"
+        now = time.time()
+        
+        if not hasattr(self, '_ai_draw_locks'):
+            self._ai_draw_locks = {}
+        
+        if lock_key in self._ai_draw_locks:
+            if now - self._ai_draw_locks[lock_key] < 10:
+                print(f"[AI绘画] 群{group_id} 触发冷却，跳过")
+                return self._create_reply("group", user_id, group_id, "⏰ 画画有冷却时间，请稍后再试哦~")
+        self._ai_draw_locks[lock_key] = now
+        
+        # 1. 先发提示消息
+        await self.websocket.send(json.dumps({
+            "action": "send_msg",
+            "params": {
+                "message_type": "group",
+                "group_id": int(group_id),
+                "message": f"[CQ:at,qq={user_id}] 🎨 正在查阅资料并努力作画，请稍候..."
+            }
+        }))
+        
+        # 2. 核心：放到后台异步执行，绝不卡主线程
+        async def draw_task():
+            try:
+                final_prompt = keyword
+                
+                # === 第一步：联网搜索并让 Agnes 改写 Prompt ===
+                if hasattr(self, 'web_search') and self.web_search:
+                    print(f"[AI绘画] 正在联网搜索角色特征: {keyword}")
+                    search_query = f"动漫角色 {keyword} 长什么样 外貌特征 发色 服装"
+                    search_res = await self.web_search.search(search_query)
+                    
+                    if search_res and not search_res.startswith("❌"):
+                        print(f"[AI绘画] 让 AI 提取画面特征...")
+                        prompt_gen = (
+                            f"你是 AI 绘画提示词专家。请将用户的输入：【{keyword}】转化为极简的英文绘画提示词。\n"
+                            f"规则：只保留外貌特征（如发色、瞳色、发长、帽子、衣服款式），必须是 '1girl' 或 '1boy' 开头。"
+                            f"绝对不要包含任何复杂的背景故事、动作描述或设定。直接输出逗号分隔的英文关键词。"
+                        )
+                        final_prompt = await self.ai.chat(prompt_gen, use_personality=False)
+                        print(f"[AI绘画] AI 优化后的提示词: {final_prompt}")
+                    else:
+                        print(f"[AI绘画] 搜索失败，使用原始词")
+                
+                # === 第二步：调用画图接口 ===
+                from ai_draw import get_ai_draw
+                draw = get_ai_draw()
+                success, result = await draw.draw(final_prompt)
+                
+                # === 第三步：发送结果 ===
+                if success:
+                    await self.websocket.send(json.dumps({
+                        "action": "send_msg",
+                        "params": {
+                            "message_type": "group",
+                            "group_id": int(group_id),
+                            "message": f"[CQ:image,file=file:///{os.path.abspath(result)}]"
+                        }
+                    }))
+                    print(f"[AI绘画] ✅ 生成成功: {result}")
+                else:
+                    await self.websocket.send(json.dumps({
+                        "action": "send_msg",
+                        "params": {
+                            "message_type": "group",
+                            "group_id": int(group_id),
+                            "message": f"[CQ:at,qq={user_id}] ❌ 绘画失败：{result}"
+                        }
+                    }))
+            except Exception as e:
+                print(f"[AI绘画] 💥 后台任务异常: {e}")
+
+        # 启动后台任务，直接返回
+        asyncio.create_task(draw_task())
+        return None
     async def _music(self, group_id: int, user_id: str, keyword: str) -> Dict:
         """点歌 - 发详情 + 语音两条"""
         import aiohttp
@@ -7287,49 +8340,7 @@ class MessageHandler:
                 try: os.remove(pcm_path)
                 except: pass
             return None
-    async def _ai_draw(self, group_id: int, user_id: str, keyword: str) -> Dict:
-        """AI 绘画"""
-        import time
-        
-        # 防重复执行锁
-        lock_key = f"ai_draw_{group_id}"
-        now = time.time()
-        
-        if not hasattr(self, '_ai_draw_locks'):
-            self._ai_draw_locks = {}
-        
-        if lock_key in self._ai_draw_locks:
-            if now - self._ai_draw_locks[lock_key] < 5:
-                print(f"[AI绘画] 群{group_id} 触发冷却，跳过")
-                return None
-        self._ai_draw_locks[lock_key] = now
-        
-        from ai_draw import get_ai_draw
-        
-        # 只发一次提示
-        await self.websocket.send(json.dumps({
-            "action": "send_msg",
-            "params": {
-                "message_type": "group",
-                "group_id": int(group_id),
-                "message": f"[CQ:at,qq={user_id}] 正在生成图片,请稍候..."
-            }
-        }))
-        d=keyword
-        draw = get_ai_draw()
-        success, result = await draw.draw(keyword)
-        
-        if success:
-            return {
-                "action": "send_msg",
-                "params": {
-                    "message_type": "group",
-                    "group_id": int(group_id),
-                    "message": f"[CQ:image,file=file:///{os.path.abspath(result)}]"
-                }
-            }
-        else:
-            return self._create_reply("group", user_id, group_id, f"? 绘画失败：{result}")
+
     async def _get_member_name(self, group_id: int, user_id: str) -> str:
         """获取群成员昵称（优先返回群名片）"""
         try:
@@ -7757,7 +8768,46 @@ class MessageHandler:
         # 解析失败，返回默认600秒（10分钟）
         print(f"[禁言] 无法解析时长: {text}，使用默认10分钟")
         return 600
+    def _parse_duration_ban(self, text: str) -> int:
+        """解析黑名单封禁时长 —— 不限上限，0 表示永久"""
+        if not text:
+            return 0  # 默认永久
 
+        text = text.lower().strip()
+
+        # 永久
+        if text in ["永久", "forever", "∞"]:
+            return 0
+
+        # 纯数字默认秒
+        if text.isdigit():
+            return int(text)
+
+        import re
+        patterns = [
+            (r'^(\d+)\s*s$', 1),
+            (r'^(\d+)\s*秒$', 1),
+            (r'^(\d+)\s*m$', 60),
+            (r'^(\d+)\s*分$', 60),
+            (r'^(\d+)\s*分钟$', 60),
+            (r'^(\d+)\s*h$', 3600),
+            (r'^(\d+)\s*时$', 3600),
+            (r'^(\d+)\s*小时$', 3600),
+            (r'^(\d+)\s*d$', 86400),
+            (r'^(\d+)\s*天$', 86400),
+            (r'^(\d+)\s*w$', 604800),
+            (r'^(\d+)\s*周$', 604800),
+            (r'^(\d+)\s*月$', 2592000),
+            (r'^(\d+)\s*年$', 31536000),
+        ]
+
+        for pattern, multiplier in patterns:
+            match = re.match(pattern, text)
+            if match:
+                return int(match.group(1)) * multiplier  # 不限制
+        #print(f"[黑名单时长] {text} → {result}秒")
+        print(f"[黑名单] 无法解析时长: {text}，按永久处理")
+        return 0
     def _format_duration(self, seconds: int) -> str:
         """格式化时长显示"""
         if seconds <= 0:
@@ -8445,6 +9495,52 @@ class MessageHandler:
                     ("", ""),
                     ("--- 欢迎管理 ---", ""),
                     ("!欢迎开关 开/关", "全局欢迎开关"),
+                    ("", ""),
+                    ("--- 检测 ---", ""),
+                    ("!违禁词 全局 开/关", "全局总开关"),
+                    ("!违禁词 启用/禁用", "启用/禁用本群"),
+                    ("!违禁词 启用群 <群号>", "远程启用指定群"),
+                    ("!违禁词 禁用群 <群号>", "远程禁用指定群"),
+                    ("!违禁词 群列表", "查看已启用群"),
+                    ("!违禁词 添加 <词>", "添加违禁词"),
+                    ("!违禁词 删除 <词>", "删除违禁词"),
+                    ("!违禁词 列表", "查看所有违禁词"),
+                    ("!违禁词 阈值 <次数>", "设置第几次禁言(默认10)"),
+                    ("!违禁词 时长 <秒>", "设置禁言时长(默认600)"),
+                    ("!违禁词 重置 <小时>", "设置重置时间(默认3h)"),
+                    ("!违禁词 撤回 开/关", "是否撤回违禁消息"),
+                    ("!违禁词 清除记录 <QQ>", "清除单个用户记录"),
+                    ("!违禁词 清空本群", "清空本群所有记录"),
+                    ("!违禁词 状态", "查看当前状态"),
+                    ("", ""),
+                    ("--- 进群审核 ---", ""),
+                    ("!审核 全局 开/关", "模块总开关(默认关)"),
+                    ("!审核 启用/禁用", "启用/禁用本群"),
+                    ("!审核 启用群 <群号>", "远程启用"),
+                    ("!审核 禁用群 <群号>", "远程禁用"),
+                    ("!审核 群列表", "查看白名单"),
+                    ("!审核 添加诉求 <文本>", "设置本群AI审批标准"),
+                    ("!审核 查看诉求", "查看本群诉求"),
+                    ("!审核 删除诉求", "删除本群诉求"),
+                    ("!审核 添加关键词 <词>", "添加审核违禁词"),
+                    ("!审核 删除关键词 <词>", "删除审核违禁词"),
+                    ("!审核 关键词列表", "查看审核违禁词"),
+                    ("!审核 状态", "查看状态"),
+                    ("!审核 记录", "查看最近审核记录"),
+                    ("", ""),
+                    ("--- 被踢通知 ---", ""),
+                    ("被踢通知","显示被踢通知帮助菜单"),
+                    ("", ""),
+                    ("--- 刷屏检测（管理员）---", ""),
+                    ("!刷屏检测 启用", "开启本群刷屏检测"),
+                    ("!刷屏检测 禁用", "关闭本群刷屏检测"),
+                    ("!刷屏检测 状态", "查看本群刷屏检测状态"),
+                    ("!刷屏检测 启用群 <群号>", "远程开启指定群"),
+                    ("!刷屏检测 禁用群 <群号>", "远程关闭指定群"),
+                    ("!刷屏检测 状态群 <群号>", "远程查看指定群状态"),
+                    ("!刷屏检测 群列表", "查看所有已启用群"),
+                    ("!清除刷屏记录 @用户", "清除单个用户刷屏记录"),
+                    ("!清除全部刷屏记录", "清空本群全部记录（需回复「确定」）"),
                 ]
                 img = generator.create_help_page("管理员命令", "【⚙️ 管理员命令】", commands, is_admin)
                 filepath = generator.save_to_temp(img)
@@ -8487,16 +9583,11 @@ class MessageHandler:
                     ("!自动解禁 添加用户 <QQ>", "添加用户白名单"),
                     ("!自动解禁 移除用户 <QQ>", "移除用户白名单"),
                     ("", ""),
-                    ("--- 刷屏检测 ---", ""),
-                    ("!刷屏检测 启用", "开启本群刷屏检测"),
-                    ("!刷屏检测 禁用", "关闭本群刷屏检测"),
-                    ("!刷屏检测 状态", "查看本群刷屏检测状态"),
-                    ("!清除刷屏记录 @用户", "清除单个用户刷屏记录"),
-                    ("!清除全部刷屏记录", "清除本群全部刷屏记录（需确认）"),
-                    ("", ""),
+
                     ("--- 视频解析 ---", ""),
                     ("!视频解析 开/关", "开启/关闭视频解析"),
                     ("!视频解析 群发/私聊", "设置发送方式"),
+                    ("被踢通知","被踢通知帮助")
                 ]
                 img = generator.create_help_page("其他功能", "【🔧 其他功能】", commands, is_admin)
                 filepath = generator.save_to_temp(img)
@@ -8534,24 +9625,56 @@ class MessageHandler:
             traceback.print_exc()
             return self._get_text_help(message_type, user_id, group_id)
     async def _handle_ai_chat(self, text: str, user_id: str, message_type: str, group_id: str, raw_message=None) -> Dict:
-        """处理AI聊天 - 支持好感度影响，传递原始消息用于图片检测"""
         try:
-            # 获取用户好感度（全局）
             favor = None
             if hasattr(self, 'favorability') and self.favorability:
                 favor = self.favorability.get_favor(user_id)
-                print(f"[AI] 用户 {user_id} 好感度: {favor}")
-        
-            # 处理原始消息：如果是 list 则转换为字符串
-            ai_input = text  # 默认用纯文本
+
+            ai_input = text
             if raw_message:
                 if isinstance(raw_message, list):
-                    # 将消息段列表转换为字符串（保留 CQ 码）
                     ai_input = self._convert_message_to_string(raw_message)
-                    print(f"[AI调试] 原始消息已转换: {ai_input[:100]}...")
                 elif isinstance(raw_message, str):
                     ai_input = raw_message
-        
+
+            # ==============================================================
+            # 🆕 第一步：让 Agnes 做“意图判断”，决定是否联网
+            # ==============================================================
+            need_search = False
+            if hasattr(self, 'web_search') and self.web_search:
+                # 用非常极简的提示词，让它只输出 YES 或 NO
+                check_prompt = (
+                    f"你是一个意图识别助手。请判断用户的话是否需要联网搜索才能准确回答（比如问新闻、实时天气、股票、最新事件等）。\n"
+                    f"如果不需要联网（比如普通的闲聊、问你是谁、算个数学题等），请回复 NO。\n"
+                    f"如果需要联网，请回复 YES。\n"
+                    f"用户的话：{text}\n"
+                    f"请只输出 YES 或 NO，不要任何多余的解释。"
+                )
+                
+                # 请求 Agnes
+                check_res = await self.ai.chat(check_prompt, use_personality=False)
+                
+                # 看看它是不是说了 YES
+                if check_res and "YES" in check_res.upper():
+                    need_search = True
+                    print(f"[AI智能路由] Agnes 判断需要联网: {text}")
+
+            # ==============================================================
+            # 🆕 第二步：如果判断需要联网，就去搜
+            # ==============================================================
+            if need_search:
+                search_result = await self.web_search.search(text)
+                if search_result and not search_result.startswith("❌"):
+                    # 强制注入搜索结果
+                    ai_input = (
+                        f"【系统提示：这是为你实时联网获取的信息，请结合以下内容回答用户】\n"
+                        f"{search_result}\n\n"
+                        f"【用户刚才说】\n{text}"
+                    )
+                    print(f"[AI智能路由] 搜索成功，已注入背景知识")
+            # ==============================================================
+
+            # 第三步：正式回答
             reply_text = await self.ai.chat(
                 ai_input,
                 use_personality=True,
@@ -8560,7 +9683,6 @@ class MessageHandler:
                 favor=favor
             )
         
-            # 保存对话到记忆
             if user_id and reply_text and "AI服务暂时不可用" not in reply_text:
                 if hasattr(self.ai, 'memory_module'):
                     self.ai.memory_module.add_conversation(user_id, text, reply_text)
@@ -10994,25 +12116,32 @@ def main():
         print("[看门狗] 已独立启动")
     
     _check()
-    # ===== Ollama 模式提示 =====
-    # ===== Ollama 模式提示 =====
-    _ollama_key = os.environ.get("OLLAMA_API_KEY", "").strip()
+
+    # ===== AI 引擎模式提示 =====
+    _api_key = os.environ.get("api", "").strip()
+    _api_url = os.environ.get("api_url", "https://api.agnes-ai.cn/v1").strip()
+    
     print("=" * 50)
-    if _ollama_key:
-        _masked = _ollama_key[:8] + "..." + _ollama_key[-6:]
-        print(f"🧠 Ollama: ☁️  云端模式 (密钥 {_masked})")
-        print("   💡 想切回本地？删除环境变量 OLLAMA_API_KEY 后重开窗口")
+    if _api_key:
+        _masked = _api_key[:8] + "..." + _api_key[-6:]
+        print(f"🧠 AI 引擎: ☁️  API 云端模式")
+        print(f"   🔗 接口地址: {_api_url}")
+        print(f"   🔑 当前密钥: {_masked}")
+        print("   💡 想换接口？修改环境变量 'api_url' 后重开窗口")
     else:
-        print("🧠 Ollama: 💻 本地模式")
-        print("   💡 想用云端？设置环境变量 OLLAMA_API_KEY")
+        print("🧠 AI 引擎: ⚠️ 未检测到 API 密钥")
+        print("   💡 请设置环境变量 'api' 才能正常使用 AI 功能")
         print("   ┌─────────────────────────────────────────")
         print("   │ 永久设置（推荐，重开窗口生效）:")
-        print("   │   setx OLLAMA_API_KEY \"你的密钥\"")
+        print("   │   setx api \"你的密钥\"")
+        print("   │   setx api_url \"https://api.agnes-ai.cn/v1\"")
         print("   │")
         print("   │ 临时设置（只对当前窗口有效）:")
-        print("   │   $env:OLLAMA_API_KEY = \"你的密钥\"")
+        print("   │   $env:api = \"你的密钥\"")
+        print("   │   $env:api_url = \"https://api.agnes-ai.cn/v1\"")
         print("   └─────────────────────────────────────────")
     print("=" * 50)
+    
     print("=" * 50)
     print("🤖 XP12 机器人启动器")
     print("=" * 50)

@@ -9,8 +9,8 @@ import builtins
 from datetime import datetime
 from typing import Dict, Optional, List
 import asyncio
-import aiohttp  # 🆕 加上这一行
-import shutil   # 🆕 顺便加上 shutil（convert_to_amr 里用了）
+import aiohttp
+import shutil   # convert_to_amr 里用了
 
 # ==================== 授权验证 ====================
 def _verify_module():
@@ -68,100 +68,150 @@ FFmpeg 下载地址（用于音频转语音）：
 
 
 class MusicService:
-    """音乐服务类"""
-    
+    """音乐服务类（QQ 音乐底层接口直连，无需第三方 API）"""
+
     def __init__(self):
-        self.apis = {
-            "qq": {
-                "name": "QQ音乐",
-                "url": "https://a.aa.cab/qq.music",
-                "params": {"msg": "", "num": 1, "n": 1, "type": 2}  # ← 改成 2（普通品质）
-            }
-        }
-        
-        self.source_order = ["qq"]
         self.download_dir = "data/temp_music"
         os.makedirs(self.download_dir, exist_ok=True)
-    
-    async def search(self, keyword: str, source: str = None) -> dict:
-        """搜索歌曲"""
-        if source:
-            return await self._search_one(keyword, source)
-        
-        for src in self.source_order:
-            result = await self._search_one(keyword, src)
-            if result.get("success"):
-                return result
-        return {"success": False, "msg": "所有音乐源都无法访问"}
-    
-    async def _search_one(self, keyword: str, source: str) -> dict:
-        """在单个源搜索"""
-        config = self.apis.get(source)
-        if not config:
-            return {"success": False, "msg": f"未知源: {source}"}
-        
-        params = config["params"].copy()
-        params["msg"] = keyword
-        
+
+    # ---------------- curl 工具 ----------------
+    async def _curl_get_json(self, url: str, timeout: int = 15) -> dict:
+        """用 Windows 自带 curl.exe 异步 GET 并解析 JSON"""
+        cmd = [
+            "curl.exe", "-s",
+            "-A", "Mozilla/5.0",
+            url,
+        ]
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(config["url"], params=params, timeout=15) as resp:
-                    if resp.status == 200:
-                        # 尝试解析 JSON
-                        try:
-                            data = await resp.json(content_type=None)
-                        except:
-                            text = await resp.text()
-                            data = json.loads(text)
-                        
-                        # 打印调试信息，方便排查
-                        print(f"[点歌调试] API返回: code={data.get('code')}")
-                        
-                        # 关键：检查返回的 code 是否为 0
-                        if data.get("code") == 0:
-                            # 获取 data 字段中的歌曲信息
-                            song_data = data.get("data", {})
-                            if song_data:
-                                music_url = song_data.get("music", "")
-                                # 确保获取到音乐链接
-                                if music_url:
-                                    return {
-                                        "success": True,
-                                        "source": config["name"],
-                                        "name": song_data.get("song", "未知"),
-                                        "artist": song_data.get("singer", "未知"),
-                                        "url": music_url,
-                                        "cover": song_data.get("cover", "")
-                                    }
-                                else:
-                                    return {"success": False, "msg": "未获取到播放链接"}
-                            else:
-                                return {"success": False, "msg": "未找到相关歌曲"}
-                        else:
-                            return {"success": False, "msg": data.get("msg", "请求失败")}
-                    else:
-                        return {"success": False, "msg": f"HTTP {resp.status}"}
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            text = stdout.decode("utf-8", errors="replace").strip()
+            if not text:
+                raise ValueError("curl 返回为空")
+            return json.loads(text)
         except asyncio.TimeoutError:
-            return {"success": False, "msg": "请求超时"}
+            raise
+        except json.JSONDecodeError:
+            raise ValueError("响应不是合法 JSON")
+
+    # ---------------- 搜索 ----------------
+    async def search(self, keyword: str, source: str = None) -> dict:
+        """QQ 音乐底层接口搜索（无需第三方 API）"""
+        try:
+            # 1. 搜索：取第一首，提取 songname、singer[0].name、songmid
+            search_url = (
+                "https://c.y.qq.com/soso/fcgi-bin/client_search_cp"
+                f"?p=1&n=3&w={keyword}&format=json"
+            )
+            data = await self._curl_get_json(search_url, timeout=15)
+            song_list = ((data.get("data") or {}).get("song") or {}).get("list") or []
+            if not song_list:
+                return {"success": False, "msg": "未找到相关歌曲"}
+
+            song = song_list[0]
+            song_name = song.get("songname", "未知")
+            singers = song.get("singer") or []
+            artist = singers[0].get("name", "未知") if singers else "未知"
+            songmid = song.get("songmid", "")
+            if not songmid:
+                return {"success": False, "msg": "未获取到歌曲ID"}
+
+            # 提取专辑 mid，拼高清封面链接
+            albummid = song.get("albummid", "")
+            cover = f"https://y.gtimg.cn/music/photo_new/T002R300x300M000{albummid}.jpg" if albummid else ""
+
+            # 2. 获取直链（构造 vkey 请求，用 aiohttp params 字典传参，避免 JSON 空格/引号编码问题）
+            vkey_payload = {
+                "req_0": {
+                    "module": "vkey.GetVkeyServer",
+                    "method": "CgiGetVkey",
+                    "param": {
+                        "guid": "3581234567",
+                        "songmid": [songmid],
+                        "songtype": [0],
+                        "uin": "0",
+                        "loginflag": 1,
+                        "platform": "20",
+                    },
+                },
+                "comm": {"uin": 0, "format": "json", "ct": 24, "cv": 0},
+            }
+            vkey_params = {
+                "format": "json",
+                "data": json.dumps(vkey_payload, separators=(",", ":")),
+            }
+            vkey_url = "https://u.y.qq.com/cgi-bin/musicu.fcg"
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    vkey_url,
+                    params=vkey_params,
+                    headers={"User-Agent": "Mozilla/5.0"},
+                    timeout=aiohttp.ClientTimeout(total=15),
+                ) as resp:
+                    if resp.status != 200:
+                        return {"success": False, "msg": f"vkey 接口 HTTP {resp.status}"}
+                    vkey = await resp.json(content_type=None)
+
+            midurlinfo = ((vkey.get("req_0") or {}).get("data") or {}).get("midurlinfo") or []
+            if not midurlinfo:
+                return {"success": False, "msg": "未获取到播放链接"}
+
+            purl = midurlinfo[0].get("purl", "")
+            if not purl:
+                return {"success": False, "msg": "该歌曲没有版权或需要 VIP"}
+
+            direct_url = f"http://aqqmusic.tc.qq.com/{purl}"
+
+            # 3. 返回
+            return {
+                "success": True,
+                "name": song_name,
+                "artist": artist,
+                "url": direct_url,
+                "cover": cover,
+                "download_url": direct_url,
+            }
+        except asyncio.TimeoutError:
+            return {"success": False, "msg": "QQ音乐连接超时"}
         except Exception as e:
             print(f"[点歌错误] {e}")
             return {"success": False, "msg": str(e)}
-    
+
     async def download_music(self, url: str, filename: str) -> str:
-        """下载音乐文件"""
+        """下载音乐文件（curl.exe 直连 QQ 音乐 CDN）"""
         filepath = os.path.join(self.download_dir, filename)
-        
+
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, timeout=60) as resp:
-                    if resp.status == 200:
-                        with open(filepath, 'wb') as f:
-                            f.write(await resp.read())
-                        print(f"[下载] 成功: {filepath}")
-                        return filepath
-                    else:
-                        print(f"[下载] HTTP {resp.status}")
-                        return None
+            cmd = [
+                "curl.exe", "-s", "-L",
+                "-A", "Mozilla/5.0",
+                "-o", filepath,
+                "--max-time", "60",
+                url,
+            ]
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _, stderr = await proc.communicate()
+            if proc.returncode != 0:
+                err = (stderr or b"").decode("utf-8", errors="replace").strip()
+                print(f"[下载] curl 失败 (code={proc.returncode}): {err}")
+                return None
+
+            size = os.path.getsize(filepath) if os.path.exists(filepath) else 0
+            if size < 5 * 1024:
+                print(f"[下载] 文件太小（{size} bytes），疑似非音频内容")
+                os.remove(filepath)
+                return None
+
+            print(f"[下载] 成功: {filepath} ({size} bytes)")
+            return filepath
         except Exception as e:
             print(f"[下载] 失败: {e}")
             return None

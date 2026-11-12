@@ -1915,6 +1915,7 @@ class AntiRecallLogger:
         self.message_cache: Dict[str, Dict] = {}
         self.id_mapping: Dict[str, str] = {}
         self.image_cache = None
+        self.media_cache: Dict[str, Dict] = {}  # {message_id: {"image": "path", "voice": "path"}}
         # ==================== 冷却机制 ====================
         self.revenge_cooldown = 1
         self.group_cooldowns: Dict[str, float] = {}
@@ -4023,6 +4024,11 @@ class MessageHandler:
             self.auto_rejoin = None
         self.last_reply_time = {}
         self.reply_cooldown = 1  # 2秒冷却
+        # B站视频搜索：交互式选择（user_id -> {"videos": [...], "group_id": ..., "time": ...}）
+        self._bili_waiting = {}
+        # B站视频搜索：双重限流冷却（user_id / group_id -> 上次触发时间戳）
+        self._bili_user_cooldown = {}
+        self._bili_group_cooldown = {}
         # ... 其他代码 ...
         self.anti_recall = AntiRecallLogger()
         # 好感度系统（传入AI实例）
@@ -5578,7 +5584,40 @@ class MessageHandler:
         import re
         text = re.sub(r'[\u200e\u200f\u2066\u2067\u2068\u2069]', '', text)
         text_lower = text.strip().lower()
-        
+
+        # ============================================================
+        # 🆕 B站视频搜索 - 数字选择拦截（1-10）放在最前
+        # ============================================================
+        if (message_type == "group" and text.isdigit() and 1 <= int(text) <= 10
+                and hasattr(self, "_bili_waiting") and str(user_id) in self._bili_waiting):
+            # 双重限流（管理员豁免）
+            cd = self._bili_check_cooldown(group_id, user_id, message_type)
+            if not cd["pass"]:
+                return self._create_reply(message_type, user_id, group_id, cd["reply"])
+            print(f"[B站视频] 用户 {user_id} 选择视频 {text}")
+            return await self._bili_pick(group_id, user_id, int(text))
+
+        # ============================================================
+        # 🆕 搜视频 命令
+        # ============================================================
+        if text_lower.startswith(("搜视频", "!搜视频", "！搜视频")):
+            if message_type != "group":
+                return self._create_reply(message_type, user_id, group_id, "❌ 该命令只能在群聊中使用")
+            # 提取关键词（支持 !搜视频 / ！搜视频 / 搜视频 三种前缀）
+            kw = text
+            for p in ("!搜视频", "！搜视频", "搜视频"):
+                if kw.startswith(p):
+                    kw = kw[len(p):]
+                    break
+            kw = kw.strip()
+
+            # ===== 双重限流（按用户 + 按群聊，30 秒冷却，AI 管理员豁免）=====
+            cd = self._bili_check_cooldown(group_id, user_id, message_type)
+            if not cd["pass"]:
+                return self._create_reply(message_type, user_id, group_id, cd["reply"])
+
+            return await self._bili_search(group_id, user_id, kw)
+
         # ============================================================
         # 🆕 确认命令放最前面，直接处理
         # ============================================================
@@ -7825,31 +7864,33 @@ class MessageHandler:
         return None
     # ==================== 辅助方法 ====================
     async def _get_treehole(self) -> str:
-        """获取树洞内容 - 新版API（纯文本）"""
+        """获取树洞内容 - 一言 API（hitokoto）"""
         try:
             import aiohttp
-            
+
             headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                              "AppleWebKit/537.36 (KHTML, like Gecko) "
+                              "Chrome/120.0.0.0 Safari/537.36"
             }
-            
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
-                async with session.get("https://a.aa.cab/yy.api", headers=headers) as resp:
+
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=10)
+            ) as session:
+                async with session.get(
+                    "https://v1.hitokoto.cn/?c=k", headers=headers
+                ) as resp:
                     if resp.status != 200:
                         return f"🌳 树洞暂时睡着了（HTTP {resp.status}），稍后再试试吧~"
-                    
-                    # 直接获取文本内容（纯文本，不是JSON）
-                    text = await resp.text()
-                    
-                    # 去除首尾空白
-                    content = text.strip()
-                    
+
+                    data = await resp.json(content_type=None)
+                    content = (data.get("hitokoto") or "").strip()
+
                     if not content:
                         return "🌳 树洞今天空空如也，什么也没留下~"
-                    
-                    # 直接返回内容
-                    return f"📖 {content}"
-                    
+
+                    return f"🌳 {content}"
+
         except asyncio.TimeoutError:
             return "🌳 树洞响应超时了，可能太挤了……"
         except Exception as e:
@@ -7898,10 +7939,9 @@ class MessageHandler:
                     if search_res and not search_res.startswith("❌"):
                         print(f"[AI绘画] 让 AI 提取画面特征...")
                         prompt_gen = (
-                            f"请根据以下搜索到的信息，提取出【{keyword}】的外貌特征（发色、服装、性别等），"
-                            f"并写成一段适合用于 AI 绘画的英文 Prompt。"
-                            f"要求：直接输出英文 Prompt，包含 'anime style, masterpiece, best quality' 等画质词，不要任何废话。\n"
-                            f"搜索信息：{search_res}"
+                            f"你是 AI 绘画提示词专家。请将用户的输入：【{keyword}】转化为极简的英文绘画提示词。\n"
+                            f"规则：只保留外貌特征（如发色、瞳色、发长、帽子、衣服款式），必须是 '1girl' 或 '1boy' 开头。"
+                            f"绝对不要包含任何复杂的背景故事、动作描述或设定。直接输出逗号分隔的英文关键词。"
                         )
                         final_prompt = await self.ai.chat(prompt_gen, use_personality=False)
                         print(f"[AI绘画] AI 优化后的提示词: {final_prompt}")
@@ -7939,6 +7979,333 @@ class MessageHandler:
         # 启动后台任务，直接返回
         asyncio.create_task(draw_task())
         return None
+
+    # ==================== B站视频搜索 ====================
+    def _bili_send_bg(self, group_id, user_id, text):
+        """B站功能专用：按当前模式发送群消息（后台任务调用）"""
+        text = f"[CQ:at,qq={user_id}] {text}"
+        if hasattr(self, "_official_mode") and self._official_mode:
+            asyncio.create_task(self._bili_send_official(group_id, text))
+        else:
+            asyncio.create_task(self._bili_send_napcat(group_id, text))
+
+    async def _bili_send_official(self, group_id, text):
+        try:
+            from official_bot_adapter import send_group_text
+            ok, err = await send_group_text(int(group_id), text)
+            if not ok:
+                print(f"[B站视频] 官方发送失败: {err}")
+        except Exception as e:
+            print(f"[B站视频] 官方发送异常: {e}")
+
+    async def _bili_send_napcat(self, group_id, text):
+        import aiohttp
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    "http://127.0.0.1:3000/send_group_msg",
+                    json={"group_id": int(group_id), "message": text},
+                    timeout=aiohttp.ClientTimeout(total=30),
+                ) as resp:
+                    if resp.status != 200:
+                        print(f"[B站视频] NapCat 发送失败 HTTP {resp.status}: {await resp.text()}")
+        except Exception as e:
+            print(f"[B站视频] NapCat 发送异常: {e}")
+
+    def _bili_check_cooldown(self, group_id, user_id, message_type) -> dict:
+        """B站双重限流检查（按用户 + 按群聊，管理员豁免）。
+        返回 {"pass": True} 表示通过；否则 {"pass": False, "reply": 应回复的话术}。
+        通过时已刷新两个字典的时间戳。
+        """
+        if self.admin_manager.is_admin(user_id):
+            return {"pass": True}
+
+        if not hasattr(self, "_bili_user_cooldown"):
+            self._bili_user_cooldown = {}
+        if not hasattr(self, "_bili_group_cooldown"):
+            self._bili_group_cooldown = {}
+
+        current_time = time.time()
+        user_id_str = str(user_id)
+        group_id_str = str(group_id) if group_id else ""
+
+        # 用户冷却检查
+        if user_id_str in self._bili_user_cooldown:
+            elapsed = current_time - self._bili_user_cooldown[user_id_str]
+            if elapsed < 30:
+                remain = int(30 - elapsed)
+                return {"pass": False, "reply": f"⏰ 你点视频太快啦，请 {remain} 秒后再试~"}
+
+        # 群聊冷却检查（如果是群聊）
+        if group_id_str and group_id_str in self._bili_group_cooldown:
+            elapsed = current_time - self._bili_group_cooldown[group_id_str]
+            if elapsed < 30:
+                return {"pass": False, "reply": "⏰ 本群视频请求太频繁啦，请稍后再试~"}
+
+        # 通过检查，立即记录冷却时间
+        self._bili_user_cooldown[user_id_str] = current_time
+        if group_id_str:
+            self._bili_group_cooldown[group_id_str] = current_time
+        return {"pass": True}
+
+    async def _bili_search(self, group_id, user_id, keyword):
+        """搜视频 <关键词>：搜索B站 → 发序号列表 → 等待用户数字选择"""
+        keyword = keyword.strip()
+        if not keyword:
+            return self._create_reply("group", user_id, group_id,
+                "❌ 请指定关键词\n示例: 搜视频 猫meme")
+
+        self._bili_send_bg(group_id, user_id, f"🔍 正在搜索B站视频「{keyword}」...")
+
+        async def search_task():
+            try:
+                import re as _re
+                # B站搜索走 bilibili_api，底层用 curl_cffi 客户端规避 412 风控
+                import bilibili_api
+                from bilibili_api.search import SearchObjectType
+                bilibili_api.select_client("curl_cffi")
+
+                res = await bilibili_api.search.search_by_type(
+                    keyword,
+                    search_type=SearchObjectType.VIDEO,
+                    page=1,
+                    page_size=10,
+                )
+                # 注意：search_by_type 的返回是扁平 dict，结果在 res["result"]（不是 res["data"]["result"]）
+                results = (res or {}).get("result") or []
+
+                items = []
+                for v in results[:10]:
+                    # 去掉 B 站返回里的 <em> 高亮标签
+                    title = _re.sub(r"</?em[^>]*>", "", (v.get("title") or "未知标题"))
+                    # author 是纯字符串（UP主名）
+                    author = v.get("author") or "未知UP主"
+                    bvid = v.get("bvid", "")
+                    link = v.get("arcurl") or (f"https://www.bilibili.com/video/{bvid}" if bvid else "")
+                    # duration 格式为 "mm:ss" 或 "h:mm:ss"
+                    dur = 0
+                    m = _re.match(r"^(?:(\d+):)?(\d+):(\d+)$", str(v.get("duration", "")))
+                    if m:
+                        h, mn, sec = m.group(1) or "0", m.group(2), m.group(3)
+                        dur = int(h) * 3600 + int(mn) * 60 + int(sec)
+                    items.append({"title": title, "author": author, "duration": dur, "bvid": bvid, "link": link})
+
+                if not items:
+                    self._bili_send_bg(group_id, user_id, "📭 没找到相关视频，换个词试试~")
+                    return
+
+                if not hasattr(self, "_bili_waiting"):
+                    self._bili_waiting = {}
+                self._bili_waiting[str(user_id)] = {"videos": items, "group_id": group_id, "time": time.time()}
+
+                lines = [f"📺 「{keyword}」找到 {len(items)} 个结果："]
+                for i, v in enumerate(items, 1):
+                    lines.append(f"{i}. {v['title']} ({v['author']})")
+                lines.append("请回复数字 1-10 选择要下载的视频 (60秒内有效)")
+                self._bili_send_bg(group_id, user_id, "\n".join(lines))
+            except Exception as e:
+                print(f"[B站视频] 搜索失败: {e}")
+                self._bili_send_bg(group_id, user_id, f"❌ B站搜索失败: {e}")
+
+        asyncio.create_task(search_task())
+        return {"_handled": True}
+
+    async def _bili_pick(self, group_id, user_id, index):
+        """用户回复数字 1-10：判断时长 → 发链接或后台下载发视频"""
+        entry = getattr(self, "_bili_waiting", {}).get(str(user_id))
+        if not entry:
+            return self._create_reply("group", user_id, group_id,
+                "⏰ 没有在等待视频选择（请先发「搜视频 关键词」，或已超时）")
+        if time.time() - entry.get("time", 0) > 60:
+            del self._bili_waiting[str(user_id)]
+            return self._create_reply("group", user_id, group_id,
+                "⏰ 选择已超时，请重新发送「搜视频 关键词」")
+
+        items = entry.get("videos", [])
+        if index < 1 or index > len(items):
+            return self._create_reply("group", user_id, group_id,
+                f"❌ 请输入 1-{len(items)} 之间的数字")
+
+        video = items[index - 1]
+        del self._bili_waiting[str(user_id)]
+
+        duration = video.get("duration", 0)
+        title = video.get("title", "视频")
+        link = video.get("link") or (f"https://www.bilibili.com/video/{video.get('bvid')}" if video.get("bvid") else "")
+
+        if duration > 600:
+            self._bili_send_bg(group_id, user_id,
+                f"🎬 《{title}》时长 {duration // 60}分{duration % 60}秒（>10分钟），不下载，直接看：\n{link}")
+            return {"_handled": True}
+
+        self._bili_send_bg(group_id, user_id, f"⏬ 正在下载《{title}》...")
+
+        async def download_task():
+            try:
+                os.makedirs("data/temp_video", exist_ok=True)
+                target = "data/temp_video"
+                import shutil
+                ffmpeg = os.path.join("ffmpeg.exe") if os.path.exists("ffmpeg.exe") else shutil.which("ffmpeg")
+                if not ffmpeg:
+                    print("[B站视频] 未找到 ffmpeg，无法合并音视频")
+                    self._bili_send_bg(group_id, user_id, "❌ 缺少 ffmpeg，无法合并音视频，请安装后重试")
+                    return
+                # ffmpeg_location 只需给到可执行文件的目录即可；项目内 ffmpeg.exe 直接用其所在目录
+                ffmpeg_dir = "." if os.path.exists("ffmpeg.exe") else os.path.dirname(ffmpeg)
+
+                # ===== 定位 yt-dlp：优先 项目目录/scripts/yt-dlp.py，其次 PATH =====
+                def _find_ytdlp():
+                    import subprocess
+                    local = os.path.join("scripts", "yt-dlp.py")
+                    if os.path.exists(local):
+                        return [sys.executable, local]
+                    which = subprocess.which("yt-dlp")
+                    if which:
+                        return [which]
+                    import site
+                    for p in (site.getusersitepackages(), *site.getsitepackages()):
+                        c = os.path.join(p, "yt-dlp", "yt_dlp", "__main__.py")
+                        if os.path.exists(c):
+                            return [sys.executable, c]
+                    c = os.path.join("yt-dlp", "yt_dlp", "__main__.py")
+                    if os.path.exists(c):
+                        return [sys.executable, c]
+                    return None
+
+                ytdlp_cmd = _find_ytdlp()
+                if not ytdlp_cmd:
+                    print("[B站视频] 未找到 yt-dlp，请安装: pip install yt-dlp")
+                    self._bili_send_bg(group_id, user_id, "❌ 未安装 yt-dlp，无法下载视频")
+                    return
+
+                # 预生成文件名（纯计算，不产生 I/O）
+                import hashlib
+                safe = re.sub(r'[\\/:*?"<>|]', '', title).strip() or "video"
+                base_name = f"{safe}_{hashlib.md5(str(video.get('bvid', '')).encode()).hexdigest()[:8]}"
+                out_tmpl = os.path.join(target, f"{base_name}.%(ext)s").replace("\\", "/")
+
+                # ===== 组装 yt-dlp 命令：--newline 让进度按行输出，便于异步流式读取 =====
+                target_abs = os.path.abspath(target)
+                ytdlp_args = [
+                    *ytdlp_cmd,
+                    "--newline",
+                    "--no-playlist",
+                    "-f", "bestvideo+bestaudio/best",
+                    "--merge-output-format", "mp4",
+                    "--ffmpeg-location", ffmpeg_dir,
+                    "-o", out_tmpl,
+                    link or video.get("bvid", ""),
+                ]
+                print(f"[B站视频] 开始异步下载: {link or video.get('bvid')}")
+
+                # ===== 异步子进程下载（不阻塞事件循环，机器人仍可响应其他消息） =====
+                proc = await asyncio.create_subprocess_exec(
+                    *ytdlp_args,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.STDOUT,
+                    cwd=target_abs,
+                )
+                last_progress = ""
+                async for raw_line in proc.stdout:
+                    line = raw_line.decode("utf-8", errors="replace").strip()
+                    if not line:
+                        continue
+                    # 只打印有实质变化的进度，避免日志刷屏
+                    if line != last_progress:
+                        # 每 10 秒最多打一条进度，防止日志爆炸
+                        print(f"[B站视频] [download] {line}")
+                        last_progress = line
+                await proc.wait()
+
+                if proc.returncode != 0:
+                    print(f"[B站视频] yt-dlp 退出码 {proc.returncode}，下载失败")
+                    self._bili_send_bg(group_id, user_id, "❌ 视频下载失败，请稍后再试")
+                    return
+
+                # 找下载产物（同目录下最新的非 .part 文件）
+                try:
+                    files = [
+                        os.path.join(target_abs, f)
+                        for f in os.listdir(target_abs)
+                        if f.startswith(base_name) and not f.endswith(".part")
+                    ]
+                    final = max(files, key=os.path.getsize) if files else None
+                except OSError:
+                    final = None
+                if not final or not os.path.exists(final):
+                    print(f"[B站视频] 下载后未找到文件: {base_name}")
+                    self._bili_send_bg(group_id, user_id, "❌ 下载失败，请稍后再试")
+                    return
+
+                abs_path = os.path.abspath(final)
+                print(f"[B站视频] 下载完成: {abs_path} ({os.path.getsize(abs_path)} bytes)")
+
+                # ===== 发送视频（NapCat 数组格式，retcode 成功才删本地文件） =====
+                # NapCat 规定：message 里的 video 段必须是唯一的段，不能和 @ / 文字混在一起
+                # 因此分两条发：先发文本提示，再发纯视频
+                import aiohttp
+                send_url = "http://127.0.0.1:3000/send_group_msg"
+                abs_path_unix = abs_path.replace("\\", "/")
+
+                # --- 第 1 条：文本提示（@用户 + 文字）---
+                text_payload = {
+                    "group_id": int(group_id),
+                    "message": f"[CQ:at,qq={user_id}] ✅ 视频下载好了，请查收~",
+                }
+                try:
+                    async with aiohttp.ClientSession() as session:
+                        async with session.post(
+                            send_url, json=text_payload,
+                            timeout=aiohttp.ClientTimeout(total=30),
+                        ) as resp:
+                            if resp.status != 200:
+                                print(f"[B站视频] 文本提示发送失败 HTTP {resp.status}: {await resp.text()}")
+                except Exception as e:
+                    print(f"[B站视频] 文本提示发送异常: {e}")
+
+                # --- 第 2 条：纯视频（message 里只有 video 一个段）---
+                video_segment = {"type": "video", "data": {"file": abs_path_unix}}
+                video_payload = {
+                    "group_id": int(group_id),
+                    "message": [video_segment],
+                }
+                send_ok = False
+                try:
+                    async with aiohttp.ClientSession() as session:
+                        async with session.post(
+                            send_url,
+                            json=video_payload,
+                            timeout=120,  # 视频大，超时设长点
+                        ) as resp:
+                            if resp.status == 200:
+                                res_json = await resp.json()
+                                if isinstance(res_json, dict) and res_json.get("retcode") == 0:
+                                    print("[B站视频] ✅ 发送成功")
+                                    send_ok = True
+                                else:
+                                    print(f"[B站视频] ❌ 发送失败: {res_json}")
+                            else:
+                                print(f"[B站视频] ❌ HTTP 失败: {resp.status}")
+                except Exception as e:
+                    print(f"[B站视频] ❌ 发送异常: {e}")
+
+                # 只有发送成功才删本地文件，失败保留用于排查
+                if send_ok:
+                    try:
+                        if os.path.exists(abs_path):
+                            os.remove(abs_path)
+                            print(f"[B站视频] 已清理: {abs_path}")
+                    except Exception as e:
+                        print(f"[B站视频] 清理文件失败: {e}")
+                else:
+                    print(f"[B站视频] 发送失败，保留本地文件: {abs_path}")
+            except Exception as e:
+                print(f"[B站视频] 下载异常: {e}")
+                self._bili_send_bg(group_id, user_id, f"❌ 视频下载失败: {e}")
+
+        asyncio.create_task(download_task())
+        return {"_handled": True}
+
     async def _music(self, group_id: int, user_id: str, keyword: str) -> Dict:
         """点歌 - 发详情 + 语音两条"""
         import aiohttp
@@ -7981,118 +8348,138 @@ class MessageHandler:
             artist = result.get('artist')
             music_url = result.get('url')
             cover_url = result.get('cover')
-            download_url = result.get('download_url')
 
             import re
-            safe_name = re.sub(r'[\\/*?:"<>|]', '', song_name)
-            filename = f"{safe_name}.m4a"
+            # 文件名 = "{歌名} - {歌手}.m4a"，并清理 Windows 非法字符（\ / : * ? " < > |）
+            safe_name = re.sub(r'[\\/:*?"<>|]', '', song_name).strip()
+            safe_artist = re.sub(r'[\\/:*?"<>|]', '', artist).strip()
+            filename = f"{safe_name} - {safe_artist}.m4a"
 
             filepath = await music.download_music(music_url, filename)
 
-            # ===== 构建详情消息 =====
-            detail_msg = f"🎵 《{song_name}》- {artist}"
+            # ===== 构建极简详情消息（封面 + 歌名，无 cover 则只发歌名） =====
+            detail_msg = f"🎵 《{song_name}》 - {artist}"
             if cover_url:
                 detail_msg = f"[CQ:image,file={cover_url}]\n{detail_msg}"
 
-            if download_url:
-                detail_msg += f"\n📥 下载链接：{download_url}"
-            elif music_url:
-                detail_msg += f"\n🔗 链接：{music_url}"
-
-            # ===== 如果有语音文件 =====
+            # ===== 如果有语音文件（纯 CQ 码字符串格式，NapCat 无法直接读本地绝对路径） =====
             voice_msg = None
             voice_path = None
             if filepath and os.path.exists(filepath):
                 voice_path = os.path.abspath(filepath)
-                print(f"[点歌] 📤 语音文件: {voice_path}")
                 voice_msg = f"[CQ:record,file={voice_path}]"
+                print(f"[点歌] 📤 语音文件: {voice_path}")
 
-            # ===== 发送两条消息 =====
-            # 判断是否是官方适配器模式
+            # ===== 发送两条消息（整体 try/except 容错） =====
             is_official = hasattr(self, '_official_mode') and self._official_mode
 
-            if is_official:
-                # 官方适配器：返回两条消息（用 reply 列表或依次发送）
-                # 先发详情
-                detail_reply = self._create_reply("group", user_id, group_id, detail_msg)
-                await self._send_reply_via_adapter(detail_reply)
-                
-                # 再发语音（如果有）
-                if voice_msg:
-                    voice_reply = self._create_reply("group", user_id, group_id, voice_msg)
-                    await self._send_reply_via_adapter(voice_reply)
-                
-                return None  # 已发送
+            try:
+                if is_official:
+                    detail_reply = self._create_reply("group", user_id, group_id, detail_msg)
+                    await self._send_reply_via_adapter(detail_reply)
 
-            else:
-                # NapCat 模式：直接用 HTTP API 发送两条
-                import aiohttp
-                url = "http://127.0.0.1:3000/send_msg"
-                
-                # 发送详情
-                payload = {
-                    "group_id": int(group_id),
-                    "message": detail_msg
-                }
-                
-                detail_message_id = None
-                
-                async with aiohttp.ClientSession() as session:
-                    async with session.post(url, json=payload, timeout=30) as resp:
-                        if resp.status == 200:
-                            result_json = await resp.json()
-                            detail_message_id = result_json.get("data", {}).get("message_id")
-                            print(f"[点歌] ✅ 详情发送成功, ID: {detail_message_id}")
-                            
-                            if detail_message_id and hasattr(self, 'anti_recall'):
-                                self.anti_recall.record_sent_message(
-                                    group_id=str(group_id),
-                                    content=detail_msg,
-                                    message_id=detail_message_id
-                                )
-                                print(f"[防撤回] 📝 已记录详情消息: {detail_message_id}")
-                        else:
-                            text = await resp.text()
-                            print(f"[点歌] ❌ 详情发送失败: {resp.status} - {text}")
-                
-                # 发送语音（如果有）
-                if voice_msg and voice_path:
+                    if voice_msg:
+                        voice_reply = self._create_reply("group", user_id, group_id, voice_msg)
+                        await self._send_reply_via_adapter(voice_reply)
+
+                    return None  # 已发送
+
+                else:
+                    # NapCat 模式：直接用 HTTP API 发送两条
+                    import aiohttp
+                    url = "http://127.0.0.1:3000/send_group_msg"
+
+                    # --- 发送详情 ---
                     payload = {
                         "group_id": int(group_id),
-                        "message": voice_msg
+                        "message": detail_msg
                     }
-                    async with aiohttp.ClientSession() as session:
-                        async with session.post(url, json=payload, timeout=30) as resp:
-                            if resp.status == 200:
-                                result_json = await resp.json()
-                                voice_message_id = result_json.get("data", {}).get("message_id")
-                                print(f"[点歌] ✅ 语音发送成功, ID: {voice_message_id}")
-                                
-                                # ===== 🆕 手动记录语音到防撤回 =====
-                                try:
-                                    if voice_message_id and hasattr(self, 'anti_recall'):
-                                        # 记录到防撤回系统
-                                        self.anti_recall.record_sent_message(
-                                            group_id=str(group_id),
-                                            content=voice_msg,
-                                            message_id=voice_message_id
-                                        )
-                                        # 🆕 缓存语音文件到 media_cache（用归一化后的 ID）
-                                        if os.path.exists(voice_path):
-                                            norm_id = self.anti_recall._normalize_id(voice_message_id)
-                                            cache_key = str(norm_id) if norm_id else str(voice_message_id)
-                                            self.anti_recall.media_cache[cache_key] = {
-                                                "voice": voice_path
-                                            }
-                                            print(f"[防撤回] 💾 语音已手动缓存: {cache_key} -> {voice_path}")
-                                        print(f"[防撤回] 🎤 已手动记录语音消息: {voice_message_id}")
-                                except Exception as e:
-                                    print(f"[防撤回] 手动记录语音失败: {e}")
-                            else:
-                                text = await resp.text()
-                                print(f"[点歌] ❌ 语音发送失败: {resp.status} - {text}")
-                
-                return None  # 已发送
+                    detail_message_id = None
+
+                    # ===== 发送详情（终极防弹版） =====
+                    try:
+                        async with aiohttp.ClientSession() as session:
+                            async with session.post(url, json=payload, timeout=30) as resp:
+                                if resp.status == 200:
+                                    try:
+                                        result_json = await resp.json()
+                                    except Exception:
+                                        result_json = None
+                                    
+                                    # 最高级别防御：必须是个字典，且里面有 data
+                                    if isinstance(result_json, dict) and result_json.get("data"):
+                                        detail_message_id = result_json["data"].get("message_id")
+                                        print(f"[点歌] ✅ 详情发送成功, ID: {detail_message_id}")
+                                        if detail_message_id and hasattr(self, 'anti_recall'):
+                                            self.anti_recall.record_sent_message(
+                                                group_id=str(group_id),
+                                                content=detail_msg,
+                                                message_id=detail_message_id
+                                            )
+                                            print(f"[防撤回] 📝 已记录详情消息: {detail_message_id}")
+                                    else:
+                                        print(f"[点歌] ⚠️ 发送成功，但返回格式异常（跳过获取ID），返回: {result_json}")
+                                else:
+                                    text = await resp.text()
+                                    print(f"[点歌] ❌ 详情发送失败 HTTP {resp.status}: {text}")
+                    except Exception as e:
+                        print(f"[点歌] ❌ 详情发送阶段发生网络异常: {e}")
+
+                    # --- 发送语音（如果有）---
+                    # 纯 CQ 码字符串格式：[CQ:record,file={abs_path}]
+                    # 不带 file:/// 前缀，直接传绝对路径给 NapCat 读取
+                    if voice_msg and voice_path:
+                        voice_payload = {
+                            "group_id": int(group_id),
+                            "message": voice_msg
+                        }
+                        try:
+                            async with aiohttp.ClientSession() as session:
+                                async with session.post(url, json=voice_payload, timeout=30) as resp:
+                                    if resp.status != 200:
+                                        text = await resp.text()
+                                        print(f"[点歌] ❌ 语音发送失败 HTTP {resp.status} - {text}")
+                                        return None
+
+                                    try:
+                                        result_json = await resp.json()
+                                    except Exception:
+                                        result_json = None
+
+                                    if not isinstance(result_json, dict) or result_json.get("retcode") != 0:
+                                        print(f"[点歌] ❌ 语音发送失败: retcode 异常，原始返回: {result_json}")
+                                        return None
+
+                                    voice_message_id = result_json.get("data", {}).get("message_id")
+                                    print(f"[点歌] ✅ 语音发送成功, ID: {voice_message_id}")
+
+                                    # 手动记录到防撤回（best-effort，不影响主流程）
+                                    try:
+                                        if voice_message_id and hasattr(self, 'anti_recall'):
+                                            self.anti_recall.record_sent_message(
+                                                group_id=str(group_id),
+                                                content=voice_msg,
+                                                message_id=voice_message_id
+                                            )
+                                            print(f"[防撤回] 🎤 已手动记录语音消息: {voice_message_id}")
+                                    except Exception as e:
+                                        print(f"[防撤回] 手动记录语音失败: {e}")
+
+                        except Exception as e:
+                            print(f"[点歌] ❌ 语音发送阶段网络异常: {e}")
+                        return None
+
+            except Exception as send_err:
+                print(f"[点歌] ⚠️ 发送阶段异常，已容错: {send_err}")
+                import traceback
+                traceback.print_exc()
+                try:
+                    fallback = self._create_reply("group", user_id, group_id,
+                        f"🎵 《{song_name}》- {artist} 已收到，但语音发送失败了，请稍后再试~")
+                    await self._send_reply_via_adapter(fallback)
+                except Exception:
+                    pass
+                return None
 
         except Exception as e:
             print(f"[点歌] 错误: {e}")
@@ -9138,6 +9525,7 @@ class MessageHandler:
     9️⃣ 抽签系统   1️⃣0️⃣ 入群欢迎
     1️⃣1️⃣ 婚姻系统   1️⃣2️⃣ 改名功能
     1️⃣3️⃣ 点歌功能   1️⃣4️⃣ AI绘画
+    1️⃣7️⃣ B站视频
     """
         if is_admin:
             help_text += "1️⃣5️⃣ 管理员命令\n1️⃣6️⃣ 其他功能\n"
@@ -9457,7 +9845,27 @@ class MessageHandler:
                         return result
                     return None
                 return self._get_text_help(message_type, user_id, group_id)
-            
+
+            # ========== 17. B站视频 ==========
+            if category_str in ["17", "b站", "B站", "视频", "bilibili"]:
+                commands = [
+                    ("搜视频 <关键词>", "搜索B站视频，回复数字选择"),
+                    ("", "≤10分钟：自动下载并发送视频消息"),
+                    ("", ">10分钟：直接发送B站链接，不下载"),
+                    ("", ""),
+                    ("--- 使用示例 ---", ""),
+                    ("搜视频 猫meme", "搜索并选择"),
+                    ("", "回复 1-10 选择对应视频"),
+                ]
+                img = generator.create_help_page("B站视频", "【📺 B站视频】", commands, is_admin)
+                filepath = generator.save_to_temp(img)
+                if filepath:
+                    result = await self._send_help_image_async(message_type, user_id, group_id, filepath)
+                    if result:
+                        return result
+                    return None
+                return self._get_text_help(message_type, user_id, group_id)
+
             # ========== 15. 管理员命令 ==========
             if category_str in ["15", "管理", "管理员"] and is_admin:
                 commands = [
@@ -9588,7 +9996,10 @@ class MessageHandler:
                     ("--- 视频解析 ---", ""),
                     ("!视频解析 开/关", "开启/关闭视频解析"),
                     ("!视频解析 群发/私聊", "设置发送方式"),
-                    ("被踢通知","被踢通知帮助")
+                    ("被踢通知","被踢通知帮助"),
+                    ("", ""),
+                    ("--- B站视频 ---", ""),
+                    ("搜视频 <关键词>", "搜索B站视频，回复数字选择；≤10分钟自动下载发送，>10分钟直接发链接"),
                 ]
                 img = generator.create_help_page("其他功能", "【🔧 其他功能】", commands, is_admin)
                 filepath = generator.save_to_temp(img)
