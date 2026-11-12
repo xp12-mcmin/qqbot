@@ -8142,49 +8142,61 @@ class MessageHandler:
 
         async def download_task():
             try:
+                import os
+                import shutil
+
                 os.makedirs("data/temp_video", exist_ok=True)
                 target = "data/temp_video"
-                import shutil
-                ffmpeg = os.path.join("ffmpeg.exe") if os.path.exists("ffmpeg.exe") else shutil.which("ffmpeg")
+
+                # ===== 智能查找 ffmpeg：本地目录优先，再查系统 PATH =====
+                ffmpeg = None
+                if os.path.exists("ffmpeg.exe"):
+                    ffmpeg = os.path.abspath("ffmpeg.exe")
+                else:
+                    ffmpeg = shutil.which("ffmpeg")
                 if not ffmpeg:
-                    print("[B站视频] 未找到 ffmpeg，无法合并音视频")
-                    self._bili_send_bg(group_id, user_id, "❌ 缺少 ffmpeg，无法合并音视频，请安装后重试")
+                    print("[B站视频] 未找到 ffmpeg")
+                    self._bili_send_bg(group_id, user_id, "❌ 未找到 ffmpeg 工具，无法合并音视频，请安装后重试")
                     return
-                # ffmpeg_location 只需给到可执行文件的目录即可；项目内 ffmpeg.exe 直接用其所在目录
-                ffmpeg_dir = "." if os.path.exists("ffmpeg.exe") else os.path.dirname(ffmpeg)
+                # --ffmpeg-location 只接受可执行文件所在目录
+                ffmpeg_dir = os.path.dirname(ffmpeg)
 
-                # ===== 定位 yt-dlp：优先 项目目录/scripts/yt-dlp.py，其次 PATH =====
-                def _find_ytdlp():
-                    import subprocess
-                    local = os.path.join("scripts", "yt-dlp.py")
-                    if os.path.exists(local):
-                        return [sys.executable, local]
-                    which = subprocess.which("yt-dlp")
+                # ===== 智能查找 yt-dlp：本地目录优先，再查系统 PATH，最后查 Python site-packages =====
+                ytdlp_cmd = None
+                if os.path.exists("yt-dlp.exe"):
+                    ytdlp_cmd = [os.path.abspath("yt-dlp.exe")]
+                else:
+                    which = shutil.which("yt-dlp")
                     if which:
-                        return [which]
-                    import site
-                    for p in (site.getusersitepackages(), *site.getsitepackages()):
-                        c = os.path.join(p, "yt-dlp", "yt_dlp", "__main__.py")
-                        if os.path.exists(c):
-                            return [sys.executable, c]
-                    c = os.path.join("yt-dlp", "yt_dlp", "__main__.py")
-                    if os.path.exists(c):
-                        return [sys.executable, c]
-                    return None
+                        ytdlp_cmd = [which]
+                    else:
+                        # 兜底：Python 包安装的 yt-dlp（console script 未加入 PATH 时）
+                        import site
+                        for p in (site.getusersitepackages(), *site.getsitepackages()):
+                            c = os.path.join(p, "yt_dlp", "__main__.py")
+                            if os.path.exists(c):
+                                ytdlp_cmd = [sys.executable, c]
+                                break
+                        if not ytdlp_cmd:
+                            c = os.path.join("yt_dlp", "__main__.py")
+                            if os.path.exists(c):
+                                ytdlp_cmd = [sys.executable, c]
 
-                ytdlp_cmd = _find_ytdlp()
                 if not ytdlp_cmd:
-                    print("[B站视频] 未找到 yt-dlp，请安装: pip install yt-dlp")
-                    self._bili_send_bg(group_id, user_id, "❌ 未安装 yt-dlp，无法下载视频")
+                    print("[B站视频] 未找到 yt-dlp")
+                    self._bili_send_bg(group_id, user_id, "❌ 未找到 ffmpeg 或 yt-dlp 工具，请安装后重试")
                     return
 
-                # 预生成文件名（纯计算，不产生 I/O）
-                import hashlib
-                safe = re.sub(r'[\\/:*?"<>|]', '', title).strip() or "video"
-                base_name = f"{safe}_{hashlib.md5(str(video.get('bvid', '')).encode()).hexdigest()[:8]}"
-                out_tmpl = os.path.join(target, f"{base_name}.%(ext)s").replace("\\", "/")
+                # 文件名强制用 BVID（纯英文+数字，任何系统/编码下都不会乱码）
+                bvid = video.get("bvid", "")
+                if not bvid:
+                    print("[B站视频] 未获取到 BVID，无法命名文件")
+                    self._bili_send_bg(group_id, user_id, "❌ 未获取到视频ID，无法下载")
+                    return
+                base_name = bvid
+                out_tmpl = os.path.join(target, f"{bvid}.%(ext)s").replace("\\", "/")
 
-                # ===== 组装 yt-dlp 命令：--newline 让进度按行输出，便于异步流式读取 =====
+                # ===== 组装 yt-dlp 命令 =====
                 target_abs = os.path.abspath(target)
                 ytdlp_args = [
                     *ytdlp_cmd,
@@ -8194,11 +8206,12 @@ class MessageHandler:
                     "--merge-output-format", "mp4",
                     "--ffmpeg-location", ffmpeg_dir,
                     "-o", out_tmpl,
-                    link or video.get("bvid", ""),
+                    link or bvid,
                 ]
-                print(f"[B站视频] 开始异步下载: {link or video.get('bvid')}")
+                print(f"[B站视频] 开始异步下载: {link or bvid}")
+                print(f"[B站视频] ffmpeg={ffmpeg}, yt-dlp={' '.join(ytdlp_cmd)}, 输出文件={bvid}")
 
-                # ===== 异步子进程下载（不阻塞事件循环，机器人仍可响应其他消息） =====
+                # ===== 异步子进程下载（绝不卡主线程，机器人仍可正常响应其他消息） =====
                 proc = await asyncio.create_subprocess_exec(
                     *ytdlp_args,
                     stdout=asyncio.subprocess.PIPE,
@@ -8210,9 +8223,7 @@ class MessageHandler:
                     line = raw_line.decode("utf-8", errors="replace").strip()
                     if not line:
                         continue
-                    # 只打印有实质变化的进度，避免日志刷屏
                     if line != last_progress:
-                        # 每 10 秒最多打一条进度，防止日志爆炸
                         print(f"[B站视频] [download] {line}")
                         last_progress = line
                 await proc.wait()
@@ -8222,30 +8233,33 @@ class MessageHandler:
                     self._bili_send_bg(group_id, user_id, "❌ 视频下载失败，请稍后再试")
                     return
 
-                # 找下载产物（同目录下最新的非 .part 文件）
-                try:
-                    files = [
-                        os.path.join(target_abs, f)
-                        for f in os.listdir(target_abs)
-                        if f.startswith(base_name) and not f.endswith(".part")
-                    ]
-                    final = max(files, key=os.path.getsize) if files else None
-                except OSError:
-                    final = None
-                if not final or not os.path.exists(final):
-                    print(f"[B站视频] 下载后未找到文件: {base_name}")
+                # 直接用 BVID 拼接路径找下载产物（无需再 listdir 猜文件名）
+                filepath = os.path.join("data/temp_video", f"{bvid}.mp4")
+                print(f"[B站视频] 检查文件是否存在: {filepath}")
+                if not os.path.exists(filepath):
+                    # 兜底：扫目录找 BVID 开头的非 .part 文件（万一个别视频扩展名不是 mp4）
+                    try:
+                        files = [
+                            os.path.join("data/temp_video", f)
+                            for f in os.listdir("data/temp_video")
+                            if f.startswith(bvid) and not f.endswith(".part")
+                        ]
+                        filepath = max(files, key=os.path.getsize) if files else None
+                    except OSError:
+                        filepath = None
+                if not filepath or not os.path.exists(filepath):
+                    print(f"[B站视频] 下载后未找到文件: {bvid}")
                     self._bili_send_bg(group_id, user_id, "❌ 下载失败，请稍后再试")
                     return
 
-                abs_path = os.path.abspath(final)
+                abs_path = os.path.abspath(filepath)
+                abs_path_unix = abs_path.replace("\\", "/")
+                video_cq = f"[CQ:video,file=file:///{abs_path_unix}]"
                 print(f"[B站视频] 下载完成: {abs_path} ({os.path.getsize(abs_path)} bytes)")
 
-                # ===== 发送视频（NapCat 数组格式，retcode 成功才删本地文件） =====
-                # NapCat 规定：message 里的 video 段必须是唯一的段，不能和 @ / 文字混在一起
-                # 因此分两条发：先发文本提示，再发纯视频
+                # ===== 发送视频（分两条：先文本提示，再纯视频 CQ 码） =====
                 import aiohttp
                 send_url = "http://127.0.0.1:3000/send_group_msg"
-                abs_path_unix = abs_path.replace("\\", "/")
 
                 # --- 第 1 条：文本提示（@用户 + 文字）---
                 text_payload = {
@@ -8263,11 +8277,10 @@ class MessageHandler:
                 except Exception as e:
                     print(f"[B站视频] 文本提示发送异常: {e}")
 
-                # --- 第 2 条：纯视频（message 里只有 video 一个段）---
-                video_segment = {"type": "video", "data": {"file": abs_path_unix}}
+                # --- 第 2 条：纯视频（message 里只有 video 一个段，CQ 码格式） ---
                 video_payload = {
                     "group_id": int(group_id),
-                    "message": [video_segment],
+                    "message": video_cq,
                 }
                 send_ok = False
                 try:
@@ -12502,6 +12515,24 @@ def main():
     builtins.XP12_LICENSE_KEY = license_mgr.get_key()
     print(f"[授权] 密钥已注入: {builtins.XP12_LICENSE_KEY}")
     
+    # ===== 启动前自动清理临时音频/视频缓存，防止撑爆硬盘 =====
+    def _cleanup_temp_media():
+        import glob
+        exts = ("*.mp4", "*.m4a", "*.mp3")
+        dirs = ("data/temp_video", "data/temp_music")
+        cleaned = 0
+        for d in dirs:
+            for pattern in exts:
+                for f in glob.glob(os.path.join(d, pattern)):
+                    try:
+                        os.remove(f)
+                        cleaned += 1
+                    except Exception as e:
+                        print(f"[系统] 清理失败 {f}: {e}")
+        print(f"[系统] 启动前已自动清理临时音频/视频缓存文件（共 {cleaned} 个）")
+
+    _cleanup_temp_media()
+
     # ===== 创建处理器 =====
     main_handler = MessageHandler()
     
