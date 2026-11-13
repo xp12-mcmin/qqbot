@@ -447,6 +447,91 @@ class BannedWordDetector:
         }
 
     # ==================== 违禁词管理 ====================
+    def record_violation(self, group_id: str, user_id: str, source: str) -> Optional[Dict]:
+        """记录一次违规（供 AI 图片审核等非词库命中路径使用）。
+
+        与 check_message 共享同一套计数 / 禁言 / 黑名单逻辑，
+        但跳过词库匹配，直接把 source 作为 matched_word 返回。
+        """
+        if not self.is_group_enabled(group_id):
+            return None
+
+        group_id = str(group_id)
+        user_id = str(user_id)
+        matched_word = f"[AI图片审核] {source}"
+
+        group_records = self.records.setdefault(group_id, {})
+        user_record = group_records.get(user_id, {
+            "count": 0,
+            "last_time": 0,
+            "muted_at": 0,
+            "total_strikes": 0,
+            "strike_window_start": 0,
+        })
+
+        now = time.time()
+        reset_seconds = self.config["reset_hours"] * 3600
+
+        # 短周期重置禁言计数
+        if user_record["last_time"] > 0 and (now - user_record["last_time"]) > reset_seconds:
+            print(f"[违禁词] 用户 {user_id} 超过 {self.config['reset_hours']}h 未违禁，重置禁言计数")
+            user_record["count"] = 0
+
+        # 黑名单统计窗口
+        window_seconds = self.config["blacklist_window_hours"] * 3600
+        if user_record.get("strike_window_start", 0) == 0 \
+                or (now - user_record["strike_window_start"]) > window_seconds:
+            user_record["strike_window_start"] = now
+            user_record["total_strikes"] = 0
+
+        user_record["count"] += 1
+        user_record["last_time"] = now
+        user_record["total_strikes"] = user_record.get("total_strikes", 0) + 1
+        group_records[user_id] = user_record
+        self.save_records()
+
+        current_count = user_record["count"]
+        total_strikes = user_record["total_strikes"]
+        should_mute = (current_count >= self.config["mute_threshold"])
+
+        should_blacklist = (
+            self.is_blacklist_active_in_group(group_id)
+            and total_strikes >= self.config.get("blacklist_threshold", 50)
+        )
+
+        print(f"[违禁词] ⚠️ 群{group_id} 用户{user_id} {source}违规 "
+              f"(禁言计数 {current_count}, 窗口累计 {total_strikes})")
+
+        if should_mute:
+            user_record["count"] = 0
+            user_record["muted_at"] = now
+            self.save_records()
+            print(f"[违禁词] 🔨 用户 {user_id} 达到 {self.config['mute_threshold']} 次，执行禁言")
+
+        if should_blacklist:
+            self.add_to_blacklist(
+                group_id, user_id,
+                reason=f"{self.config['blacklist_window_hours']}h 内违规 {total_strikes} 次（最后触发：{source}）",
+                is_global=False
+            )
+            user_record["total_strikes"] = 0
+            user_record["strike_window_start"] = now
+            user_record["count"] = 0
+            self.save_records()
+            print(f"[违禁词] 🚫 用户 {user_id} 达到黑名单阈值，已加入本群黑名单并踢出")
+
+        return {
+            "matched_word": matched_word,
+            "count": current_count,
+            "total_strikes": total_strikes,
+            "should_mute": should_mute,
+            "should_blacklist": should_blacklist,
+            "mute_duration": self.config["mute_duration"],
+            "threshold": self.config["mute_threshold"],
+            "delete_message": self.config["delete_message"],
+            "notify": self.config["notify"],
+        }
+
     def add_word(self, word: str) -> bool:
         word = word.strip()
         if not word:

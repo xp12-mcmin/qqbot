@@ -33,9 +33,9 @@
 ### 🧠 双核 AI 引擎 (Agnes + 智谱)
 - **高智商聊天**：接入 Agnes 2.5 Flash，支持多轮对话记忆与上下文理解。
 - **自动联网搜索**：AI 自动判断是否需要实时信息，若需要则调用智谱搜索并总结，告别 AI 胡说八道。
-- **视觉识别**：支持识别群友发送的图片内容。
+- **图片视觉审核**：仅对启用的群生效，自动调用视觉大模型判断图片是否包含违禁信息（支持自定义 API 接口）。
 - **性格系统**：支持多种性格切换，每个群可独立设置。
-- **安全过滤**：敏感词拦截、辱骂机器人自动拉黑。
+- **安全过滤**：本地词库拦截 + 视觉大模型审核双重防护。
 
 ### 🎨 AI 绘画 (智谱 CogView)
 - 接入智谱 CogView 画图接口。
@@ -43,10 +43,10 @@
 - 自动优化提示词，支持二次元/写实等风格。
 
 ### 🎵 点歌功能
-- 支持 QQ 音乐搜索。
-- **直接让 QQ 服务器代劳转码，无需本地 FFmpeg 环境**。
+- 直连 QQ 音乐官方底层接口，支持 320k 高音质解析。
+- 直接让 QQ 服务器代劳转码，无需本地 FFmpeg 环境。
 - 发送歌曲封面图和详情链接。
-- 多源自动切换。
+- 内置用户级与群聊级 30 秒双重冷却防刷机制。
 
 ### 🛡️ 防撤回系统 (媒体级)
 - 消息撤回保护。
@@ -93,7 +93,9 @@ pip install websockets aiohttp flask requests pillow psutil
 | `api` | Agnes API 密钥 | `sk-xxxxxxxx` |
 | `api_url` | Agnes 接口地址 | `https://api.agnes-ai.cn/v1` |
 | `zhipu_api` | 智谱 API 密钥（用于搜索和画图） | `f9e49cxxxxxxxx` |
-| `zhipu_url` | 智谱接口地址 | `https://open.bigmodel.cn/api/paas/v4` |
+| `XP12_VISION_API_KEY` | 视觉审核大模型密钥（用于图片拦截） | `sk-xxxxxxxx` |
+| `XP12_VISION_BASE_URL` | 视觉审核接口地址 | `https://api.openai.com/v1` |
+| `XP12_VISION_MODEL` | 视觉审核模型名称 | `gpt-4o` |
 
 *Windows PowerShell 永久设置示例：*
 ```powershell
@@ -133,6 +135,12 @@ python qai主程序.py
 |------|------|
 | `点歌 <歌曲名>` | 搜索并发送歌曲 |
 | `!点歌 <歌曲名>` | 同上 |
+
+### 🎬 B站视频搜索
+| 命令 | 说明 |
+|------|------|
+| `搜视频 <关键词>` | 搜索 B 站视频，列出前 10 个结果供交互选择 |
+| `回复数字 (1-10)` | 选择下载并发送视频（超过 10 分钟仅发送链接） |
 
 ### 💑 婚姻系统
 | 命令 | 说明 |
@@ -242,10 +250,14 @@ python qai主程序.py
 
 ## 🙏 致谢
 
-- [SnowLuma](https://github.com/SnowLuma) - QQ协议适配（强烈推荐）
-- [NapCat](https://github.com/NapNeko/NapCatQQ) - QQ协议适配（备用）
-- [Agnes AI](https://www.agnes-ai.cn/) - 大语言模型支持
-- [智谱 AI](https://open.bigmodel.cn/) - 联网搜索与图像生成
+**QQ 协议框架：**
+- [SnowLuma](https://github.com/SnowLuma) - QQ 协议适配（**强烈推荐**，轻量无界面，连接极其稳定、资源占用极低，完美支持 WebSocket 与 HTTP）
+- [NapCat](https://github.com/NapNeko/NapCatQQ) - QQ 协议适配（备用，适合需要图形界面调试的场景）
+
+**AI 模型支持：**
+- [Agnes AI](https://www.agnes-ai.cn/) - 双核引擎主力，提供高智商多轮对话
+- [智谱 AI](https://open.bigmodel.cn/) - 联网搜索与 AI 绘画
+- 视觉大模型（OpenAI 兼容接口）- 图片内容安全审核
 
 ---
 

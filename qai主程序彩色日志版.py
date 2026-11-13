@@ -4086,6 +4086,20 @@ class MessageHandler:
         )
         print("[调试] 进群审核模块加载成功")
         print("[调试] 违禁词检测器加载成功")
+
+        # ===== 图片 AI 视觉审核（多模态大模型） =====
+        # 只审核启用了违禁词检测的群 + 消息里带图片的情况，纯文本走本地词库，API 调用频率极低
+        self._image_vision_config = {
+            "api_key": os.environ.get("XP12_VISION_API_KEY", ""),
+            "base_url": os.environ.get("XP12_VISION_BASE_URL", "https://api.openai.com/v1"),
+            "model": os.environ.get("XP12_VISION_MODEL", "gpt-4o"),
+            "enabled": bool(os.environ.get("XP12_VISION_API_KEY", "")),
+        }
+        if self._image_vision_config["enabled"]:
+            print(f"[图片审核] 多模态视觉审核已启用: model={self._image_vision_config['model']}")
+        else:
+            print("[图片审核] 未配置 XP12_VISION_API_KEY，图片 AI 审核关闭（仅本地词库检测文本）")
+
         # 初始化 AI 性格（传入黑名单）
         self.ai = OllamaAI()
         if hasattr(self.ai, 'personality_mgr'):
@@ -4804,6 +4818,12 @@ class MessageHandler:
     async def _check_banned_word(self, group_id: str, user_id: str, data: Dict) -> Optional[Dict]:
         """
         违禁词检测处理：撤回 + 累计禁言 + 黑名单踢出（每群独立开关）
+
+        分流策略（大幅降低 API 调用频率）：
+        1. 群不在启用列表 → 直接放行
+        2. 消息里有图片 → 只把图片 URL 提交给视觉大模型（不提交纯文本），YES 才处罚
+        3. 消息没有图片 → 纯文本走本地词库匹配（零 API 调用）
+        图片审核在后台异步执行，不阻塞主聊天流程；AI 超时/报错默认放行
         """
         print(f"[违禁词🔍] 进入检测: 群={group_id}, 用户={user_id}")
 
@@ -4821,15 +4841,23 @@ class MessageHandler:
                 print(f"[违禁词🔍] ❌ 本群未启用，跳过")
                 return None
 
-            # ==================== 2. 提取文本 ====================
+            # ==================== 2. 提取文本 + 图片 URL ====================
             text = self._extract_pure_text(data)
-            print(f"[违禁词🔍] 提取文本={repr(text[:80])}")
+            img_urls = self._extract_image_urls(data)
+            print(f"[违禁词🔍] 提取文本={repr(text[:80])}, 图片数={len(img_urls)}")
 
+            # ==================== 3. 分流 ====================
+            if img_urls:
+                # 有图片 → 只把图片提交给视觉大模型（纯文本不提交，降低 API 调用频率）
+                self._schedule_image_vision_review(group_id, user_id, img_urls, data)
+                return None  # 后台异步处理，不阻塞主流程
+
+            # 没有图片 → 纯文本走本地词库匹配（零 API 调用）
             if not text or text in ["（空消息）", "（提取失败）"]:
                 print(f"[违禁词🔍] ❌ 文本为空，跳过")
                 return None
 
-            # ==================== 3. 调用检测 ====================
+            # ==================== 4. 调用本地词库检测 ====================
             result = self.banned_word_detector.check_message(group_id, user_id, text)
             print(f"[违禁词🔍] 检测结果={result}")
 
@@ -4837,7 +4865,7 @@ class MessageHandler:
                 print(f"[违禁词🔍] 无违禁词")
                 return None
 
-            # ==================== 4. 提取检测结果 ====================
+            # ==================== 5. 提取检测结果 ====================
             matched_word    = result["matched_word"]
             count           = result["count"]
             threshold       = result["threshold"]
@@ -4946,6 +4974,180 @@ class MessageHandler:
             import traceback
             traceback.print_exc()
             return None
+    def _extract_image_urls(self, data: Dict) -> list:
+        """从消息里提取图片 URL（支持 CQ:image url= 和 onebot segment 两种格式）"""
+        urls = []
+        try:
+            raw_message = data.get("message", "")
+            if isinstance(raw_message, str):
+                # CQ 码字符串：[CQ:image,url=...]
+                for m in re.finditer(r'\[CQ:image,url=([^\]]+)\]', raw_message):
+                    urls.append(m.group(1).strip())
+            elif isinstance(raw_message, list):
+                # onebot 数组格式
+                for seg in raw_message:
+                    if isinstance(seg, dict) and seg.get("type") == "image":
+                        url = seg.get("data", {}).get("url", "")
+                        if url:
+                            urls.append(url)
+            # raw_message（HTTP 上报）
+            raw_msg = data.get("raw_message", "")
+            if isinstance(raw_msg, str):
+                for m in re.finditer(r'\[CQ:image,url=([^\]]+)\]', raw_msg):
+                    urls.append(m.group(1).strip())
+        except Exception as e:
+            print(f"[图片审核] 提取图片URL异常: {e}")
+        return urls
+
+    def _schedule_image_vision_review(self, group_id: str, user_id: str, img_urls: list, data: Dict):
+        """把图片视觉审核放到后台异步执行（不阻塞主聊天流程）"""
+        async def vision_task():
+            try:
+                await self._run_image_vision_review(group_id, user_id, img_urls, data)
+            except Exception as e:
+                # 任何异常都默认放行，别让机器人卡死
+                print(f"[图片审核] ❌ 后台任务异常，默认放行: {e}")
+                import traceback
+                traceback.print_exc()
+
+        asyncio.create_task(vision_task())
+
+    async def _run_image_vision_review(self, group_id: str, user_id: str, img_urls: list, data: Dict):
+        """图片视觉审核主逻辑：调多模态大模型，YES 才执行处罚"""
+        cfg = getattr(self, "_image_vision_config", None)
+        if not cfg or not cfg.get("enabled") or not cfg.get("api_key"):
+            print("[图片审核] 未配置视觉 API，跳过（仅本地词库生效）")
+            return
+
+        import aiohttp
+
+        # 取第一张图审核（避免一条消息发多图时 API 调用翻倍）
+        img_url = img_urls[0]
+        print(f"[图片审核] 提交视觉模型: {img_url[:80]}...")
+
+        payload = {
+            "model": cfg["model"],
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": img_url},
+                        },
+                        {
+                            "type": "text",
+                            "text": ("请判断这张图片是否包含辱骂、色情、暴力的文字或画面。"
+                                      "如果有，回复 YES；如果没有，回复 NO。"),
+                        },
+                    ],
+                }
+            ],
+            "max_tokens": 10,
+            "temperature": 0,
+        }
+        headers = {
+            "Authorization": f"Bearer {cfg['api_key']}",
+            "Content-Type": "application/json",
+        }
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{cfg['base_url'].rstrip('/')}/chat/completions",
+                    json=payload,
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=30),
+                ) as resp:
+                    if resp.status != 200:
+                        print(f"[图片审核] ❌ HTTP {resp.status}: {await resp.text()}，默认放行")
+                        return
+                    res_json = await resp.json()
+                    answer = ""
+                    try:
+                        answer = res_json["choices"][0]["message"]["content"].strip().upper()
+                    except (KeyError, IndexError, TypeError):
+                        pass
+                    print(f"[图片审核] 模型回复: {answer[:50]!r}")
+
+                    if "YES" not in answer:
+                        print("[图片审核] ✅ 判定安全，放行")
+                        return
+
+        except Exception as e:
+            # AI 接口超时 / 报错 → 默认放行，别让机器人卡死
+            print(f"[图片审核] ❌ 请求异常: {e}，默认放行")
+            return
+
+        # ===== 模型判定 YES → 执行处罚（撤回 / 累计禁言 / 黑名单） =====
+        print(f"[图片审核] 🚫 判定违规，执行处罚: 群={group_id}, 用户={user_id}")
+        detector = self.banned_word_detector
+        result = detector.record_violation(group_id, user_id, "图片AI审核")
+        if not result:
+            return
+
+        count           = result["count"]
+        threshold       = result["threshold"]
+        should_mute     = result["should_mute"]
+        mute_duration   = result["mute_duration"]
+        delete_message  = result["delete_message"]
+        notify          = result["notify"]
+        should_blacklist = result.get("should_blacklist", False)
+        total_strikes    = result.get("total_strikes", 0)
+        raw_message_id = data.get("message_id")
+
+        actions = []
+        if delete_message and raw_message_id:
+            actions.append({"action": "delete_msg", "params": {"message_id": raw_message_id}})
+            print(f"[图片审核] 🗑️ 撤回消息: {raw_message_id}")
+        if should_mute:
+            actions.append({
+                "action": "set_group_ban",
+                "params": {"group_id": int(group_id), "user_id": int(user_id), "duration": mute_duration}
+            })
+            print(f"[图片审核] 🔨 禁言 {user_id} {mute_duration}秒")
+        if should_blacklist:
+            actions.append({
+                "action": "set_group_kick",
+                "params": {"group_id": int(group_id), "user_id": int(user_id), "reject_add_request": False}
+            })
+            window_hours = detector.config.get("blacklist_window_hours", 3)
+            blacklist_tip = (
+                f"🚫 [CQ:at,qq={user_id}] 已被加入本群黑名单\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"⚠️ {window_hours}h 内累计违规 {total_strikes} 次（图片审核）\n"
+                f"🔨 已自动踢出本群\n"
+                f"📝 如有异议请联系管理员"
+            )
+            actions.append({
+                "action": "send_msg",
+                "params": {"message_type": "group", "group_id": int(group_id), "message": blacklist_tip}
+            })
+            print(f"[图片审核] 🚫 黑名单踢出 + 提示")
+        elif notify:
+            if should_mute:
+                mute_desc = self._format_duration(mute_duration)
+                tip = (f"[CQ:at,qq={user_id}] 🚫 图片内容违规\n"
+                       f"⚠️ 已累计 {threshold} 次，禁言 {mute_desc}")
+            else:
+                tip = (f"[CQ:at,qq={user_id}] 🚫 图片内容违规\n"
+                       f"⚠️ 警告 {count}/{threshold} 次")
+            actions.append({
+                "action": "send_msg",
+                "params": {"message_type": "group", "group_id": int(group_id), "message": tip}
+            })
+            print(f"[图片审核] 💬 普通提示")
+
+        if actions and hasattr(self, "websocket") and self.websocket:
+            for act in actions:
+                try:
+                    await self.websocket.send(json.dumps(act))
+                    print(f"[图片审核] ✅ 已发送: {act.get('action')}")
+                except Exception as e:
+                    print(f"[图片审核] ❌ 发送失败: {e}")
+        elif actions:
+            print(f"[图片审核] ❌ websocket 为 None，action 发不出去！")
+
     async def _kick_and_notify(self, group_id, user_id, message: str):
         """先发提示，再踢人（异步任务）"""
         try:
@@ -5817,12 +6019,11 @@ class MessageHandler:
             
             # ✅ 调用 _music
             result = await self._music(group_id, user_id, keyword)
-            
-            # ✅ 关键：如果 _music 返回 None，说明是重复请求，也要返回一个"占位"回复
-            if result is None:
-                # 返回一个空回复（不发消息），但阻止继续执行
-                return {"action": "ignore", "params": {}}  # 特殊标记
-            
+
+            # _music 现在返回 {"_handled": True}（后台任务已启动）或 _create_reply（去重拦截）
+            if isinstance(result, dict) and result.get("_handled"):
+                return {"_handled": True}
+
             return result
         # ========== 2. 打卡命令 ==========
         if text_lower in ["!打卡", "！打卡", "!sign", "！sign", "打卡"]:
@@ -8316,185 +8517,159 @@ class MessageHandler:
         return {"_handled": True}
 
     async def _music(self, group_id: int, user_id: str, keyword: str) -> Dict:
-        """点歌 - 发详情 + 语音两条"""
+        """点歌 - B站音频搜索、下载、发送（彻底废弃 QQ 音乐）"""
         import aiohttp
+
         # ========== 计数去重 ==========
         if not hasattr(self, '_music_count'):
             self._music_count = {}
-
         import hashlib
         command_key = f"music_{group_id}_{user_id}_{keyword}"
         command_hash = hashlib.md5(command_key.encode()).hexdigest()
-
-        count = self._music_count.get(command_hash, 0)
-
-        if count >= 1:
+        if self._music_count.get(command_hash, 0) >= 1:
             print(f"[点歌] 重复命令，已忽略: {command_key}")
             return self._create_reply("group", user_id, group_id,
                 "⏰ 点歌命令已收到，正在处理中，请勿重复发送~")
-
-        self._music_count[command_hash] = count + 1
+        self._music_count[command_hash] = 1
 
         async def cleanup():
             await asyncio.sleep(5)
             if command_hash in self._music_count:
                 del self._music_count[command_hash]
                 print(f"[点歌] 已清理计数: {command_hash}")
-
         asyncio.create_task(cleanup())
 
-        # ========== 点歌逻辑 ==========
-        try:
-            from music import get_music_service
-            music = get_music_service()
-            result = await music.search(keyword)
-
-            if not result.get("success"):
-                return self._create_reply("group", user_id, group_id,
-                    f"❌ 点歌失败：{result.get('msg')}")
-
-            song_name = result.get('name')
-            artist = result.get('artist')
-            music_url = result.get('url')
-            cover_url = result.get('cover')
-
-            import re
-            # 文件名 = "{歌名} - {歌手}.m4a"，并清理 Windows 非法字符（\ / : * ? " < > |）
-            safe_name = re.sub(r'[\\/:*?"<>|]', '', song_name).strip()
-            safe_artist = re.sub(r'[\\/:*?"<>|]', '', artist).strip()
-            filename = f"{safe_name} - {safe_artist}.m4a"
-
-            filepath = await music.download_music(music_url, filename)
-
-            # ===== 构建极简详情消息（封面 + 歌名，无 cover 则只发歌名） =====
-            detail_msg = f"🎵 《{song_name}》 - {artist}"
-            if cover_url:
-                detail_msg = f"[CQ:image,file={cover_url}]\n{detail_msg}"
-
-            # ===== 如果有语音文件（纯 CQ 码字符串格式，NapCat 无法直接读本地绝对路径） =====
-            voice_msg = None
-            voice_path = None
-            if filepath and os.path.exists(filepath):
-                voice_path = os.path.abspath(filepath)
-                voice_msg = f"[CQ:record,file={voice_path}]"
-                print(f"[点歌] 📤 语音文件: {voice_path}")
-
-            # ===== 发送两条消息（整体 try/except 容错） =====
-            is_official = hasattr(self, '_official_mode') and self._official_mode
-
+        # ========== B站搜索 + 音频下载 + 发送（后台异步，不卡主线程） ==========
+        async def music_task():
             try:
-                if is_official:
-                    detail_reply = self._create_reply("group", user_id, group_id, detail_msg)
-                    await self._send_reply_via_adapter(detail_reply)
+                import os
+                import re
+                import bilibili_api
+                from bilibili_api.search import SearchObjectType
+                from bilibili_api import video
 
-                    if voice_msg:
-                        voice_reply = self._create_reply("group", user_id, group_id, voice_msg)
-                        await self._send_reply_via_adapter(voice_reply)
+                bilibili_api.select_client("curl_cffi")
 
-                    return None  # 已发送
+                # 1. 搜索：取第一个视频
+                res = await bilibili_api.search.search_by_type(
+                    keyword, search_type=SearchObjectType.VIDEO, page=1, page_size=1
+                )
+                results = (res or {}).get("result") or []
+                if not results:
+                    self._bili_send_bg(group_id, user_id, "B站没找到这首歌，换首歌试试喵~")
+                    return
+                first = results[0]
+                bvid = first.get("bvid", "")
+                title = re.sub(r"</?em[^>]*>", "", first.get("title", "未知标题"))
+                if not bvid:
+                    self._bili_send_bg(group_id, user_id, "B站没找到这首歌，换首歌试试喵~")
+                    return
 
-                else:
-                    # NapCat 模式：直接用 HTTP API 发送两条
-                    import aiohttp
-                    url = "http://127.0.0.1:3000/send_group_msg"
+                print(f"[点歌] 命中: 《{title}》 bvid={bvid}")
+                self._bili_send_bg(group_id, user_id, f"🎵 正在从B站提取《{title}》的音频流...")
 
-                    # --- 发送详情 ---
-                    payload = {
-                        "group_id": int(group_id),
-                        "message": detail_msg
-                    }
-                    detail_message_id = None
+                # 2. 获取音频流（纯音频，不下视频）
+                v = video.Video(bvid)
+                data = await v.get_download_url(0)
+                dash = (data or {}).get("dash", {})
+                audio_list = dash.get("audio") or []
+                if not audio_list:
+                    self._bili_send_bg(group_id, user_id, "B站没找到这首歌，换首歌试试喵~")
+                    return
+                # 选码率最高的音频流
+                best_audio = max(audio_list, key=lambda a: int(a.get("bandwidth") or 0))
+                audio_url = best_audio.get("baseUrl", "")
+                if not audio_url:
+                    self._bili_send_bg(group_id, user_id, "B站没找到这首歌，换首歌试试喵~")
+                    return
 
-                    # ===== 发送详情（终极防弹版） =====
-                    try:
-                        async with aiohttp.ClientSession() as session:
-                            async with session.post(url, json=payload, timeout=30) as resp:
-                                if resp.status == 200:
-                                    try:
-                                        result_json = await resp.json()
-                                    except Exception:
-                                        result_json = None
-                                    
-                                    # 最高级别防御：必须是个字典，且里面有 data
-                                    if isinstance(result_json, dict) and result_json.get("data"):
-                                        detail_message_id = result_json["data"].get("message_id")
-                                        print(f"[点歌] ✅ 详情发送成功, ID: {detail_message_id}")
-                                        if detail_message_id and hasattr(self, 'anti_recall'):
-                                            self.anti_recall.record_sent_message(
-                                                group_id=str(group_id),
-                                                content=detail_msg,
-                                                message_id=detail_message_id
-                                            )
-                                            print(f"[防撤回] 📝 已记录详情消息: {detail_message_id}")
-                                    else:
-                                        print(f"[点歌] ⚠️ 发送成功，但返回格式异常（跳过获取ID），返回: {result_json}")
+                # 3. 用 BVID 作为文件名（纯英文+数字，不乱码），保存到 data/temp_music
+                os.makedirs("data/temp_music", exist_ok=True)
+                filepath = os.path.join("data/temp_music", f"{bvid}.m4a")
+                headers = {
+                    "Referer": "https://www.bilibili.com",
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                }
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(
+                        audio_url, headers=headers,
+                        timeout=aiohttp.ClientTimeout(total=120),
+                    ) as resp:
+                        if resp.status != 200:
+                            print(f"[点歌] 音频下载 HTTP {resp.status}")
+                            self._bili_send_bg(group_id, user_id, "B站没找到这首歌，换首歌试试喵~")
+                            return
+                        content = await resp.read()
+                        if len(content) < 10 * 1024:
+                            print(f"[点歌] 音频文件太小（{len(content)} bytes），疑似失败")
+                            self._bili_send_bg(group_id, user_id, "B站没找到这首歌，换首歌试试喵~")
+                            return
+                        with open(filepath, "wb") as f:
+                            f.write(content)
+                print(f"[点歌] 音频下载完成: {filepath} ({len(content)} bytes)")
+
+                # 4. 通过 NapCat 发送 [CQ:record] 语音
+                abs_path = os.path.abspath(filepath)
+                abs_path_unix = abs_path.replace("\\", "/")
+                record_msg = f"[CQ:record,file=file:///{abs_path_unix}]"
+
+                send_url = "http://127.0.0.1:3000/send_group_msg"
+                # 先发文本详情，再发纯语音（NapCat 规定 record 段必须独占一条消息）
+                detail_text = f"[CQ:at,qq={user_id}] 🎵 《{title}》（来自B站音频流）"
+                try:
+                    async with aiohttp.ClientSession() as session:
+                        async with session.post(
+                            send_url,
+                            json={"group_id": int(group_id), "message": detail_text},
+                            timeout=aiohttp.ClientTimeout(total=30),
+                        ) as resp:
+                            if resp.status != 200:
+                                print(f"[点歌] 详情发送失败 HTTP {resp.status}: {await resp.text()}")
+                except Exception as e:
+                    print(f"[点歌] 详情发送异常: {e}")
+
+                send_ok = False
+                try:
+                    async with aiohttp.ClientSession() as session:
+                        async with session.post(
+                            send_url,
+                            json={"group_id": int(group_id), "message": record_msg},
+                            timeout=aiohttp.ClientTimeout(total=120),
+                        ) as resp:
+                            if resp.status == 200:
+                                try:
+                                    res_json = await resp.json()
+                                except Exception:
+                                    res_json = None
+                                if isinstance(res_json, dict) and res_json.get("retcode") == 0:
+                                    print(f"[点歌] ✅ 语音发送成功, ID: {res_json.get('data', {}).get('message_id')}")
+                                    send_ok = True
                                 else:
-                                    text = await resp.text()
-                                    print(f"[点歌] ❌ 详情发送失败 HTTP {resp.status}: {text}")
+                                    print(f"[点歌] ❌ 语音发送失败: {res_json}")
+                            else:
+                                print(f"[点歌] ❌ 语音 HTTP 失败: {resp.status}")
+                except Exception as e:
+                    print(f"[点歌] ❌ 语音发送异常: {e}")
+
+                # 5. 清理：发送成功后删本地文件，失败保留用于排查
+                if send_ok:
+                    try:
+                        if os.path.exists(abs_path):
+                            os.remove(abs_path)
+                            print(f"[点歌] 已清理: {abs_path}")
                     except Exception as e:
-                        print(f"[点歌] ❌ 详情发送阶段发生网络异常: {e}")
+                        print(f"[点歌] 清理文件失败: {e}")
+                else:
+                    print(f"[点歌] 发送失败，保留本地文件: {abs_path}")
 
-                    # --- 发送语音（如果有）---
-                    # 纯 CQ 码字符串格式：[CQ:record,file={abs_path}]
-                    # 不带 file:/// 前缀，直接传绝对路径给 NapCat 读取
-                    if voice_msg and voice_path:
-                        voice_payload = {
-                            "group_id": int(group_id),
-                            "message": voice_msg
-                        }
-                        try:
-                            async with aiohttp.ClientSession() as session:
-                                async with session.post(url, json=voice_payload, timeout=30) as resp:
-                                    if resp.status != 200:
-                                        text = await resp.text()
-                                        print(f"[点歌] ❌ 语音发送失败 HTTP {resp.status} - {text}")
-                                        return None
-
-                                    try:
-                                        result_json = await resp.json()
-                                    except Exception:
-                                        result_json = None
-
-                                    if not isinstance(result_json, dict) or result_json.get("retcode") != 0:
-                                        print(f"[点歌] ❌ 语音发送失败: retcode 异常，原始返回: {result_json}")
-                                        return None
-
-                                    voice_message_id = result_json.get("data", {}).get("message_id")
-                                    print(f"[点歌] ✅ 语音发送成功, ID: {voice_message_id}")
-
-                                    # 手动记录到防撤回（best-effort，不影响主流程）
-                                    try:
-                                        if voice_message_id and hasattr(self, 'anti_recall'):
-                                            self.anti_recall.record_sent_message(
-                                                group_id=str(group_id),
-                                                content=voice_msg,
-                                                message_id=voice_message_id
-                                            )
-                                            print(f"[防撤回] 🎤 已手动记录语音消息: {voice_message_id}")
-                                    except Exception as e:
-                                        print(f"[防撤回] 手动记录语音失败: {e}")
-
-                        except Exception as e:
-                            print(f"[点歌] ❌ 语音发送阶段网络异常: {e}")
-                        return None
-
-            except Exception as send_err:
-                print(f"[点歌] ⚠️ 发送阶段异常，已容错: {send_err}")
+            except Exception as e:
+                print(f"[点歌] 错误: {e}")
                 import traceback
                 traceback.print_exc()
-                try:
-                    fallback = self._create_reply("group", user_id, group_id,
-                        f"🎵 《{song_name}》- {artist} 已收到，但语音发送失败了，请稍后再试~")
-                    await self._send_reply_via_adapter(fallback)
-                except Exception:
-                    pass
-                return None
+                self._bili_send_bg(group_id, user_id, "B站没找到这首歌，换首歌试试喵~")
 
-        except Exception as e:
-            print(f"[点歌] 错误: {e}")
-            import traceback
-            traceback.print_exc()
-            return self._create_reply("group", user_id, group_id, f"❌ 点歌失败：{str(e)}")
+        asyncio.create_task(music_task())
+        return {"_handled": True}
 
     async def _send_reply_via_adapter(self, reply: Dict):
         """通过适配器发送回复"""
