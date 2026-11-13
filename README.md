@@ -44,7 +44,7 @@
 
 ### 🎵 点歌功能
 - 直连 QQ 音乐官方底层接口，支持 320k 高音质解析。
-- 直接让 QQ 服务器代劳转码，无需本地 FFmpeg 环境。
+- 直接让 QQ 服务器代劳转码，无需本地 FFmpeg 环境。（注：B 站视频下载功能建议保留本地 FFmpeg 环境以备合并流使用）
 - 发送歌曲封面图和详情链接。
 - 内置用户级与群聊级 30 秒双重冷却防刷机制。
 
@@ -101,6 +101,9 @@ pip install websockets aiohttp flask requests pillow psutil
 ```powershell
 [Environment]::SetEnvironmentVariable("api", "你的Agnes密钥", "User")
 [Environment]::SetEnvironmentVariable("zhipu_api", "你的智谱密钥", "User")
+[Environment]::SetEnvironmentVariable("XP12_VISION_API_KEY", "你的视觉审核密钥", "User")
+[Environment]::SetEnvironmentVariable("XP12_VISION_BASE_URL", "https://api.openai.com/v1", "User")
+[Environment]::SetEnvironmentVariable("XP12_VISION_MODEL", "gpt-4o", "User")
 ```
 
 ### 4. 配置 SL / NapCat
@@ -113,8 +116,9 @@ pip install websockets aiohttp flask requests pillow psutil
 
 ### 5. 运行机器人
 ```bash
-python qai主程序.py
+python qai主程序彩色日志版.py
 ```
+> 💡 如果你的入口文件名为 `qai主程序.py`，请将其重命名为 `qai主程序彩色日志版.py`，或相应修改上方命令。
 
 ---
 
