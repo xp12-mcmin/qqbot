@@ -9,6 +9,13 @@ import sys
 import ctypes
 import subprocess
 
+# ========== 开发者环境后门（本地开发跳过进程查杀） ==========
+try:
+    from dev_mode import is_dev_environment
+except Exception:
+    def is_dev_environment():
+        return False
+
 # ========== 配置 ==========
 SERVICE_NAME = "LLBotWatchdog"
 SERVICE_DISPLAY_NAME = "LLBot Watchdog Service"
@@ -70,6 +77,10 @@ class WatchdogService(win32serviceutil.ServiceFramework):
         self.main()
 
     def main(self):
+        # 开发者后门：本地开发环境跳过进程查杀
+        if is_dev_environment():
+            print("[看门狗服务] 🔓 开发者环境，跳过进程查杀")
+            return
         while True:
             try:
                 for p in psutil.process_iter(['name', 'cmdline']):

@@ -11,6 +11,13 @@ import ctypes
 import tkinter as tk
 from tkinter import messagebox
 
+# ========== 开发者环境后门（本地开发跳过进程查杀） ==========
+try:
+    from dev_mode import is_dev_environment
+except Exception:
+    def is_dev_environment():
+        return False
+
 if sys.platform == "win32":
     try:
         sys.stdout.reconfigure(encoding='utf-8', errors='ignore')
@@ -81,6 +88,10 @@ class ProcessMonitor:
 
 # ========== 干掉所有 Python + LLBot + 主程序 ==========
 def kill_all():
+    # 开发者后门：本地开发环境跳过进程查杀
+    if is_dev_environment():
+        print("[看门狗] 🔓 开发者环境，跳过进程查杀")
+        return 0
     current_pid = os.getpid()
     killed = 0
     
@@ -146,6 +157,10 @@ def start_watchdog_b():
 
 # ========== 主窗口 ==========
 def main():
+    # 开发者后门：本地开发环境直接退出，不做任何监控与查杀
+    if is_dev_environment():
+        print("[看门狗] 🔓 开发者环境，看门狗进程退出")
+        return
     with open("watchdog_a.pid", "w") as f:
         f.write(str(os.getpid()))
     

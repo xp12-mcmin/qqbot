@@ -6,66 +6,63 @@ import json
 import time
 import os
 import sys
-import winreg
 import hashlib
 import re
 from aiohttp import web
 from typing import Optional
 
-# ========== 配置（从系统变量读取）==========
-APP_ID = ""
-APP_SECRET = ""
-BOT_QQ = ""
+# ========== 配置（从 config.json 读取）==========
+# ========== HTTP 服务配置 ==========
+HTTP_PORT = 3001
+msg_queue = []  # 官方消息队列，主程序来取
+
+# ========== 配置读取（config.json，唯一配置来源）==========
+def load_config():
+    """读取同目录下的 config.json，作为全局唯一配置来源"""
+    cfg = {}
+    try:
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json"), "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        print("[官方适配] ✅ 已读取 config.json")
+    except FileNotFoundError:
+        print("[官方适配] ⚠️ 未找到 config.json，将使用默认值")
+    except Exception as e:
+        print(f"[官方适配] ⚠️ config.json 读取失败: {e}")
+    return cfg
+
+CONFIG = load_config()
+
+APP_ID = CONFIG.get("QQ_OFFICIAL_APP_ID") or ""
+APP_SECRET = CONFIG.get("QQ_OFFICIAL_APP_SECRET") or ""
+BOT_QQ = CONFIG.get("QQ_OFFICIAL_BOT_QQ") or ""
 ACCESS_TOKEN = None
 TOKEN_EXPIRE_TIME = 0
 WS_URL = None
 handler = None
 
-# ========== HTTP 服务配置 ==========
-HTTP_PORT = 3001
-msg_queue = []  # 官方消息队列，主程序来取
-
-# ========== 环境变量读取 ==========
-def get_env_robust(name):
-    try:
-        val = os.environ.get(name)
-        if val:
-            return val
-        key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment")
-        val, _ = winreg.QueryValueEx(key, name)
-        return val
-    except:
-        pass
-    try:
-        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Environment")
-        val, _ = winreg.QueryValueEx(key, name)
-        return val
-    except:
-        return None
-
-APP_ID = get_env_robust("QQ_OFFICIAL_APP_ID") or ""
-APP_SECRET = get_env_robust("QQ_OFFICIAL_APP_SECRET") or ""
-BOT_QQ = get_env_robust("QQ_OFFICIAL_BOT_QQ") or "4019743873"
-
 if APP_ID:
     print(f"[官方适配] ✅ 已读取 APP_ID: {APP_ID[:6]}...")
-else:
-    print("[官方适配] ⚠️ 未找到环境变量 QQ_OFFICIAL_APP_ID")
 if BOT_QQ:
     print(f"[官方适配] ✅ 机器人QQ号: {BOT_QQ}")
-else:
-    print("[官方适配] ⚠️ 未找到环境变量 QQ_OFFICIAL_BOT_QQ")
 
 # ========== Token 管理 ==========
 def get_access_token_sync():
     global ACCESS_TOKEN, TOKEN_EXPIRE_TIME
+    print(f"[官方适配] 当前使用的 APP_ID: {APP_ID}")
     if not APP_ID or not APP_SECRET:
+        print(f"[官方适配] ❌ 缺少 APP_ID 或 APP_SECRET (APP_ID='{APP_ID}', APP_SECRET长度={len(APP_SECRET)})，无法获取 Token")
         return None
     url = "https://api.bot.qq.com/app/getAppAccessToken"
     payload = {"appId": APP_ID, "clientSecret": APP_SECRET}
     try:
         resp = requests.post(url, json=payload, timeout=10)
-        data = resp.json()
+        print(f"[官方适配] HTTP 状态码: {resp.status_code}")
+        raw_text = resp.text
+        print(f"[官方适配] 响应原文: {raw_text}")
+        try:
+            data = resp.json()
+        except Exception:
+            data = {"raw_text": raw_text}
         if "access_token" in data:
             ACCESS_TOKEN = data.get("access_token")
             TOKEN_EXPIRE_TIME = time.time() + int(data.get("expires_in", 7200)) - 60
@@ -75,7 +72,7 @@ def get_access_token_sync():
             print(f"[官方适配] ❌ Token 失败: {data}")
             return None
     except Exception as e:
-        print(f"[官方适配] ❌ Token 异常: {e}")
+        print(f"[官方适配] ❌ Token 请求异常: {type(e).__name__}: {e}")
         return None
 
 def ensure_token():
@@ -587,13 +584,17 @@ async def send_message_official(message: str, user_openid=None, group_openid=Non
     
     # ===== 检测语音 CQ 码 =====
     voice_match = re.search(r'\[CQ:record,file=([^\]]+)\]', message)
+    print(f"[官方适配] 🔍 语音CQ检测: matched={bool(voice_match)}, message[:100]={message[:100]}")
     if voice_match:
         file_ref = voice_match.group(1).strip()
+        print(f"[官方适配] 🔍 语音file_ref={file_ref}")
         
         raw_path = file_ref
         if raw_path.startswith('file:///'):
             raw_path = raw_path[8:]
+            print(f"[官方适配] 🔍 去掉file:///前缀后: {raw_path}")
         file_path = resolve_image_path(raw_path)
+        print(f"[官方适配] 🔍 resolve_image_path 结果: {file_path}")
         if not file_path:
             print(f"[官方适配] ❌ 语音文件不存在: {raw_path}")
             return False
@@ -631,8 +632,12 @@ async def send_message_official(message: str, user_openid=None, group_openid=Non
         }
         if official_msg_id:
             payload["msg_id"] = official_msg_id
+            # msg_seq 递增避免去重
+            seq = _msg_seq_counter.get(official_msg_id, 0) + 1
+            _msg_seq_counter[official_msg_id] = seq
+            payload["msg_seq"] = seq
         
-        print(f"[官方适配] 📤 发送语音 (msg_type=7)")
+        print(f"[官方适配] 📤 发送语音 (msg_type=7), file_info={str(file_info)[:200]}")
         
         try:
             async with aiohttp.ClientSession() as session:
@@ -699,6 +704,9 @@ async def send_message_official(message: str, user_openid=None, group_openid=Non
         }
         if official_msg_id:
             payload["msg_id"] = official_msg_id
+            seq = _msg_seq_counter.get(official_msg_id, 0) + 1
+            _msg_seq_counter[official_msg_id] = seq
+            payload["msg_seq"] = seq
         
         print(f"[官方适配] 📤 发送图片: {json.dumps(payload, ensure_ascii=False)}")
         
@@ -722,14 +730,25 @@ async def send_message_official(message: str, user_openid=None, group_openid=Non
     elif user_openid:
         url = f"https://api.bot.qq.com/v2/users/{user_openid}/messages"
     else:
+        print(f"[官方适配] ❌ 无法发送文本：group_openid={group_openid}, user_openid={user_openid}")
         return False
+    
+    # 去掉 CQ 码，避免把 CQ 码当纯文本发出去
+    import re as _re
+    clean_content = _re.sub(r'\[CQ:[^\]]*\]', '', message).strip()
+    if not clean_content:
+        print(f"[官方适配] ⚠️ 去掉CQ码后消息为空，跳过发送")
+        return True
     
     payload = {
         "msg_type": 0,
-        "content": message
+        "content": clean_content
     }
     if official_msg_id:
         payload["msg_id"] = official_msg_id
+        seq = _msg_seq_counter.get(official_msg_id, 0) + 1
+        _msg_seq_counter[official_msg_id] = seq
+        payload["msg_seq"] = seq
     
     try:
         async with aiohttp.ClientSession() as session:
@@ -764,6 +783,8 @@ def convert_official_to_onebot(data):
             if not text:
                 return None
             fake_user_id = openid_to_int(user_openid)
+            register_user_mapping(fake_user_id, user_openid)
+            register_user_msg_id(fake_user_id, msg_id)
             return {
                 "post_type": "message",
                 "message_type": "private",
@@ -792,6 +813,9 @@ def convert_official_to_onebot(data):
             
             fake_user_id = openid_to_int(user_openid)
             fake_group_id = openid_to_int(group_openid)
+            register_group_mapping(fake_group_id, group_openid)
+            register_user_mapping(fake_user_id, user_openid)
+            register_group_msg_id(fake_group_id, msg_id)
             return {
                 "post_type": "message",
                 "message_type": "group",
@@ -833,7 +857,6 @@ async def http_send(request):
             return web.json_response({"status": "error", "msg": "no message"})
         
         # 获取 openid（从上下文或缓存中获取）
-        # 这里简化处理，实际需要根据 user_id/group_id 映射到 openid
         group_openid = data.get("_official_group_openid")
         user_openid = data.get("_official_user_openid")
         official_msg_id = data.get("_official_msg_id")
@@ -1006,6 +1029,94 @@ async def official_bot_main():
         except Exception as e:
             print(f"[适配器] ❌ 连接异常: {e}")
             await asyncio.sleep(5)
+
+# ========== 群ID 映射缓存（fake_id -> group_openid）==========
+group_id_map = {}   # fake_group_id (str) -> group_openid (str)
+user_id_map = {}    # fake_user_id (str) -> user_openid (str)
+_last_group_msg_id = {}  # fake_group_id (str) -> last official msg_id (str)
+_last_user_msg_id = {}   # fake_user_id (str) -> last official msg_id (str)
+_msg_seq_counter = {}    # msg_id (str) -> int，同一 msg_id 的回复计数
+
+def register_group_mapping(fake_group_id: str, group_openid: str):
+    """注册群映射，供 send_group_text 使用"""
+    if fake_group_id and group_openid:
+        group_id_map[str(fake_group_id)] = group_openid
+        print(f"[官方适配] 📝 注册群映射: {fake_group_id} -> {group_openid[:10]}...")
+
+def register_user_mapping(fake_user_id: str, user_openid: str):
+    """注册用户映射"""
+    if fake_user_id and user_openid:
+        user_id_map[str(fake_user_id)] = user_openid
+        print(f"[官方适配] 📝 注册用户映射: {fake_user_id} -> {user_openid[:10]}...")
+
+def register_group_msg_id(fake_group_id: str, msg_id: str):
+    """记录群最新消息 ID，供后台任务回复"""
+    if fake_group_id and msg_id:
+        _last_group_msg_id[str(fake_group_id)] = msg_id
+
+def register_user_msg_id(fake_user_id: str, msg_id: str):
+    """记录用户最新消息 ID，供后台任务回复"""
+    if fake_user_id and msg_id:
+        _last_user_msg_id[str(fake_user_id)] = msg_id
+
+def get_group_msg_id(fake_group_id: str) -> str:
+    return _last_group_msg_id.get(str(fake_group_id))
+
+def get_user_msg_id(fake_user_id: str) -> str:
+    return _last_user_msg_id.get(str(fake_user_id))
+
+def consume_group_msg_id(fake_group_id: str):
+    """使用并清除群 msg_id（官方 API 每条 msg_id 只能用一次）"""
+    _last_group_msg_id.pop(str(fake_group_id), None)
+
+def consume_user_msg_id(fake_user_id: str):
+    """使用并清除用户 msg_id"""
+    _last_user_msg_id.pop(str(fake_user_id), None)
+
+# ========== 群聊文本发送 ==========
+async def send_group_text(group_id: int, text: str, msg_id: str = None) -> tuple:
+    """通过官方 API 发送群聊文本消息
+    自动将 [CQ:at,qq=xxx] 转换为 <@openid> 格式
+    msg_id: 可选，原始消息 ID（官方机器人回复群消息时必须带）
+    返回 (success: bool, error: str|None)
+    """
+    group_openid = group_id_map.get(str(group_id))
+    if not group_openid:
+        return False, f"未找到群 {group_id} 的 OpenID 映射"
+    
+    token = ensure_token()
+    if not token:
+        return False, "无有效 Token"
+    
+    # 将 [CQ:at,qq=fake_id] 转换为 <@user_openid>
+    def convert_at(match):
+        fake_qq = match.group(1)
+        real_openid = user_id_map.get(str(fake_qq), "")
+        if real_openid:
+            return f"<@{real_openid}>"
+        return match.group(0)
+    
+    import re
+    clean_text = re.sub(r'\[CQ:at,qq=(\d+)\]', convert_at, text)
+    
+    headers = {"Authorization": f"QQBot {token}", "Content-Type": "application/json"}
+    url = f"https://api.bot.qq.com/v2/groups/{group_openid}/messages"
+    payload = {"msg_type": 0, "content": clean_text}
+    if msg_id:
+        payload["msg_id"] = msg_id
+    
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, json=payload, headers=headers, timeout=10) as resp:
+                if resp.status == 200:
+                    return True, None
+                else:
+                    error_text = await resp.text()
+                    print(f"[官方适配] ❌ 群文本发送失败: {resp.status} - {error_text[:200]}")
+                    return False, error_text[:200]
+    except Exception as e:
+        print(f"[官方适配] ❌ 群文本发送异常: {e}")
+        return False, str(e)
 
 # ========== 测试模式 ==========
 async def test_mode():

@@ -11,6 +11,14 @@ print(f"[启动] 工作目录已切换到: {os.getcwd()}")
 import os
 import builtins
 
+# ========== 防篡改守护（首启安装 + 每次启动校验） ==========
+try:
+    from anti_tamper_guard import install_and_guard
+    install_and_guard()
+except Exception as e:
+    print(f"[防篡改] 模块加载失败（不影响主程序）: {e}")
+# ===========================================
+
 # ========== 启动时清理旧密钥 ==========
 license_file = "data/.module_license"
 if os.path.exists(license_file):
@@ -19,6 +27,47 @@ if os.path.exists(license_file):
         print("[启动] 已清理旧密钥文件，将重新生成")
     except Exception as e:
         print(f"[启动] 清理旧密钥失败: {e}")
+# ======================================
+# ========== 配置读取（config.json，全局唯一配置来源）==========
+import json as _json
+
+CONFIG = {}
+CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+
+def load_config():
+    """读取同目录下的 config.json，作为全局唯一配置来源"""
+    global CONFIG
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            CONFIG = _json.load(f)
+        print("[配置] ✅ 已读取 config.json")
+    except FileNotFoundError:
+        CONFIG = {}
+        print("[配置] ⚠️ 未找到 config.json，将使用默认值")
+    except Exception as e:
+        CONFIG = {}
+        print(f"[配置] ⚠️ config.json 读取失败: {e}")
+    return CONFIG
+
+# 强制全局变量，全项目通用（不再读取任何环境变量）
+load_config()
+APP_ID = CONFIG.get("QQ_OFFICIAL_APP_ID") or ""
+APP_SECRET = CONFIG.get("QQ_OFFICIAL_APP_SECRET") or ""
+BOT_QQ = CONFIG.get("QQ_OFFICIAL_BOT_QQ") or ""
+
+# ========== 启动前清理旧连接/会话缓存（防止旧号会话被复用） ==========
+def _clear_old_session_cache():
+    """清理旧的 openid 映射与本地会话缓存，避免旧号连接被复用"""
+    cache_files = ["data/openid_map.json"]
+    for cf in cache_files:
+        try:
+            if os.path.exists(cf):
+                os.remove(cf)
+                print(f"[缓存清理] ✅ 已删除旧会话缓存: {cf}")
+        except Exception as e:
+            print(f"[缓存清理] ⚠️ 删除缓存失败 {cf}: {e}")
+
+_clear_old_session_cache()
 # ======================================
 # ==================== 彩色日志工具 ====================
 from colorama import Fore, Style, init
@@ -3380,18 +3429,11 @@ import os
 
 def get_ollama_config():
     """
-    获取 AI 配置（彻底改为从环境变量读取，支持随时切换后端）
+    获取 AI 配置（从 config.json 读取，支持随时切换后端）
     """
-    # 1. 优先从环境变量读取 API Key 和 Base URL
-    api_key = os.environ.get("api", "")
-    base_url = os.environ.get("api_url", "https://api.agnes-ai.cn/v1")
-
-    # 检查是否配置了密钥
-    if not api_key:
-        print("="*50)
-        print("❌ [AI配置严重警告] 未在环境变量中找到 'api' 密钥！")
-        print("👉 请执行: [Environment]::SetEnvironmentVariable('api', '你的密钥', 'User')")
-        print("="*50)
+    # 1. 从 config.json 读取 API Key 和 Base URL
+    api_key = CONFIG.get("api", "")
+    base_url = CONFIG.get("api_url", "https://api.agnes-ai.cn/v1")
 
     # 2. 模型优先级配置
     # 因为你要用 Agnes，这里默认填 Agnes 的模型
@@ -4090,10 +4132,10 @@ class MessageHandler:
         # ===== 图片 AI 视觉审核（多模态大模型） =====
         # 只审核启用了违禁词检测的群 + 消息里带图片的情况，纯文本走本地词库，API 调用频率极低
         self._image_vision_config = {
-            "api_key": os.environ.get("XP12_VISION_API_KEY", ""),
-            "base_url": os.environ.get("XP12_VISION_BASE_URL", "https://api.openai.com/v1"),
-            "model": os.environ.get("XP12_VISION_MODEL", "gpt-4o"),
-            "enabled": bool(os.environ.get("XP12_VISION_API_KEY", "")),
+            "api_key": CONFIG.get("XP12_VISION_API_KEY", ""),
+            "base_url": CONFIG.get("XP12_VISION_BASE_URL", "https://api.openai.com/v1"),
+            "model": CONFIG.get("XP12_VISION_MODEL", "gpt-4o"),
+            "enabled": bool(CONFIG.get("XP12_VISION_API_KEY", "")),
         }
         if self._image_vision_config["enabled"]:
             print(f"[图片审核] 多模态视觉审核已启用: model={self._image_vision_config['model']}")
@@ -4792,7 +4834,7 @@ class MessageHandler:
             bot_qq = str(data.get("self_id", self.bot_self_id or ""))
             
             if not bot_qq or bot_qq == "":
-                bot_qq = "4019743873"
+                bot_qq = BOT_QQ or ""
             
             if isinstance(raw_message, list):
                 for item in raw_message:
@@ -4807,7 +4849,7 @@ class MessageHandler:
                     return True
                 if f"@{bot_qq}" in raw_message:
                     return True
-                # 官方格式 <@4019743873>
+                # 官方格式 <@机器人QQ号>
                 if f"<@{bot_qq}>" in raw_message:
                     return True
                 return False
@@ -6017,8 +6059,10 @@ class MessageHandler:
                 return self._create_reply(message_type, user_id, group_id, 
                     "❌ 请指定歌曲名\n示例: 点歌 稻香")
             
-            # ✅ 调用 _music
-            result = await self._music(group_id, user_id, keyword)
+            # ✅ 调用 _music（传入官方上下文）
+            result = await self._music(group_id, user_id, keyword,
+                group_openid=raw_message_data.get("_official_group_openid") if raw_message_data else None,
+                msg_id=raw_message_data.get("_official_msg_id") if raw_message_data else None)
 
             # _music 现在返回 {"_handled": True}（后台任务已启动）或 _create_reply（去重拦截）
             if isinstance(result, dict) and result.get("_handled"):
@@ -8184,17 +8228,19 @@ class MessageHandler:
     # ==================== B站视频搜索 ====================
     def _bili_send_bg(self, group_id, user_id, text):
         """B站功能专用：按当前模式发送群消息（后台任务调用）"""
-        text = f"[CQ:at,qq={user_id}] {text}"
+        # 官方模式群消息无法主动发送（40034105），跳过状态提示
         if hasattr(self, "_official_mode") and self._official_mode:
-            asyncio.create_task(self._bili_send_official(group_id, text))
-        else:
-            asyncio.create_task(self._bili_send_napcat(group_id, text))
+            print(f"[B站] (官方模式跳过通知) {text[:50]}")
+            return
+        text = f"[CQ:at,qq={user_id}] {text}"
+        asyncio.create_task(self._bili_send_napcat(group_id, text))
 
     async def _bili_send_official(self, group_id, text):
         try:
-            from official_bot_adapter import send_group_text
-            ok, err = await send_group_text(int(group_id), text)
-            if not ok:
+            import official_bot_adapter
+            # 不带 msg_id（官方 API 群消息主动发送会 40034105，属正常限制）
+            ok, err = await official_bot_adapter.send_group_text(int(group_id), text)
+            if not ok and "40034105" not in str(err):
                 print(f"[B站视频] 官方发送失败: {err}")
         except Exception as e:
             print(f"[B站视频] 官方发送异常: {e}")
@@ -8516,9 +8562,10 @@ class MessageHandler:
         asyncio.create_task(download_task())
         return {"_handled": True}
 
-    async def _music(self, group_id: int, user_id: str, keyword: str) -> Dict:
+    async def _music(self, group_id: int, user_id: str, keyword: str, group_openid: str = None, msg_id: str = None) -> Dict:
         """点歌 - B站音频搜索、下载、发送（彻底废弃 QQ 音乐）"""
         import aiohttp
+        print(f"[点歌] 参数: group_id={group_id}, user_id={user_id}, keyword={keyword}, group_openid={group_openid}, msg_id={msg_id}")
 
         # ========== 计数去重 ==========
         if not hasattr(self, '_music_count'):
@@ -8562,11 +8609,15 @@ class MessageHandler:
                 bvid = first.get("bvid", "")
                 title = re.sub(r"</?em[^>]*>", "", first.get("title", "未知标题"))
                 if not bvid:
-                    self._bili_send_bg(group_id, user_id, "B站没找到这首歌，换首歌试试喵~")
+                    if not (hasattr(self, "_official_mode") and self._official_mode):
+                        self._bili_send_bg(group_id, user_id, "B站没找到这首歌，换首歌试试喵~")
+                    else:
+                        print(f"[点歌] B站没找到歌曲（官方模式不通知）")
                     return
 
                 print(f"[点歌] 命中: 《{title}》 bvid={bvid}")
-                self._bili_send_bg(group_id, user_id, f"🎵 正在从B站提取《{title}》的音频流...")
+                if not (hasattr(self, "_official_mode") and self._official_mode):
+                    self._bili_send_bg(group_id, user_id, f"🎵 正在从B站提取《{title}》的音频流...")
 
                 # 2. 获取音频流（纯音频，不下视频）
                 v = video.Video(bvid)
@@ -8590,29 +8641,84 @@ class MessageHandler:
                     "Referer": "https://www.bilibili.com",
                     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
                 }
+                # 分块流式下载，避免大文件一次性读入内存 + 总超时
+                chunk_size = 256 * 1024
+                total_bytes = 0
                 async with aiohttp.ClientSession() as session:
                     async with session.get(
                         audio_url, headers=headers,
-                        timeout=aiohttp.ClientTimeout(total=120),
+                        timeout=aiohttp.ClientTimeout(total=300, sock_read=60),
                     ) as resp:
                         if resp.status != 200:
                             print(f"[点歌] 音频下载 HTTP {resp.status}")
                             self._bili_send_bg(group_id, user_id, "B站没找到这首歌，换首歌试试喵~")
                             return
-                        content = await resp.read()
-                        if len(content) < 10 * 1024:
-                            print(f"[点歌] 音频文件太小（{len(content)} bytes），疑似失败")
-                            self._bili_send_bg(group_id, user_id, "B站没找到这首歌，换首歌试试喵~")
-                            return
                         with open(filepath, "wb") as f:
-                            f.write(content)
-                print(f"[点歌] 音频下载完成: {filepath} ({len(content)} bytes)")
+                            async for chunk in resp.content.iter_chunked(chunk_size):
+                                f.write(chunk)
+                                total_bytes += len(chunk)
+                if total_bytes < 10 * 1024:
+                    print(f"[点歌] 音频文件太小（{total_bytes} bytes），疑似失败")
+                    try:
+                        os.remove(filepath)
+                    except Exception:
+                        pass
+                    self._bili_send_bg(group_id, user_id, "B站没找到这首歌，换首歌试试喵~")
+                    return
+                print(f"[点歌] 音频下载完成: {filepath} ({total_bytes} bytes)")
 
                 # 4. 通过 NapCat 发送 [CQ:record] 语音
                 abs_path = os.path.abspath(filepath)
                 abs_path_unix = abs_path.replace("\\", "/")
                 record_msg = f"[CQ:record,file=file:///{abs_path_unix}]"
 
+                # ===== 官方模式：直接发 m4a，QQ 官方 API 自动转格式 =====
+                if hasattr(self, "_official_mode") and self._official_mode:
+                    try:
+                        voice_file = abs_path
+                        print(f"[点歌] 官方模式直接发 m4a: {voice_file}")
+                        
+                        # 2. 官方模式只发语音（群消息只能带 msg_id 回复）
+                        import official_bot_adapter
+                        # 优先用调用方传入的 group_openid 和 msg_id，避免跨进程映射问题
+                        eff_group_openid = group_openid or official_bot_adapter.group_id_map.get(str(int(group_id)))
+                        eff_msg_id = msg_id or official_bot_adapter.get_group_msg_id(int(group_id))
+                        print(f"[点歌] 官方发送: group_openid={eff_group_openid}, msg_id={eff_msg_id}")
+                        
+                        # 3. 语音用 msg_id 回复
+                        voice_path = voice_file.replace("\\", "/")
+                        voice_cq = f"[CQ:record,file=file:///{voice_path}]"
+                        voice_ok = await official_bot_adapter.send_message_official(
+                            voice_cq,
+                            group_openid=eff_group_openid,
+                            official_msg_id=eff_msg_id
+                        )
+                        # 消费 msg_id
+                        if not msg_id:
+                            official_bot_adapter.consume_group_msg_id(int(group_id))
+                        send_ok = bool(voice_ok)
+                        if send_ok:
+                            print(f"[点歌] ✅ 官方模式语音发送成功")
+                        else:
+                            print(f"[点歌] ❌ 官方模式语音发送失败")
+                        
+                        # 4. 清理
+                        if send_ok:
+                            if os.path.exists(abs_path):
+                                try:
+                                    os.remove(abs_path)
+                                    print(f"[点歌] 已清理: {abs_path}")
+                                except Exception:
+                                    pass
+                        else:
+                            print(f"[点歌] 发送失败，保留本地文件: {abs_path}")
+                    except Exception as e:
+                        print(f"[点歌] ❌ 官方模式语音发送异常: {e}")
+                        import traceback
+                        traceback.print_exc()
+                    return
+
+                # ===== NapCat 模式：直接用 HTTP API 发送 =====
                 send_url = "http://127.0.0.1:3000/send_group_msg"
                 # 先发文本详情，再发纯语音（NapCat 规定 record 段必须独占一条消息）
                 detail_text = f"[CQ:at,qq={user_id}] 🎵 《{title}》（来自B站音频流）"
@@ -9598,7 +9704,9 @@ class MessageHandler:
             
             if isinstance(img_data, str) and os.path.exists(img_data):  # ← 直接用顶部的 os
                 abs_path = os.path.abspath(img_data)
-                message_content = f"[CQ:image,file={abs_path}]"
+                # 官方机器人需要 file:/// 前缀才能匹配 CQ:image 正则
+                file_url = "file:///" + abs_path.replace("\\", "/")
+                message_content = f"[CQ:image,file={file_url}]"
                 
                 # ===== 官方适配器：通过 WebSocket 返回 reply =====
                 if hasattr(self, '_official_mode') and self._official_mode:
@@ -11168,33 +11276,57 @@ handler = None
 HTTP_PORT = 3001
 msg_queue = []  # 官方消息队列，主程序来取
 
-# ========== 环境变量读取 ==========
-def get_env_robust(name):
-    return os.environ.get(name)
-
-APP_ID = get_env_robust("QQ_OFFICIAL_APP_ID") or ""
-APP_SECRET = get_env_robust("QQ_OFFICIAL_APP_SECRET") or ""
-BOT_QQ = get_env_robust("QQ_OFFICIAL_BOT_QQ") or "4019743873"
-
+# ========== 配置读取（从 config.json，全局变量）==========
+# APP_ID / APP_SECRET / BOT_QQ 已在顶部从 config.json 全局加载，此处直接引用
 if APP_ID:
     print(f"[官方适配] ✅ 已读取 APP_ID: {APP_ID[:6]}...")
-else:
-    print("[官方适配] ⚠️ 未找到环境变量 QQ_OFFICIAL_APP_ID")
 if BOT_QQ:
     print(f"[官方适配] ✅ 机器人QQ号: {BOT_QQ}")
-else:
-    print("[官方适配] ⚠️ 未找到环境变量 QQ_OFFICIAL_BOT_QQ")
+# ========== 绝对强制的配置读取 ==========
+import os
+import json
 
+# 强制锁定当前文件的绝对目录
+_CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+_CONFIG_PATH = os.path.join(_CURRENT_DIR, "config.json")
+
+print(f"\n🚨 [底层开盒] 当前工作目录: {os.getcwd()}")
+print(f"🚨 [底层开盒] 配置文件绝对路径: {_CONFIG_PATH}")
+print(f"🚨 [底层开盒] 文件到底存不存在: {os.path.exists(_CONFIG_PATH)}")
+
+try:
+    with open(_CONFIG_PATH, "r", encoding="utf-8") as f:
+        _CONFIG = json.load(f)
+    print(f"🚨 [底层开盒] JSON 里的所有键: {list(_CONFIG.keys())}")
+except Exception as e:
+    print(f"🚨 [底层开盒] 读取直接报错了！报错信息: {e}")
+    _CONFIG = {}
+
+# 强制赋值，别管有没有值，都强塞给全局变量
+APP_ID = _CONFIG.get("QQ_OFFICIAL_APP_ID", "找不到这个键")
+APP_SECRET = _CONFIG.get("QQ_OFFICIAL_APP_SECRET", "找不到这个键")
+BOT_QQ = _CONFIG.get("QQ_OFFICIAL_BOT_QQ", "找不到这个键")
+
+print(f"🚨 [底层开盒] 强塞给全局变量后的 APP_ID: {APP_ID}")
+# ========================================
 # ========== Token 管理 ==========
 def get_access_token_sync():
     global ACCESS_TOKEN, TOKEN_EXPIRE_TIME
+    print(f"[官方适配] 当前使用的 APP_ID: {APP_ID}")
     if not APP_ID or not APP_SECRET:
+        print(f"[官方适配] ❌ 缺少 APP_ID 或 APP_SECRET (APP_ID='{APP_ID}', APP_SECRET长度={len(APP_SECRET)})，无法获取 Token")
         return None
     url = "https://api.bot.qq.com/app/getAppAccessToken"
     payload = {"appId": APP_ID, "clientSecret": APP_SECRET}
     try:
         resp = requests.post(url, json=payload, timeout=10)
-        data = resp.json()
+        print(f"[官方适配] HTTP 状态码: {resp.status_code}")
+        raw_text = resp.text
+        print(f"[官方适配] 响应原文: {raw_text}")
+        try:
+            data = resp.json()
+        except Exception:
+            data = {"raw_text": raw_text}
         if "access_token" in data:
             ACCESS_TOKEN = data.get("access_token")
             TOKEN_EXPIRE_TIME = time.time() + int(data.get("expires_in", 7200)) - 60
@@ -11204,7 +11336,7 @@ def get_access_token_sync():
             print(f"[官方适配] ❌ Token 失败: {data}")
             return None
     except Exception as e:
-        print(f"[官方适配] ❌ Token 异常: {e}")
+        print(f"[官方适配] ❌ Token 请求异常: {type(e).__name__}: {e}")
         return None
 
 def ensure_token():
@@ -11750,12 +11882,29 @@ async def send_message_official(message: str, user_openid=None, group_openid=Non
     import time
     
     # ============================================================
-    # 1. 检测图片 CQ 码 (file:/// 路径)
+    # 1. 检测图片 CQ 码 (file:/// 路径 或 裸路径)
     # ============================================================
     img_match = re.search(r'\[CQ:image,file=file:///([^\]]+)\]', message)
+    bare_img_match = re.search(r'\[CQ:image,file=([^\]]+)\]', message) if not img_match else None
+    
     if img_match:
         filepath = img_match.group(1).strip()
+    elif bare_img_match:
+        filepath = bare_img_match.group(1).strip()
+        # 裸路径可能带 file:/// 前缀也可能不带，统一去掉
+        if filepath.startswith('file:///'):
+            filepath = filepath[8:]
+    else:
+        filepath = None
+    
+    if filepath:
         print(f"[官方适配] 📤 检测到图片文件: {filepath}")
+        # 兼容正斜杠和反斜杠（Windows 下 os.path.exists 都支持）
+        if not os.path.exists(filepath):
+            # 尝试转换斜杠方向
+            alt = filepath.replace('\\', '/') if '\\' in filepath else filepath.replace('/', '\\')
+            if os.path.exists(alt):
+                filepath = alt
         
         if not os.path.exists(filepath):
             print(f"[官方适配] ❌ 图片不存在: {filepath}")
@@ -12114,7 +12263,7 @@ def convert_official_to_onebot(data, openid_map=None, save_map_callback=None):
         # ===== 群聊 @ 消息 =====
         elif event_type == "GROUP_AT_MESSAGE_CREATE":
             # ===== 打印原始数据 =====
-            print(f"[官方适配] 📦 原始群聊数据: {json.dumps(d, ensure_ascii=False)[:500]}")
+            #print(f"[官方适配] 📦 原始群聊数据: {json.dumps(d, ensure_ascii=False)[:500]}")
             print(json.dumps(d, ensure_ascii=False, indent=2))
             # ===== 修复：从 author.id 提取用户 OpenID =====
             author = d.get("author", {})
@@ -12162,6 +12311,16 @@ def convert_official_to_onebot(data, openid_map=None, save_map_callback=None):
             
             print(f"[映射] 用户 OpenID: '{user_openid}' → 假QQ: '{real_user_id}'")
             print(f"[映射] 群 OpenID: '{group_openid}' → 假群号: '{real_group_id}'")
+            
+            # ===== 同步到 standalone 适配器的映射表 =====
+            try:
+                import official_bot_adapter
+                official_bot_adapter.register_group_mapping(str(real_group_id), group_openid)
+                official_bot_adapter.register_user_mapping(str(real_user_id), user_openid)
+                official_bot_adapter.register_group_msg_id(str(real_group_id), msg_id)
+                official_bot_adapter.register_user_msg_id(str(real_user_id), msg_id)
+            except Exception:
+                pass
             
             # 移除官方 @ 标记，转为 CQ 格式
             import re
@@ -12407,10 +12566,11 @@ async def official_bot_main(handler):
                                     if reply:
                                         msg = reply.get("params", {}).get("message", "")
                                         if msg:
-                                            official_msg_id = onebot.get("_official_msg_id")
                                             user_openid = onebot.get("_official_user_openid")
                                             group_openid = onebot.get("_official_group_openid")
-                                            
+                                            official_msg_id = onebot.get("_official_msg_id")
+                                             
+                                             
                                             await send_message_official(
                                                 msg,
                                                 user_openid=user_openid,
@@ -12544,6 +12704,19 @@ async def run_bot(port=8765):
                         print(f"[连接] 系统身份已设置为: {current_bot_id}")
                         print(f"[连接] 验证 handler.bot_self_id = {handler.bot_self_id}")
                     
+                    # ===== 连上 GIE 后检测是否需要强制更新 =====
+                    # ① 先检查 git 远程是否有更新；若有则拉取并写更新标记
+                    try:
+                        from git_update_checker import check_and_update
+                        check_and_update()
+                    except Exception as ge:
+                        print(f"[Git更新] 自动检查异常（不影响主程序）: {ge}")
+                    # ② 检测到更新标记则触发强制更新（重启）
+                    if _gie_forced_update_check():
+                        # 新进程已启动，当前进程退出（让看门狗/启动器感知）
+                        print("[GIE] 当前进程退出，等待重启...")
+                        return
+                    
                     last_check_time = time.time()
                     
                     while True:
@@ -12612,12 +12785,24 @@ async def poll_adapter(handler):
                         data = await resp.json()
                         if data.get("status") != "empty":
                             print(f"[主程序] 📩 收到官方消息")
+                            # 提取上下文（官方机器人 OpenID 等）
+                            ctx_user_openid = data.get("_official_user_openid")
+                            ctx_group_openid = data.get("_official_group_openid")
+                            ctx_msg_id = data.get("_official_msg_id")
                             # 处理消息
                             reply = await handler.handle_message(data)
                             if reply:
                                 # 发送回复到适配器
                                 try:
-                                    async with session.post("http://127.0.0.1:3001/send", json=reply) as send_resp:
+                                    # 把上下文塞进回复里，让适配器能识别 OpenID 和 msg_id
+                                    payload = dict(reply)
+                                    if ctx_user_openid:
+                                        payload["_official_user_openid"] = ctx_user_openid
+                                    if ctx_group_openid:
+                                        payload["_official_group_openid"] = ctx_group_openid
+                                    if ctx_msg_id:
+                                        payload["_official_msg_id"] = ctx_msg_id
+                                    async with session.post("http://127.0.0.1:3001/send", json=payload) as send_resp:
                                         if send_resp.status == 200:
                                             print(f"[主程序] ✅ 已发送回复")
                                         else:
@@ -12633,6 +12818,49 @@ async def poll_adapter(handler):
         except Exception as e:
             print(f"[主程序] ⚠️ 轮询异常: {e}")
             await asyncio.sleep(3)
+# ==================== GIE 强制更新 ====================
+GIE_UPDATE_FLAG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gie_update_needed.flag")
+
+def _gie_forced_update_check():
+    """
+    连上 GIE 后调用：
+      - 检查 gie_update_needed.flag 是否存在
+      - 存在 → 触发强制更新：重启主程序（由看门狗/启动器拉起）
+      - 不存在 → 静默跳过
+    用法：每次 WebSocket 连上后调用一次。
+    """
+    if not os.path.exists(GIE_UPDATE_FLAG):
+        return False
+    print("[GIE] 检测到更新标记，触发强制更新...")
+    try:
+        # 删除标记，避免无限重启
+        os.remove(GIE_UPDATE_FLAG)
+    except Exception:
+        pass
+    # 重启主程序（让启动器/看门狗拉起新进程）
+    import subprocess
+    import sys
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    exe = sys.executable or "python"
+    main_script = os.path.abspath(__file__)
+    subprocess.Popen(
+        [exe, main_script],
+        cwd=script_dir,
+        creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) | getattr(subprocess, "DETACHED_PROCESS", 0),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        stdin=subprocess.DEVNULL,
+        close_fds=True,
+    )
+    print("[GIE] 新进程已启动，当前进程即将退出...")
+    return True
+
+def _gie_set_update_flag():
+    """外部调用：标记 GIE 有更新，下次连上 GIE 时自动重启"""
+    with open(GIE_UPDATE_FLAG, "w", encoding="utf-8") as f:
+        f.write(time.strftime("%Y-%m-%d %H:%M:%S"))
+    print(f"[GIE] 更新标记已写入: {GIE_UPDATE_FLAG}")
+
 # ==================== 主函数 ====================
 # 在 main 函数开始前添加
 import os
@@ -12732,8 +12960,8 @@ def main():
     _check()
 
     # ===== AI 引擎模式提示 =====
-    _api_key = os.environ.get("api", "").strip()
-    _api_url = os.environ.get("api_url", "https://api.agnes-ai.cn/v1").strip()
+    _api_key = CONFIG.get("api", "").strip()
+    _api_url = CONFIG.get("api_url", "https://api.agnes-ai.cn/v1").strip()
     
     print("=" * 50)
     if _api_key:
@@ -12741,18 +12969,14 @@ def main():
         print(f"🧠 AI 引擎: ☁️  API 云端模式")
         print(f"   🔗 接口地址: {_api_url}")
         print(f"   🔑 当前密钥: {_masked}")
-        print("   💡 想换接口？修改环境变量 'api_url' 后重开窗口")
+        print("   💡 想换接口？修改 config.json 中的 'api_url' 后重开窗口")
     else:
         print("🧠 AI 引擎: ⚠️ 未检测到 API 密钥")
-        print("   💡 请设置环境变量 'api' 才能正常使用 AI 功能")
+        print("   💡 请在 config.json 中配置 'api' 才能正常使用 AI 功能")
         print("   ┌─────────────────────────────────────────")
-        print("   │ 永久设置（推荐，重开窗口生效）:")
-        print("   │   setx api \"你的密钥\"")
-        print("   │   setx api_url \"https://api.agnes-ai.cn/v1\"")
-        print("   │")
-        print("   │ 临时设置（只对当前窗口有效）:")
-        print("   │   $env:api = \"你的密钥\"")
-        print("   │   $env:api_url = \"https://api.agnes-ai.cn/v1\"")
+        print("   │ config.json 示例:")
+        print("   │   \"api\": \"你的密钥\"")
+        print("   │   \"api_url\": \"https://api.agnes-ai.cn/v1\"")
         print("   └─────────────────────────────────────────")
     print("=" * 50)
     
@@ -12769,8 +12993,8 @@ def main():
     # 🚫 NapCat 模式黑名单自毁检测（只针对模式1）
     # ============================================================
     if choice == "1":
-        # 获取当前机器人的 QQ 号（从环境变量读取）
-        bot_qq = os.getenv("QQ_OFFICIAL_BOT_QQ", "4019743873")
+        # 获取当前机器人的 QQ 号（从 config.json 读取）
+        bot_qq = CONFIG.get("QQ_OFFICIAL_BOT_QQ") or BOT_QQ or ""
         
         # ===== 黑名单列表（要封禁的机器人 QQ 号）=====
         BLACKLISTED_BOT_QQ = [

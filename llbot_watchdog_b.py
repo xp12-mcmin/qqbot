@@ -17,6 +17,13 @@ if sys.platform == "win32":
 
 WATCHDOG_A_SCRIPT = "llbot_watchdog.py"
 
+# ========== 开发者环境后门（本地开发跳过重启守护） ==========
+try:
+    from dev_mode import is_dev_environment
+except Exception:
+    def is_dev_environment():
+        return False
+
 def get_watchdog_a_pid():
     try:
         with open("watchdog_a.pid", "r") as f:
@@ -40,6 +47,10 @@ def start_watchdog_a():
     return False
 
 def main():
+    # 开发者后门：本地开发环境直接退出，不监控、不重启看门狗A
+    if is_dev_environment():
+        print("[看门狗B] 🔓 开发者环境，守护进程退出")
+        return
     while True:
         try:
             pid = get_watchdog_a_pid()
