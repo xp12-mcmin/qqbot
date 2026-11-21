@@ -769,7 +769,6 @@ def minimize_cmd_window():
         print(f"[调试] 窗口最小化失败: {e}")
         return False
 
-minimize_cmd_window()
 # ==================== 管理员自定义时长刷屏器 ====================
 import asyncio
 import random
@@ -3620,7 +3619,8 @@ class OllamaAI:
 语气风格：{effect['tone']}，额外要求：{effect['extra']}，称呼方式：{effect['greeting']}"""
     
     async def chat(self, message, use_personality: bool = True,
-                   group_id: str = None, user_id: str = None, favor: int = None) -> str:
+                   group_id: str = None, user_id: str = None, favor: int = None,
+                   local_image_paths: list = None) -> str:
 
         # 转换消息
         if isinstance(message, list):
@@ -3629,12 +3629,18 @@ class OllamaAI:
             message_str = message
 
         has_image = '[图片:' in message_str
+        # 官方模式群图片：已下载到本地 .qq-images/ 的附件路径直接视为有图
+        if not has_image and local_image_paths:
+            has_image = True
+            for p in local_image_paths:
+                message_str = f"{message_str} [图片:{p}]"
 
         # 有图片时优先走多模态（Agnes 的 2.5-flash 支持看图）
         if has_image:
             print(f"[AI] 检测到图片，使用多模态模型: {self.image_model}")
             result = await self._chat_with_model(
-                message_str, self.image_model, use_personality, group_id, user_id, favor
+                message_str, self.image_model, use_personality, group_id, user_id, favor,
+                raw_message=local_image_paths
             )
             if result and result.strip():
                 return result
@@ -3680,8 +3686,15 @@ class OllamaAI:
             has_image = '[图片:' in message_str
             image_base64 = None
 
-            # 如果有图片，获取 base64
-            if has_image:
+            # ===== 优先：如果 raw_message 传入了本地文件路径列表（官方模式群图片已下载到 .qq-images/）=====
+            # 直接把第一张图的本地路径读成 base64，跳过 URL/hash 解析
+            if isinstance(raw_message, list) and raw_message:
+                _local_paths = [p for p in raw_message if isinstance(p, str) and os.path.exists(p)]
+                if _local_paths:
+                    image_base64 = await self._get_image_base64(_local_paths[0], group_id, raw_message_list=raw_message)
+                    print(f"[AI] 使用本地图片路径: {_local_paths[0]}")
+            # 如果有图片标记，获取 base64
+            elif has_image:
                 match = re.search(r'\[图片:([^\]]+)\]', message_str)
                 if match:
                     file_hash = match.group(1)
@@ -3696,7 +3709,7 @@ class OllamaAI:
 
             # ===== 构建 OpenAI 兼容格式的 messages =====
             messages = []
-            
+
             # 1. 系统提示词（性格）
             if use_personality:
                 if group_id:
@@ -3730,13 +3743,14 @@ class OllamaAI:
                 messages.append({"role": "user", "content": context_message})
 
             # ===== 发送请求 (Agnes /chat/completions 端点) =====
+            # 强制超时：总 30s / 连接 10s，避免 AI API 卡死事件循环
             api_endpoint = f"{self.base_url}/chat/completions"
-            
-            headers = {
+
+            req_headers = {
                 "Authorization": f"Bearer {self.api_key}",
                 "Content-Type": "application/json"
             }
-            
+
             payload = {
                 "model": model,  # 👈 直接用传进来的模型名
                 "messages": messages,
@@ -3745,21 +3759,25 @@ class OllamaAI:
                 "max_tokens": 500
             }
 
-            timeout = aiohttp.ClientTimeout(total=120, connect=30)
+            ai_timeout = aiohttp.ClientTimeout(total=30, connect=10, sock_read=30)
 
-            async with aiohttp.ClientSession() as session:
+            async with aiohttp.ClientSession(timeout=ai_timeout) as session:
                 async with session.post(
                     api_endpoint,
                     json=payload,
-                    headers=headers,  # 👈 用新的 headers
-                    timeout=timeout
+                    headers=req_headers,
                 ) as response:
                     if response.status == 200:
-                        result = await response.json()
-                        
-                        # 🆕 提取 OpenAI 格式的返回结果
-                        response_text = result.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
-                        
+                        try:
+                            result = await response.json()
+                        except Exception as _json_e:
+                            print(f"[AI警告] 响应非 JSON: {_json_e}")
+                            return None
+                        choices = result.get("choices") or []
+                        if not choices:
+                            print(f"[AI警告] 响应缺 choices: {str(result)[:200]}")
+                            return None
+                        response_text = (choices[0] or {}).get("message", {}).get("content", "").strip()
                         if response_text:
                             response_text = re.sub(r'\d{5,11}', '', response_text)
                             return response_text
@@ -3768,9 +3786,14 @@ class OllamaAI:
                         error_text = await response.text()
                         print(f"[AI警告] HTTP {response.status}: {error_text[:200]}")
                         return None
-
+        except asyncio.TimeoutError:
+            print(f"[AI警告] ⏱️ AI API 超时（total=30s/connect=10s），model={model}，已降级")
+            return None
+        except aiohttp.ClientError as ce:
+            print(f"[AI警告] ❌ AI API 网络错误: {type(ce).__name__}: {ce}")
+            return None
         except Exception as e:
-            print(f"[AI警告] 异常: {e}")
+            print(f"[AI警告] 异常: {type(e).__name__}: {e}")
             import traceback
             traceback.print_exc()
             return None
@@ -3780,6 +3803,30 @@ class OllamaAI:
         import aiohttp
         import base64
         import os
+
+        # 解析本地路径候选（绝对/相对 .qq-images/ 文件名），命中则直接读成 base64
+        def _try_read_local(paths: list):
+            for p in paths:
+                if not p:
+                    continue
+                candidates = [p]
+                if os.path.sep not in p and not p.lower().startswith(('c:', 'd:', 'e:', 'f:')):
+                    candidates.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".qq-images", p))
+                    candidates.append(os.path.join(".qq-images", p))
+                for c in candidates:
+                    if os.path.exists(c):
+                        try:
+                            with open(c, 'rb') as f:
+                                b = f.read()
+                            print(f"[图片] 本地文件读取成功: {c} ({len(b)} bytes)")
+                            return base64.b64encode(b).decode('utf-8')
+                        except Exception as e:
+                            print(f"[图片] 本地文件读取失败: {c} {e}")
+            return None
+
+        _local_hit = _try_read_local([file_hash])
+        if _local_hit:
+            return _local_hit
 
         try:
             # ==================== 策略 1：直接从 raw_message 提取 URL (最稳妥) ====================
@@ -4187,8 +4234,42 @@ class MessageHandler:
             print("[视频解析] 模块加载成功")
         except Exception as e:
             print(f"[视频解析] 模块加载失败: {e}")
-            self.video_parser = None       
+            self.video_parser = None
+        # ===== B站视频自动解析：每群开关 + 开启人 + 防刷屏冷却（持久化到 data/video_group_state.json） =====
+        # _video_group_state[group_id_str] = {"enabled": bool, "enabled_by": "admin"|"group", "cooldown": ts, "last_link": str}
+        if not hasattr(self, "_video_group_state"):
+            self._video_group_state = {}
+        # 假QQ → 真实openid 缓存（官方模式下 @ 人用，避免 user_id_map 缺失时 @ 失效）
+        self._user_openid_cache = {}
+        # 启动时从文件恢复已开启的群（冷却/last_link 是易失的，只恢复 enabled + enabled_by）
+        try:
+            _vfs_file = "data/video_group_state.json"
+            if os.path.exists(_vfs_file):
+                with open(_vfs_file, "r", encoding="utf-8") as _f:
+                    _saved = json.load(_f)
+                if isinstance(_saved, dict):
+                    for _k, _v in _saved.items():
+                        if isinstance(_v, dict):
+                            self._video_group_state[_k] = {
+                                "enabled": bool(_v.get("enabled", False)),
+                                "enabled_by": _v.get("enabled_by"),
+                                "cooldown": 0,          # 冷却时间戳是易失的，重启清零
+                                "last_link": "",
+                            }
+                    _n_on = sum(1 for v in self._video_group_state.values() if v.get("enabled"))
+                    print(f"[视频解析] 已从文件恢复 {_n_on} 个开启群（共 {len(self._video_group_state)} 条记录）")
+        except Exception as _e:
+            print(f"[视频解析] ⚠️ 恢复持久化状态失败: {_e}")
         print("[调试] 消息处理器初始化完成")
+
+    def _save_video_state(self):
+        """把 _video_group_state 持久化到 data/video_group_state.json（静默失败不阻断）"""
+        try:
+            os.makedirs("data", exist_ok=True)
+            with open("data/video_group_state.json", "w", encoding="utf-8") as f:
+                json.dump(self._video_group_state, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"[视频解析] ⚠️ 持久化状态失败: {e}")
     def _load_openid_map(self):
         try:
             if os.path.exists("data/openid_map.json"):
@@ -4312,6 +4393,36 @@ class MessageHandler:
             return qq_match.group(1)
         
         return None
+
+
+    def _extract_official_ban_target(self, raw_message_data):
+        """官方模式：从原始消息里提取第 2 个 @ 的对象的 openid（即目标 member_openid）。
+        消息形如 '@机器人 @目标 1' → 第一个 @ 是机器人，第二个是目标。
+        返回目标 openid；没有 @ 则返回 None。
+        """
+        if not raw_message_data:
+            return None
+        at_list = []
+        raw_msg = raw_message_data.get("message", "")
+        if isinstance(raw_msg, str):
+            # 字符串：内容里是 [CQ:at,qq=OPENID] 标记
+            import re
+            at_list = re.findall(r'\[CQ:at,qq=([^\]]+)\]', raw_msg)
+            if not at_list:
+                # 兼容官方原生 <@OPENID> 标记
+                at_list = re.findall(r'<@([^>]+)>', raw_msg)
+        elif isinstance(raw_msg, list):
+            # 段数组：type == "at" 的 data.qq
+            for seg in raw_msg:
+                if isinstance(seg, dict) and seg.get("type") == "at":
+                    qq = str(seg.get("data", {}).get("qq", "")).strip()
+                    if qq:
+                        at_list.append(qq)
+        if not at_list:
+            return None
+        # 取第二个 @（第一个通常是机器人自己）；若只有一个 @ 则用那一个
+        target = at_list[1] if len(at_list) >= 2 else at_list[0]
+        return target or None
 
 
     def _extract_delta_value(self, text, default=10, exclude_user=None):
@@ -4824,18 +4935,28 @@ class MessageHandler:
             print(f"[提取文本] 错误: {e}")
             return "（提取失败）"
     def is_at_bot(self, data: Dict) -> bool:
-        """检查是否@了机器人"""
+        """检查是否@了机器人。
+        官方模式：直接依据事件类型判定（GROUP_AT_MESSAGE_CREATE 即 @ 机器人，已由适配器标记为 group；
+        全量消息标记为 group_silent 且在进入本方法前已被拦截记录，不会走到这里）。
+        不再解析 mentions/at/OpenID。OneBot 模式保持按机器人 QQ 号匹配。
+        """
         try:
-            # ===== 官方适配器消息直接返回 True =====
-            if data.get("_official_msg_type") in ["group", "private"]:
-                return True
-            
+            # ===== 官方模式：按事件类型判定 =====
+            _ot = data.get("_official_msg_type")
+            if _ot == "private":
+                return True          # 私聊 = 直接发给机器人
+            if _ot == "group":
+                return True          # GROUP_AT_MESSAGE_CREATE = @ 机器人
+            if _ot == "group_silent":
+                return False         # 全量群聊 = 普通聊天，不回复
+
             raw_message = data.get("message", "")
+
+            # ===== OneBot 模式：按机器人 QQ 号匹配 =====
             bot_qq = str(data.get("self_id", self.bot_self_id or ""))
-            
             if not bot_qq or bot_qq == "":
                 bot_qq = BOT_QQ or ""
-            
+
             if isinstance(raw_message, list):
                 for item in raw_message:
                     if isinstance(item, dict) and item.get("type") == "at":
@@ -4843,7 +4964,7 @@ class MessageHandler:
                         if at_qq == bot_qq:
                             return True
                 return False
-            
+
             if isinstance(raw_message, str):
                 if f"[CQ:at,qq={bot_qq}]" in raw_message:
                     return True
@@ -4853,7 +4974,7 @@ class MessageHandler:
                 if f"<@{bot_qq}>" in raw_message:
                     return True
                 return False
-            
+
             return False
         except Exception:
             return False
@@ -4886,6 +5007,11 @@ class MessageHandler:
             # ==================== 2. 提取文本 + 图片 URL ====================
             text = self._extract_pure_text(data)
             img_urls = self._extract_image_urls(data)
+            # ===== 补充：官方模式图片-only 消息，从 attachments 提取（_attachment_image_urls） =====
+            _att_urls = data.get("_attachment_image_urls") or []
+            for _u in _att_urls:
+                if _u and _u not in img_urls:
+                    img_urls.append(_u)
             print(f"[违禁词🔍] 提取文本={repr(text[:80])}, 图片数={len(img_urls)}")
 
             # ==================== 3. 分流 ====================
@@ -4919,41 +5045,64 @@ class MessageHandler:
             total_strikes    = result.get("total_strikes", 0)
 
             # 获取原始 message_id（用于撤回）
-            raw_message_id = data.get("message_id")
+            # 官方 API 模式下 _official_msg_id 是官方真实 message id；OneBot 模式下 message_id 是 OneBot int
+            raw_message_id = data.get("message_id") or data.get("_official_msg_id")
+
+            # 官方模式：把官方 message_id 透传给 actions，供 DELETE 接口使用
+            official_msg_id = data.get("_official_msg_id")
+            official_group_openid = data.get("_official_group_openid")
+            official_user_openid = data.get("_official_user_openid")
 
             # ==================== 5. 构造 actions 列表 ====================
             actions = []
 
             # ---------- 5.1 撤回消息 ----------
             if delete_message and raw_message_id:
+                _del_params = {"message_id": raw_message_id}
+                if official_msg_id:
+                    _del_params["official_msg_id"] = official_msg_id
+                if official_group_openid:
+                    _del_params["group_openid"] = official_group_openid
+                if official_user_openid:
+                    _del_params["user_openid"] = official_user_openid
                 actions.append({
                     "action": "delete_msg",
-                    "params": {"message_id": raw_message_id}
+                    "params": _del_params
                 })
                 print(f"[违禁词🔍] 🗑️ 加入撤回: message_id={raw_message_id}")
 
             # ---------- 5.2 禁言 ----------
             if should_mute:
+                _ban_params = {
+                    "group_id": int(group_id),
+                    "user_id": int(user_id),
+                    "duration": mute_duration
+                }
+                if official_group_openid:
+                    _ban_params["group_openid"] = official_group_openid
+                if official_user_openid:
+                    _ban_params["user_openid"] = official_user_openid
                 actions.append({
                     "action": "set_group_ban",
-                    "params": {
-                        "group_id": int(group_id),
-                        "user_id": int(user_id),
-                        "duration": mute_duration
-                    }
+                    "params": _ban_params
                 })
                 print(f"[违禁词🔍] 🔨 加入禁言: {user_id} {mute_duration}秒")
 
             # ---------- 5.3 黑名单 → 踢出 ----------
             if should_blacklist:
                 # 踢出
+                _kick_params = {
+                    "group_id": int(group_id),
+                    "user_id": int(user_id),
+                    "reject_add_request": False
+                }
+                if official_group_openid:
+                    _kick_params["group_openid"] = official_group_openid
+                if official_user_openid:
+                    _kick_params["user_openid"] = official_user_openid
                 actions.append({
                     "action": "set_group_kick",
-                    "params": {
-                        "group_id": int(group_id),
-                        "user_id": int(user_id),
-                        "reject_add_request": False
-                    }
+                    "params": _kick_params
                 })
 
                 # 提示（黑名单专属）
@@ -4970,7 +5119,10 @@ class MessageHandler:
                     "params": {
                         "message_type": "group",
                         "group_id": int(group_id),
-                        "message": blacklist_tip
+                        "message": blacklist_tip,
+                        "group_openid": official_group_openid,
+                        "user_openid": official_user_openid,
+                        "official_msg_id": official_msg_id
                     }
                 })
                 print(f"[违禁词🔍] 🚫 加入黑名单踢出 + 提示")
@@ -4989,7 +5141,10 @@ class MessageHandler:
                     "params": {
                         "message_type": "group",
                         "group_id": int(group_id),
-                        "message": tip
+                        "message": tip,
+                        "group_openid": official_group_openid,
+                        "user_openid": official_user_openid,
+                        "official_msg_id": official_msg_id
                     }
                 })
                 print(f"[违禁词🔍] 💬 加入普通提示")
@@ -4997,6 +5152,47 @@ class MessageHandler:
             # ==================== 6. 发送所有 action ====================
             print(f"[违禁词🔍] websocket={self.websocket is not None}")
             if actions:
+                # ===== 官方 API 模式：优雅降级（撤回 → 静默警告 → 统一出口） =====
+                if hasattr(self, '_official_mode') and self._official_mode:
+                    print(f"[违禁词🔍] 🌐 官方 API 模式，优雅降级流程")
+                    _delete_ok = False
+
+                    # ---------- 第一步：强制撤回（只处理 delete_msg，失败静默捕获） ----------
+                    for act in actions:
+                        if act.get("action") != "delete_msg":
+                            continue
+                        try:
+                            _ok = await self._exec_official_action(act)
+                            if _ok:
+                                _delete_ok = True
+                                print(f"[违禁词] 已成功撤回原消息")
+                            else:
+                                print(f"[违禁词] 撤回失败（超时/权限）: {act.get('_err')}")
+                        except Exception as e:
+                            # 撤回失败大概率是超时，静默捕获，不阻断流程
+                            print(f"[违禁词] 撤回异常（已静默）: {e}")
+
+                    # ---------- 第二步：发送警告（静默容错，不带 msg_id，随机 msg_seq 防去重） ----------
+                    # 撤回成功 → "🚫 检测到违禁词，已撤回"；撤回失败 → "🚫 检测到违禁词，请文明发言"
+                    if _delete_ok:
+                        _warn_text = f"[CQ:at,qq={user_id}] 🚫 检测到违禁词，已撤回"
+                    else:
+                        _warn_text = f"[CQ:at,qq={user_id}] 🚫 检测到违禁词，请文明发言"
+                    try:
+                        await self._send_official_warning(
+                            group_id, user_id, _warn_text,
+                            group_openid=official_group_openid,
+                            user_openid=official_user_openid
+                        )
+                    except Exception as e:
+                        # 40054005 / 无权限 / 限流 → 只打日志，绝不抛出
+                        print(f"[警告] 本群无主动发言权限，警告消息发送失败，但撤回已生效")
+                        print(f"[警告] 详情: {e}")
+
+                    # ---------- 第三步：统一出口（无论警告发没发出去，立刻结束，绝不触发 AI） ----------
+                    return {"_handled": True}
+
+                # ===== OneBot 模式：保持原有 websocket 逻辑不变 =====
                 print(f"[违禁词🔍] 准备发送 {len(actions)} 个 action")
                 if hasattr(self, 'websocket') and self.websocket:
                     for act in actions:
@@ -5016,6 +5212,204 @@ class MessageHandler:
             import traceback
             traceback.print_exc()
             return None
+
+    # ============================================================
+    # 官方 API 模式：静默容错发送警告（不带 msg_id，随机 msg_seq 防去重）
+    # 权限不足 / 被限流（40054005）时只打日志，不抛出、不崩溃
+    # ============================================================
+    async def _send_official_warning(self, group_id: int, user_id: str, text: str,
+                                      group_openid: str = None, user_openid: str = None) -> bool:
+        """官方模式发送警告消息（主动消息，不带 msg_id，随机 msg_seq 防去重）。
+
+        返回 True/False 表示是否发送成功；任何异常都被捕获并打印日志，绝不抛出。
+        """
+        try:
+            # 解析 group_openid（官方接口需要真实 group_openid）
+            _group_openid = group_openid
+            if not _group_openid:
+                _cache = getattr(self, "_official_group_openid_cache", {}) or {}
+                _group_openid = _cache.get(str(group_id))
+                if not _group_openid:
+                    try:
+                        import official_bot_adapter
+                        _group_openid = official_bot_adapter.group_id_map.get(str(int(group_id)))
+                    except Exception:
+                        _group_openid = None
+            if not _group_openid:
+                print(f"[警告] ❌ 官方模式缺 group_openid，无法发送警告")
+                return False
+
+            # 不带 msg_id，作为主动消息发送；带随机 msg_seq 防去重
+            import random as _random
+            _seq = _random.randint(1, 9999)
+            print(f"[警告] 📤 发送主动警告消息（msg_seq={_seq}）: {text[:60]}")
+
+            # ===== 转换 [CQ:at,qq=X] → 官方 mentions（避免 @cp= 截断 bug） =====
+            import re as _wre
+            _at_ids = []
+            try:
+                import official_bot_adapter as _woba
+                _uid_map = _woba.user_id_map
+                _wbot = _woba.get_bot_openid_sync()
+            except Exception:
+                _uid_map = {}
+                _wbot = ""
+            for _wm in _wre.finditer(r'\[CQ:at,qq=([^\]]+)\]', text):
+                _wv = _wm.group(1).strip()
+                if _wv:
+                    try:
+                        _wr = _uid_map.get(str(_wv), _wv)
+                    except Exception:
+                        _wr = _wv
+                    if _wr and _wr not in _at_ids:
+                        _at_ids.append(_wr)
+            _warn_content = _wre.sub(r'\[CQ:at,qq=[^\]]+\]', '', text).strip()
+            _warn_content = _wre.sub(r'<@[^>]+>', '', _warn_content).strip()
+            if not _warn_content:
+                _warn_content = "🚫 检测到违禁词"
+
+            # ===== 直接用 aiohttp 发主动消息（带随机 msg_seq，不带 msg_id） =====
+            # 这样能彻底避免 send_message_official 内部因 official_msg_id 触发的去重逻辑
+            token = ensure_token()
+            if not token:
+                print(f"[警告] ❌ 无有效 Token，无法发送警告")
+                return False
+            _headers = {"Authorization": f"QQBot {token}", "Content-Type": "application/json"}
+            _url = f"https://api.bot.qq.com/v2/groups/{_group_openid}/messages"
+            _payload = {"msg_type": 0, "content": _warn_content}
+            if _at_ids:
+                _payload["mentions"] = [
+                    {"openid": _o, "is_your_bot": bool(_wbot and _o == _wbot)}
+                    for _o in dict.fromkeys(_at_ids)
+                ]
+            if _seq:
+                _payload["msg_seq"] = _seq
+            try:
+                async with aiohttp.ClientSession() as _session:
+                    async with _session.post(
+                        _url, json=_payload, headers=_headers,
+                        timeout=aiohttp.ClientTimeout(total=10, connect=10)
+                    ) as _resp:
+                        _resp_body = await _resp.text()
+                        if _resp.status in (200, 204):
+                            print(f"[警告] ✅ 警告消息发送成功")
+                            return True
+                        else:
+                            # 40054005 等错误码 → 静默降级
+                            print(f"[警告] ⚠️ 本群无主动发言权限，警告消息发送失败，但撤回已生效")
+                            print(f"[警告] 详情: HTTP {_resp.status} - {_resp_body[:300]}")
+                            return False
+            except asyncio.TimeoutError:
+                print(f"[警告] ⏱️ 警告消息发送超时（10s），已静默降级")
+                return False
+            except aiohttp.ClientError as _ce:
+                print(f"[警告] ⚠️ 本群无主动发言权限，警告消息发送失败（{type(_ce).__name__}: {_ce}），但撤回已生效")
+                return False
+        except Exception as e:
+            print(f"[警告] ⚠️ 本群无主动发言权限，警告消息发送失败（{type(e).__name__}: {e}），但撤回已生效")
+            return False
+
+    # ============================================================
+    # 官方 API 模式：执行单个 action（DELETE 撤回 + send_message_official 文本）
+    # 由 _check_banned_word 在 handler._official_mode == True 时调用
+    # ============================================================
+    async def _exec_official_action(self, act: dict) -> bool:
+        """
+        官方 API 模式下执行单个 action：
+          - delete_msg    : DELETE /v2/groups/{group_openid}/messages/{message_id}
+          - set_group_ban : 官方禁言接口（已有，留作后续扩展）
+          - set_group_kick: 官方踢人接口（已有，留作后续扩展）
+          - send_msg      : 走 send_message_official 发文本
+        返回 True/False 表示是否执行成功；失败原因写入 act["_err"]。
+        防呆：任何单条 action 失败都不会抛出，避免阻塞其他 action。
+        """
+        a = act.get("action", "")
+        p = act.get("params", {}) or {}
+
+        # 解析 group_openid（官方接口需要真实的 group_openid，不是 fake group_id）
+        # 优先用 params 里透传的真值（_official_group_openid），
+        # 再回退到 fake group_id → 真 group_openid 的反查，绝不中途转假群号。
+        _group_openid = p.get("group_openid")
+        if not _group_openid:
+            _g = p.get("group_id")
+            if _g:
+                _cache = getattr(self, "_official_group_openid_cache", {}) or {}
+                _group_openid = _cache.get(str(_g))
+                if not _group_openid:
+                    try:
+                        import official_bot_adapter
+                        _group_openid = official_bot_adapter.group_id_map.get(str(int(_g)))
+                    except Exception:
+                        _group_openid = None
+
+        # ---------- 6.1 撤回消息（官方 DELETE 接口） ----------
+        if a == "delete_msg":
+            # 官方模式下优先用 p["official_msg_id"]（来自 _official_msg_id 的官方唯一 message_id）
+            # 回退到 p["message_id"]（OneBot 模式下是 int，官方模式下也可能已经是官方 msg_id）
+            official_msg_id = p.get("official_msg_id") or p.get("message_id")
+            if not official_msg_id:
+                print(f"[违禁词🔍] 🗑️ 缺少 message_id，无法撤回")
+                return False
+            if not _group_openid:
+                print(f"[违禁词🔍] 🗑️ 官方模式缺 group_openid，无法撤回")
+                return False
+            try:
+                ok, err = await delete_official_group_message(_group_openid, str(official_msg_id))
+                if ok:
+                    print(f"[违禁词🔍] ✅ 官方撤回成功: {official_msg_id}")
+                    return True
+                else:
+                    print(f"[违禁词🔍] ❌ 官方撤回失败: {err}")
+                    act["_err"] = err
+                    return False
+            except Exception as e:
+                print(f"[违禁词🔍] ❌ 官方撤回异常: {e}")
+                import traceback
+                traceback.print_exc()
+                act["_err"] = f"异常[{type(e).__name__}] {e}"
+                return False
+
+        # ---------- 6.2 发文本（走 send_message_official，自动转换 @、图片、语音） ----------
+        # 注意：官方模式下警告消息走 _send_official_warning（不带 msg_id，随机 msg_seq），
+        # 此处的 send_msg 仅用于非警告场景（如黑名单提示），保留 official_msg_id 透传
+        if a == "send_msg":
+            _msg_text = p.get("message") or ""
+            _g_openid = _group_openid or p.get("group_openid")
+            _user_openid = p.get("user_openid")
+            # 优先使用 _official_user_openid（若 handler 透传了）
+            if not _user_openid and p.get("official_user_openid"):
+                _user_openid = p.get("official_user_openid")
+            # 取官方 msg_id 作为回复（若 data 里有透传）
+            _official_msg_id = p.get("official_msg_id")
+            try:
+                ok = await send_message_official(
+                    _msg_text,
+                    user_openid=_user_openid,
+                    group_openid=_g_openid,
+                    official_msg_id=_official_msg_id
+                )
+                if ok:
+                    print(f"[违禁词🔍] ✅ 官方文本发送成功: {_msg_text[:40]}")
+                    return True
+                else:
+                    print(f"[违禁词🔍] ❌ 官方文本发送失败: {_msg_text[:40]}")
+                    act["_err"] = "send_message_official 返回 False"
+                    return False
+            except Exception as e:
+                print(f"[违禁词🔍] ❌ 官方文本发送异常: {e}")
+                import traceback
+                traceback.print_exc()
+                act["_err"] = f"异常[{type(e).__name__}] {e}"
+                return False
+
+        # ---------- 6.3 暂不直接实现（留作后续扩展，仅打日志） ----------
+        if a in ("set_group_ban", "set_group_kick"):
+            print(f"[违禁词🔍] ⚠️ 官方模式暂不支持 {a}，跳过")
+            return False
+
+        print(f"[违禁词🔍] ⚠️ 未知 action: {a}")
+        return False
+
     def _extract_image_urls(self, data: Dict) -> list:
         """从消息里提取图片 URL（支持 CQ:image url= 和 onebot segment 两种格式）"""
         urls = []
@@ -5136,8 +5530,46 @@ class MessageHandler:
         notify          = result["notify"]
         should_blacklist = result.get("should_blacklist", False)
         total_strikes    = result.get("total_strikes", 0)
-        raw_message_id = data.get("message_id")
+        raw_message_id = data.get("message_id") or data.get("_official_msg_id")
 
+        # ===== 官方模式透传的真实 ID（用于官方撤回） =====
+        official_group_openid = data.get("_official_group_openid")
+        official_user_openid = data.get("_official_user_openid")
+        official_msg_id = data.get("_official_msg_id")
+
+        # ===== 官方 API 模式：优雅降级（撤回 → 静默警告 → 统一出口） =====
+        if hasattr(self, '_official_mode') and self._official_mode:
+            _delete_ok = False
+            # ① 强制撤回（用真实 message_id + 真实 group_openid）
+            if delete_message and raw_message_id:
+                try:
+                    if official_group_openid:
+                        _dok, _derr = await delete_official_group_message(official_group_openid, str(official_msg_id or raw_message_id))
+                        if _dok:
+                            _delete_ok = True
+                            print(f"[图片审核] 已成功撤回原图片消息")
+                        else:
+                            print(f"[图片审核] 撤回失败: {_derr}")
+                    else:
+                        print(f"[图片审核] 撤回失败：缺真实 group_openid")
+                except Exception as e:
+                    print(f"[图片审核] 撤回异常（已静默）: {e}")
+            # ② 发送警告（静默容错）
+            _warn = f"[CQ:at,qq={user_id}] 🚫 检测到违规图片"
+            if _delete_ok:
+                _warn = f"[CQ:at,qq={user_id}] 🚫 检测到违规图片，已撤回"
+            try:
+                await self._send_official_warning(
+                    group_id, user_id, _warn,
+                    group_openid=official_group_openid,
+                    user_openid=official_user_openid
+                )
+            except Exception as e:
+                print(f"[图片审核] ⚠️ 本群无主动发言权限，警告发送失败，但撤回已生效")
+                print(f"[图片审核] 详情: {e}")
+            return
+
+        # ===== OneBot 模式：原有 websocket 逻辑 =====
         actions = []
         if delete_message and raw_message_id:
             actions.append({"action": "delete_msg", "params": {"message_id": raw_message_id}})
@@ -5387,6 +5819,20 @@ class MessageHandler:
             
             post_type = data.get("post_type", "")
             
+            # ===== 保留原始事件上下文：缓存 群号 → group_openid（官方发送时用） =====
+            _gopen = data.get("_official_group_openid")
+            if _gopen and data.get("group_id"):
+                if not hasattr(self, "_official_group_openid_cache"):
+                    self._official_group_openid_cache = {}
+                self._official_group_openid_cache[str(data.get("group_id"))] = _gopen
+
+            # ===== 缓存 假QQ → 真实 user_openid（官方 @ 人用，避免 user_id_map 缺失时 @ 失效） =====
+            _uopen = data.get("_official_user_openid")
+            if _uopen and data.get("user_id"):
+                if not hasattr(self, "_user_openid_cache"):
+                    self._user_openid_cache = {}
+                self._user_openid_cache[str(data.get("user_id"))] = _uopen
+
             # 确保有self_id
             if "self_id" not in data and self.bot_self_id:
                 data["self_id"] = self.bot_self_id
@@ -5508,24 +5954,47 @@ class MessageHandler:
                         warning_msg = f"[CQ:at,qq={user_id}] {warning_msg}"
                     return self._create_reply(message_type, user_id, group_id, warning_msg)
             
-            # ========== 视频解析 ==========
-            if hasattr(self, 'video_parser') and self.video_parser and self.video_parser.config.get("enabled", False):
+            # ========== B站视频自动解析（替代旧的手动触发） ==========
+            # 只要群消息出现 B站链接（BV/av/b23），自动触发解析；每群开关见 _video_group_state
+            if hasattr(self, 'video_parser') and self.video_parser:
                 raw_message = data.get("message", "")
                 if isinstance(raw_message, str):
                     raw_text = raw_message
                 else:
                     raw_text = self._extract_pure_text(data)
                 import re
-                url_match = re.search(r'https?://[^\s]+', raw_text)
-                if url_match:
-                    url = url_match.group(0)
-                    platform = self.video_parser.detect_platform(url)
-                    if platform:
-                        print(f"[视频解析] 检测到 {platform} 链接: {url}")
-                        info = await self.video_parser.parse_video(url)
-                        if info:
-                            msg = self.video_parser.format_message(info)
-                            return self._create_reply(message_type, user_id, group_id, msg)
+                _bili_url = None
+                # 先扫整段消息里的 B站链接
+                for _m in re.finditer(r'(?:https?://)?(?:www\.)?bilibili\.com/video/(?:BV\w+|av\d+)', raw_text, re.IGNORECASE):
+                    _bili_url = _m.group(0)
+                    break
+                if not _bili_url:
+                    for _m in re.finditer(r'https?://b23\.tv/\w+', raw_text, re.IGNORECASE):
+                        _bili_url = _m.group(0)
+                        break
+                # 兼容 "@机器人 BV号" / "@机器人 av号" 格式（裸 BV/av 号，无完整链接）
+                if not _bili_url:
+                    for _m in re.finditer(r'(BV[0-9A-Za-z]{10})', raw_text):
+                        _bili_url = "https://www.bilibili.com/video/" + _m.group(1)
+                        break
+                if not _bili_url:
+                    for _m in re.finditer(r'\bav(\d+)\b', raw_text, re.IGNORECASE):
+                        _bili_url = "https://www.bilibili.com/video/av" + _m.group(1)
+                        break
+                if _bili_url:
+                    # 补齐协议头
+                    if not _bili_url.startswith("http"):
+                        _bili_url = "https://" + _bili_url
+                    # 每群开关检查
+                    _gs = str(group_id) if group_id else ""
+                    _st = (self._video_group_state or {}).get(_gs) or {}
+                    if _st.get("enabled"):
+                        print(f"[B站视频] 📌 检测到B站链接，自动解析: {_bili_url}")
+                        _auto = await self._bili_auto_parse(group_id, user_id, _bili_url)
+                        if _auto:
+                            return _auto
+                    else:
+                        print(f"[B站视频] 群 {_gs} 未开启自动解析，跳过")
             
             # ========== 检查是否需要回复（@机器人）==========
             if message_type == "private":
@@ -5624,7 +6093,7 @@ class MessageHandler:
 
             # ========== AI聊天 ==========
             raw_message = data.get("message", "")
-            return await self._handle_ai_chat(text, user_id, message_type, group_id, raw_message)
+            return await self._handle_ai_chat(text, user_id, message_type, group_id, raw_message, local_image_paths=data.get("_local_image_paths"))
         
         except Exception as e:
             print(f"{Fore.RED}[错误] handle_message异常: {e}{Style.RESET_ALL}")
@@ -5827,6 +6296,18 @@ class MessageHandler:
     async def _process_commands(self, text: str, user_id: str, message_type: str, group_id: str, raw_message_data: dict = None):
         import re
         text = re.sub(r'[\u200e\u200f\u2066\u2067\u2068\u2069]', '', text)
+        # ===== 关键：官方模式下 content 解析后可能仍残留 [CQ:at,qq=...] 标签 =====
+        # 在关键词匹配前先剥离所有 CQ 码，保证在"解析后的纯文本"上匹配
+        text = re.sub(r'\[CQ:[^\]]*\]', '', text).strip()
+
+        # ========== 指令前缀智能兼容（/ 与 ! ！统一）==========
+        # 内部老指令统一用 ! 前缀匹配；这里把 / 前缀归一化为 !，让 /签到 与 !签到 等效，
+        # 同时保留 ! / ！ 原样，保证全部老指令照常工作。
+        stripped = text.lstrip()
+        if stripped and stripped[0] == "/":
+            text = "!" + stripped[1:]
+            print(f"[指令前缀] 已兼容: / → !，处理后: {text[:30]}")
+
         text_lower = text.strip().lower()
 
         # ============================================================
@@ -7338,6 +7819,7 @@ class MessageHandler:
         # ---------- 13.5 禁言 ----------
         if text_lower.startswith(("!禁言", "！禁言")):
             import re
+            is_official = hasattr(self, "_official_mode") and self._official_mode
             parts = text.split()
             
             # 提取目标QQ号和时长
@@ -7345,21 +7827,14 @@ class MessageHandler:
             duration_text = ""
             duration = 600  # 默认10分钟
             
-            # 遍历参数
+            # 遍历参数（只从文本里提取时长；官方模式的目标从 @ 里拿，不找纯数字QQ）
             for part in parts[1:]:  # 跳过命令本身
-                # 检查是否是QQ号（5-11位纯数字）
-                if re.match(r'^\d{5,11}$', part):
-                    target_qq = part
                 # 检查是否是时长（包含数字+单位，或纯数字）
-                elif re.match(r'^(\d+)(s|秒|m|分|分钟|h|时|小时|d|天|w|周|月|M|年)?$', part, re.I):
+                if re.match(r'^(\d+)(s|秒|m|分|分钟|h|时|小时|d|天|w|周|月|M|年)?$', part, re.I):
                     duration_text = part
-                else:
-                    # 其他内容跳过
-                    pass
-            
-            if not target_qq:
-                return self._create_reply(message_type, user_id, group_id, 
-                    "❌ 请指定QQ号\n📝 格式: !禁言 QQ号 [时长]\n⏰ 示例: !禁言 123456 10分钟")
+                elif not is_official and re.match(r'^\d{5,11}$', part):
+                    # 仅 OneBot 模式：从文本提取纯数字 QQ 号
+                    target_qq = part
             
             # 解析时长
             if duration_text:
@@ -7372,8 +7847,6 @@ class MessageHandler:
                 duration = 2505600
                 print(f"[禁言] 时长超过29天，自动调整为29天")
             
-            print(f"[禁言] 目标: {target_qq}, 时长: {duration}秒 ({self._format_duration(duration)})")
-            
             # 检查是否有权限禁言（只有AI管理员可以禁言）
             if not is_admin:
                 return self._create_reply(message_type, user_id, group_id, "❌ 只有AI管理员可以禁言")
@@ -7381,7 +7854,45 @@ class MessageHandler:
             # 检查是否在群里（群聊才能禁言）
             if message_type != "group":
                 return self._create_reply(message_type, user_id, group_id, "❌ 该命令只能在群聊中使用")
-            
+
+            # ===== 官方模式：直接从 @ 里取 member_openid，走 restrict_chat_setting =====
+            if is_official:
+                member_openid = self._extract_official_ban_target(raw_message_data)
+                group_openid = (raw_message_data or {}).get("_official_group_openid")
+                if not member_openid:
+                    return self._create_reply(message_type, user_id, group_id,
+                        "请 @ 要禁言的成员后再使用禁言指令")
+                print(f"[禁言] 官方目标 member_openid: {member_openid}, 时长: {duration}秒")
+                try:
+                    import official_bot_adapter
+                    ok, err = await official_bot_adapter.restrict_group_member(
+                        group_openid, member_openid, duration
+                    )
+                    if ok:
+                        return self._create_reply(
+                            message_type, user_id, group_id,
+                            f"🔨 已禁言 {member_openid[:10]}... {self._format_duration(duration)}（官方接口）"
+                        )
+                    else:
+                        print(f"[禁言] 官方禁言失败(完整): {err}")
+                        # 回复里保留关键信息（不截断，最多 200 字）
+                        _short = (str(err) or "未知错误")[:200]
+                        return self._create_reply(
+                            message_type, user_id, group_id,
+                            f"❌ 官方禁言失败: {_short}"
+                        )
+                except Exception as e:
+                    import traceback
+                    print(f"[禁言] 官方禁言异常(完整): {e!r}\n{traceback.format_exc()}")
+                    return self._create_reply(message_type, user_id, group_id, f"❌ 官方禁言异常: {e!r}")
+
+            # ===== OneBot 模式：需要纯数字 QQ 号 =====
+            if not target_qq:
+                return self._create_reply(message_type, user_id, group_id, 
+                    "❌ 请指定QQ号\n📝 格式: !禁言 QQ号 [时长]\n⏰ 示例: !禁言 123456 10分钟")
+
+            print(f"[禁言] 目标: {target_qq}, 时长: {duration}秒 ({self._format_duration(duration)})")
+
             return {
                 "action": "set_group_ban",
                 "params": {
@@ -8043,68 +8554,175 @@ class MessageHandler:
                 if reply:
                     return self._create_reply(message_type, user_id, group_id, reply)
                 return {"_handled": True}
-        # ========== 视频解析命令 ==========
-        # ========== 视频解析命令 ==========
+        # ========== B站视频自动解析命令（每群开关 + 权限分级） ==========
         if text_lower.startswith(("!视频解析", "！视频解析")):
-            if not is_admin:
-                return self._create_reply(message_type, user_id, group_id, "❌ 你不是管理员！")
-    
+            # 每群状态
+            if not hasattr(self, "_video_group_state"):
+                self._video_group_state = {}
+            _gs = str(group_id) if group_id else ""
+            _st = self._video_group_state.setdefault(_gs, {"enabled": False, "enabled_by": None, "cooldown": 0, "last_link": ""})
+
+            # 权限判定
+            _is_ai_admin = bool(self.admin_manager and self.admin_manager.is_admin(user_id))
+            # 群主/群管理员（不含 AI 管理员）
+            _is_group_admin = False
+            if group_id:
+                try:
+                    _role = await self.get_member_role_via_ws(group_id, int(user_id))
+                    _is_group_admin = _role in ["owner", "admin"]
+                except Exception:
+                    _is_group_admin = False
+
             parts = text.split()
             if len(parts) < 2:
-                status = self.video_parser.get_status()
-                return self._create_reply(message_type, user_id, group_id, status)
-    
+                st_msg = ("✅ 已开启" if _st.get("enabled") else "❌ 已关闭")
+                by = "系统管理员" if _st.get("enabled_by") == "admin" else ("群管理" if _st.get("enabled_by") == "group" else "—")
+                return self._create_reply(message_type, user_id, group_id,
+                    f"【📺 B站视频自动解析】\n状态: {st_msg}\n开启人: {by}\n\n"
+                    f"📋 命令:\n  !视频解析 开/关 - 开关（AI管理员/群主群管）\n  !视频解析 状态 - 查看")
+
             cmd = parts[1].lower()
-    
-            # 开启
+
+            # ===== 开启 =====
             if cmd in ["开", "on", "开启"]:
-                self.video_parser.set_enabled(True)
-                return self._create_reply(message_type, user_id, group_id, 
-                    "✅ 视频解析已开启\n支持平台: B站、抖音、YouTube、腾讯视频、爱奇艺\n⏰ 超过20分钟的视频只发封面")
-    
-            # 关闭
+                if not (_is_ai_admin or _is_group_admin):
+                    return self._create_reply(message_type, user_id, group_id, "❌ 你没有权限开启此功能（需 AI 管理员 或 群主/群管）")
+                _st["enabled"] = True
+                _st["enabled_by"] = "admin" if _is_ai_admin else "group"
+                self._video_group_state[_gs] = _st
+                self._save_video_state()
+                return self._create_reply(message_type, user_id, group_id,
+                    f"✅ 本群 B站视频自动解析已开启\n🎬 检测到 B站链接自动解析，≤20分钟自动下载\n👑 开启人: {'系统管理员' if _is_ai_admin else '群管理'}")
+
+            # ===== 关闭 =====
             elif cmd in ["关", "off", "关闭"]:
-                self.video_parser.set_enabled(False)
-                return self._create_reply(message_type, user_id, group_id, "❌ 视频解析已关闭")
-    
-            # 群发模式
-            elif cmd in ["群发", "群聊"]:
-                self.video_parser.set_send_to_group(True)
-                return self._create_reply(message_type, user_id, group_id, "✅ 视频解析结果将发送到群聊")
-    
-            # 私聊模式
-            elif cmd in ["私聊"]:
-                self.video_parser.set_send_to_group(False)
-                return self._create_reply(message_type, user_id, group_id, "✅ 视频解析结果将发送私聊")
-    
-            # 查看状态
+                # AI 管理员：强制关闭任何群
+                if _is_ai_admin:
+                    _st["enabled"] = False
+                    _st["enabled_by"] = None
+                    self._video_group_state[_gs] = _st
+                    self._save_video_state()
+                    return self._create_reply(message_type, user_id, group_id, "✅ 系统管理员已强制关闭本群视频解析")
+                # 群主/群管：无权关闭由系统管理员开启的
+                if _st.get("enabled_by") == "admin":
+                    return self._create_reply(message_type, user_id, group_id, "❌ 该功能由系统管理员开启，你无权关闭。")
+                # 群主/群管：可关闭（自己或群管理开启的）
+                if _is_group_admin:
+                    _st["enabled"] = False
+                    _st["enabled_by"] = None
+                    self._video_group_state[_gs] = _st
+                    self._save_video_state()
+                    return self._create_reply(message_type, user_id, group_id, "❌ 视频解析已关闭")
+                return self._create_reply(message_type, user_id, group_id, "❌ 你没有权限关闭此功能")
+
+            # ===== 状态 =====
             elif cmd in ["状态", "status"]:
-                status = self.video_parser.get_status()
-                return self._create_reply(message_type, user_id, group_id, status)
-    
-            # 帮助
+                st_msg = ("✅ 已开启" if _st.get("enabled") else "❌ 已关闭")
+                by = "系统管理员" if _st.get("enabled_by") == "admin" else ("群管理" if _st.get("enabled_by") == "group" else "—")
+                return self._create_reply(message_type, user_id, group_id,
+                    f"【📺 B站视频自动解析】\n状态: {st_msg}\n开启人: {by}\n\n"
+                    f"时长限制: 20分钟（超时只发链接+封面）\n防刷屏: 每群60秒冷却")
+
+            # ===== 帮助 =====
             elif cmd in ["帮助", "help"]:
-                help_text = """📖 【视频解析系统帮助】
+                help_text = """📖 【B站视频自动解析】
+🎬 自动检测群消息中的B站链接（BV/av/b23）
+⏰ 时长≤20分钟自动下载视频；>20分钟只发封面+链接
 
-        🎬 命令列表:
-          !视频解析 开 - 开启视频解析
-          !视频解析 关 - 关闭视频解析
-          !视频解析 群发 - 结果发群里
-          !视频解析 私聊 - 结果发私聊
-          !视频解析 状态 - 查看状态
-          
-          !视频解析 帮助 - 显示本帮助
+📋 命令:
+  !视频解析 开 - 开启（AI管理员/群主/群管）
+  !视频解析 关 - 关闭（AI管理员强制；群主群管受限制）
+  !视频解析 状态 - 查看
 
-        📌 说明:
-          - 开启后自动检测视频链接
-          - 支持B站、抖音、YouTube等
-          - 超过20分钟的视频只发封面
-          - 默认关闭，需管理员开启"""
+🔐 权限:
+  · AI管理员：可开可关任何群
+  · 群主/群管：可开；由系统管理员开启的不能关
+  · 默认关闭"""
                 return self._create_reply(message_type, user_id, group_id, help_text)
-    
             else:
-                return self._create_reply(message_type, user_id, group_id, 
-                    f"❌ 未知命令: {cmd}\n可用: 开/关/群发/私聊/状态/帮助")
+                return self._create_reply(message_type, user_id, group_id, "❌ 未知命令，发送「!视频解析 帮助」查看")
+
+        # ========== !b站解析：二级菜单（自动解析开关 + 每群状态） ==========
+        # 仅发送 "!b站解析" 时展示菜单；带子参数时执行开/关/状态
+        if text_lower.startswith(("!b站解析", "！b站解析")):
+            parts = text.split()
+            sub = parts[1].lower() if len(parts) >= 2 else ""
+
+            if not sub:
+                # 只发 "!b站解析" → 展示二级菜单
+                _gs = str(group_id) if group_id else ""
+                _st = (self._video_group_state or {}).get(_gs) or {}
+                st_msg = "✅ 已开启" if _st.get("enabled") else "❌ 已关闭"
+                by = "系统管理员" if _st.get("enabled_by") == "admin" else ("群管理" if _st.get("enabled_by") == "group" else "—")
+                menu = f"""📺 【B站视频自动解析】二级菜单
+━━━━━━━━━━━━━━━━━━
+📊 本群状态: {st_msg}（开启人: {by}）
+
+🎬 自动解析: 群内出现B站链接(BV/av/b23)自动解析
+⏰ 时长限制: ≤20分钟自动下载视频，>20分钟只发封面+链接
+🖼️ 封面: 发视频前先尝试发封面（失败不阻断）
+🔁 防刷屏: 每群60秒冷却
+
+📋 子命令:
+  !b站解析 开 - 开启本群自动解析
+  !b站解析 关 - 关闭本群自动解析
+  !b站解析 状态 - 查看本群状态
+  !b站解析 帮助 - 查看本菜单
+
+💡 说明: 仅发送「!b站解析」即显示本菜单"""
+                return self._create_reply(message_type, user_id, group_id, menu)
+
+            # 子命令执行（复用权限分级逻辑）
+            _gs = str(group_id) if group_id else ""
+            if not hasattr(self, "_video_group_state"):
+                self._video_group_state = {}
+            _st = self._video_group_state.setdefault(_gs, {"enabled": False, "enabled_by": None, "cooldown": 0, "last_link": ""})
+            _is_ai_admin = bool(self.admin_manager and self.admin_manager.is_admin(user_id))
+            _is_group_admin = False
+            if group_id:
+                try:
+                    _role = await self.get_member_role_via_ws(group_id, int(user_id))
+                    _is_group_admin = _role in ["owner", "admin"]
+                except Exception:
+                    _is_group_admin = False
+
+            if sub in ["开", "on", "开启"]:
+                if not (_is_ai_admin or _is_group_admin):
+                    return self._create_reply(message_type, user_id, group_id, "❌ 你没有权限开启（需 AI 管理员 或 群主/群管）")
+                _st["enabled"] = True
+                _st["enabled_by"] = "admin" if _is_ai_admin else "group"
+                self._video_group_state[_gs] = _st
+                self._save_video_state()
+                return self._create_reply(message_type, user_id, group_id,
+                    f"✅ 本群 B站视频自动解析已开启\n🎬 检测到B站链接(BV/av/b23)自动解析，≤20分钟自动下载\n👑 开启人: {'系统管理员' if _is_ai_admin else '群管理'}")
+
+            elif sub in ["关", "off", "关闭"]:
+                if _is_ai_admin:
+                    _st["enabled"] = False
+                    _st["enabled_by"] = None
+                    self._video_group_state[_gs] = _st
+                    self._save_video_state()
+                    return self._create_reply(message_type, user_id, group_id, "✅ 系统管理员已强制关闭本群视频解析")
+                if _st.get("enabled_by") == "admin":
+                    return self._create_reply(message_type, user_id, group_id, "❌ 该功能由系统管理员开启，你无权关闭。")
+                if _is_group_admin:
+                    _st["enabled"] = False
+                    _st["enabled_by"] = None
+                    self._video_group_state[_gs] = _st
+                    self._save_video_state()
+                    return self._create_reply(message_type, user_id, group_id, "❌ 视频解析已关闭")
+                return self._create_reply(message_type, user_id, group_id, "❌ 你没有权限关闭此功能")
+
+            elif sub in ["状态", "status"]:
+                st_msg = "✅ 已开启" if _st.get("enabled") else "❌ 已关闭"
+                by = "系统管理员" if _st.get("enabled_by") == "admin" else ("群管理" if _st.get("enabled_by") == "group" else "—")
+                return self._create_reply(message_type, user_id, group_id, f"【📺 B站视频自动解析】\n状态: {st_msg}\n开启人: {by}")
+
+            elif sub in ["帮助", "help"]:
+                return self._create_reply(message_type, user_id, group_id,
+                    "📖 发送「!b站解析」可查看 B站自动解析二级菜单")
+            else:
+                return self._create_reply(message_type, user_id, group_id, "❌ 未知子命令，发送「!b站解析」查看菜单")
 
         return None
     # ==================== 辅助方法 ====================
@@ -8228,22 +8846,53 @@ class MessageHandler:
     # ==================== B站视频搜索 ====================
     def _bili_send_bg(self, group_id, user_id, text):
         """B站功能专用：按当前模式发送群消息（后台任务调用）"""
-        # 官方模式群消息无法主动发送（40034105），跳过状态提示
-        if hasattr(self, "_official_mode") and self._official_mode:
-            print(f"[B站] (官方模式跳过通知) {text[:50]}")
-            return
         text = f"[CQ:at,qq={user_id}] {text}"
-        asyncio.create_task(self._bili_send_napcat(group_id, text))
+        if hasattr(self, "_official_mode") and self._official_mode:
+            # ===== 官方模式：把假 QQ 替换为真实 openid（若缓存有），避免 user_id_map 缺失时 @ 失效 =====
+            _real_oid = getattr(self, "_user_openid_cache", {}).get(str(user_id), "")
+            if _real_oid:
+                text = text.replace(f"[CQ:at,qq={user_id}]", f"[CQ:at,qq={_real_oid}]", 1)
+            print(f"[B站视频] 📤 官方模式发送: {text[:60]}...")
+            asyncio.create_task(self._bili_send_official(group_id, text))
+        else:
+            asyncio.create_task(self._bili_send_napcat(group_id, text))
 
     async def _bili_send_official(self, group_id, text):
+        import re
         try:
             import official_bot_adapter
-            # 不带 msg_id（官方 API 群消息主动发送会 40034105，属正常限制）
-            ok, err = await official_bot_adapter.send_group_text(int(group_id), text)
-            if not ok and "40034105" not in str(err):
-                print(f"[B站视频] 官方发送失败: {err}")
+            # 带上该群最新消息的 msg_id 作为回复上下文，规避 40034105 主动发送限制
+            gmsg_id = official_bot_adapter.get_group_msg_id(int(group_id))
+            # ===== 保留原始事件对象：从缓存取 group_openid，缺失时作为现场补建 fallback =====
+            _cache = getattr(self, "_official_group_openid_cache", {})
+            gopen = _cache.get(str(group_id), None)
+            if not gopen:
+                gopen = official_bot_adapter.group_id_map.get(str(group_id))
+            print(f"[B站视频] 发送前: group_id={group_id} group_openid={gopen[:12] if gopen else '缺失'}... msg_id={gmsg_id}")
+
+            ok, err = await official_bot_adapter.send_group_text(
+                int(group_id), text, msg_id=gmsg_id, group_openid=gopen
+            )
+            if ok:
+                print(f"[B站视频] ✅ 官方发送成功: {text[:40]}...")
+                return
+
+            # ===== 发送失败：完整打印 code/message，并降级重试一次 =====
+            print(f"[B站视频] ❌ 官方发送失败(完整): err={err!r} 原始text={text[:80]}")
+            # 降级：把 [CQ:at,qq=...] 转成纯文本 @昵称 形式，只重试一次
+            plain_text = re.sub(r'\[CQ:at,qq=([^\]]+)\]', r'@\1', text).strip()
+            if plain_text != text:
+                print(f"[B站视频] 🔄 降级重试纯文本: {plain_text[:60]}...")
+                ok2, err2 = await official_bot_adapter.send_group_text(
+                    int(group_id), plain_text, msg_id=None, group_openid=gopen
+                )
+                if ok2:
+                    print(f"[B站视频] ✅ 降级纯文本发送成功")
+                else:
+                    print(f"[B站视频] ❌ 降级纯文本也失败: err={err2!r}")
         except Exception as e:
-            print(f"[B站视频] 官方发送异常: {e}")
+            import traceback
+            print(f"[B站视频] ❌ 官方发送异常(完整): {e!r}\n{traceback.format_exc()}")
 
     async def _bili_send_napcat(self, group_id, text):
         import aiohttp
@@ -8258,6 +8907,203 @@ class MessageHandler:
                         print(f"[B站视频] NapCat 发送失败 HTTP {resp.status}: {await resp.text()}")
         except Exception as e:
             print(f"[B站视频] NapCat 发送异常: {e}")
+
+    # ======================================================================
+    # B站视频自动解析：自动检测链接 + 时长限制 + 封面容错 + 权限分级 + 防刷屏
+    # ======================================================================
+    async def _bili_auto_parse(self, group_id, user_id, url):
+        """B站链接自动解析（BV/av/b23）。
+        1. 时长 > 1200s → 只发文本提示
+        2. 时长 <= 1200s → 后台下载并发视频
+        3. 先尝试发封面（容错），再发视频/链接
+        """
+        try:
+            # ===== 每群开关检查 =====
+            gs = str(group_id)
+            st = (self._video_group_state or {}).get(gs) or {}
+            if not st.get("enabled"):
+                print(f"[B站视频] 群 {gs} 未开启自动解析，跳过")
+                return None
+
+            # ===== 防刷屏冷却：60s 内同一链接或连续链接只处理第一个（AI 管理员豁免） =====
+            _is_admin_exempt = self.admin_manager.is_admin(user_id)
+            now = time.time()
+            _cd = st.get("cooldown", 0)
+            if not _is_admin_exempt and now - _cd < 60:
+                # 非管理员且同链接/冷却期内新链接 → 忽略
+                print(f"[B站视频] ⏰ 群 {gs} 冷却中（{int(60 - (now - _cd))}s），忽略链接")
+                return None
+            if _is_admin_exempt:
+                print(f"[B站视频] 👑 管理员 {user_id} 豁免冷却")
+            # 非管理员才记录冷却时间（避免刷屏）
+            if not _is_admin_exempt:
+                st["cooldown"] = now
+                st["last_link"] = url
+                self._video_group_state[gs] = st
+
+            print(f"[B站视频] 📌 自动检测到B站链接: {url}")
+            # ===== b23 短链 → 解析重定向到真实 BV/av 链接（否则拿不到 BV号/时长/封面） =====
+            if "b23.tv" in url:
+                resolved = await self._resolve_b23_shortlink(url)
+                if resolved:
+                    print(f"[B站视频] 🔗 b23 短链已解析: {url} → {resolved}")
+                    url = resolved
+                else:
+                    print(f"[B站视频] ⚠️ b23 短链解析失败，尝试直接解析原链")
+            # 先用既有 video_parser 解析基本信息（时长/封面/标题）
+            info = await self.video_parser.parse_video(url)
+            if not info:
+                print(f"[B站视频] 解析失败，忽略")
+                return None
+
+            duration = info.get("duration", 0)
+            title = info.get("title", "B站视频")
+            cover = info.get("cover", "")
+            # 确保 bvid 是合法的 BVID/AV 号（放在去重前，便于构造 dedup key）
+            bvid_early = str(info.get("bvid") or self.video_parser.extract_bvid(url) or "")
+
+            # ===== 去重：60 秒内同一用户+同一 BVID 直接忽略（封面+下载都不发）=====
+            if bvid_early:
+                if not hasattr(self, "_bili_dedup"):
+                    self._bili_dedup = {}
+                _dedup_key = f"{str(user_id)}:{bvid_early}"
+                _now = time.time()
+                if _dedup_key in self._bili_dedup and _now - self._bili_dedup[_dedup_key] < 60:
+                    print(f"[B站视频] ⏰ 去重：{user_id} 60s内已请求过 {bvid_early}，全部忽略")
+                    return {"_handled": True}
+                self._bili_dedup[_dedup_key] = _now
+                _expired = [k for k, v in self._bili_dedup.items() if _now - v > 120]
+                for _k in _expired:
+                    del self._bili_dedup[_k]
+
+            # ===== 先发送封面（容错：失败不阻断后续） =====
+            if cover:
+                await self._bili_send_cover(group_id, user_id, cover)
+
+            # ===== 时长限制 =====
+            if duration > 1200:
+                msg = f"🎬 视频时长超过20分钟，请前往B站观看：[{title}]({url})"
+                # 兼容不能带 Markdown 的 CQ 场景，用纯文本
+                msg = f"🎬 视频时长超过20分钟，请前往B站观看：\n{url}\n📺 {title}"
+                self._bili_send_bg(group_id, user_id, msg)
+                return {"_handled": True}
+
+            # ===== 时长合规 → 后台下载并发视频 =====
+            # 复用 _bili_pick 的下载+发送逻辑：注入一个"等待选择"条目再调用
+            # （去重已在发封面之前完成，这里直接发"正在下载" + 触发下载）
+            bvid = bvid_early
+            import re as _re_bv
+            if bvid and not _re_bv.match(r'^(BV[0-9A-Za-z]{10}|av\d+|AV\d+)$', bvid):
+                # bvid 不是合法 BVID/AV，提取一个（从解析后的真实 URL 里取 BV）
+                _bv_m = _re_bv.search(r'(BV[0-9A-Za-z]{10}|av\d+)', url, _re_bv.IGNORECASE)
+                bvid = _bv_m.group(1) if _bv_m else bvid
+            if not bvid:
+                print(f"[B站视频] 无法获取有效 BVID，跳过下载: {url}")
+                self._bili_send_bg(group_id, user_id, f"🎬 无法获取视频ID，请前往B站观看：\n{url}")
+                return {"_handled": True}
+            # 确保 duration 是 int（防止比较/切片报错）
+            try:
+                duration = int(duration)
+            except (ValueError, TypeError):
+                duration = 0
+            # ===== 发"正在下载"提示 + 注入 _bili_waiting 条目 =====
+            self._bili_send_bg(group_id, user_id, f"⏬ 正在下载《{str(title or 'B站视频')[:30]}》...")
+            if not hasattr(self, "_bili_waiting"):
+                self._bili_waiting = {}
+            self._bili_waiting[str(user_id)] = {
+                "videos": [{
+                    "bvid": bvid,
+                    "title": str(title or "B站视频"),
+                    "link": url,
+                    "duration": duration,
+                }],
+                "group_id": group_id,
+                "time": time.time(),
+                "_auto_parse_sending": True,
+            }
+            async def auto_video_task():
+                try:
+                    await self._bili_pick(group_id, user_id, 1, max_duration=1200)
+                except Exception as e:
+                    print(f"[B站视频] 自动下载任务异常: {e}")
+                    self._bili_send_bg(group_id, user_id, f"🎬 视频下载失败，请前往B站观看：\n{url}")
+            asyncio.create_task(auto_video_task())
+            return {"_handled": True}
+        except Exception as e:
+            print(f"[B站视频] 自动解析异常: {e}")
+            # 兜底：发纯文本链接，不阻断
+            try:
+                self._bili_send_bg(group_id, user_id, f"🎬 视频解析失败，请前往B站观看：\n{url}")
+            except Exception:
+                pass
+            return None
+
+    async def _bili_send_cover(self, group_id, user_id, cover_url):
+        """发送视频封面（强制容错：失败只打日志，绝不阻断后续）"""
+        try:
+            if not cover_url:
+                return False
+            cover_cq = f"[CQ:image,file={cover_url}]"
+            if hasattr(self, "_official_mode") and self._official_mode:
+                # 官方模式：通过官方富媒体上传图片
+                import official_bot_adapter
+                _cache = getattr(self, "_official_group_openid_cache", {}) or {}
+                gopen = _cache.get(str(group_id)) or official_bot_adapter.group_id_map.get(str(group_id))
+                gmsg_id = official_bot_adapter.get_group_msg_id(int(group_id))
+                if gopen:
+                    # 下载封面到本地再上传
+                    import aiohttp
+                    async with aiohttp.ClientSession() as _sess:
+                        async with _sess.get(cover_url, timeout=aiohttp.ClientTimeout(total=10, connect=5)) as _r:
+                            if _r.status == 200:
+                                _img = await _r.read()
+                                await official_bot_adapter.send_message_official(
+                                    f"[CQ:image,file=base64://{__import__('base64').b64encode(_img).decode()}]",
+                                    group_openid=gopen, official_msg_id=gmsg_id,
+                                )
+                    print(f"[B站视频] 🖼️ 官方模式封面已发送")
+                else:
+                    print(f"[B站视频] ⚠️ 官方模式缺 group_openid，封面发送跳过")
+            else:
+                # OneBot 模式：CQ 码直发
+                self._bili_send_bg(group_id, user_id, cover_cq)
+            return True
+        except Exception as e:
+            print(f"[B站视频] ⚠️ 封面发送失败（已忽略，不阻断）: {e}")
+            return False
+
+    async def _resolve_b23_shortlink(self, url: str) -> Optional[str]:
+        """解析 b23.tv 短链 → 真实 BV/av 视频链接（跟随 302 重定向）。
+        返回真实视频 URL；失败返回 None（绝不抛出）。
+        """
+        try:
+            import aiohttp
+            # 禁止自动重定向，自己拿 Location 头里的真实链接
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    url,
+                    allow_redirects=False,
+                    headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
+                    timeout=aiohttp.ClientTimeout(total=10, connect=5),
+                ) as resp:
+                    loc = resp.headers.get("Location", "")
+                    if loc and ("bilibili.com/video" in loc or "av" in loc or "BV" in loc):
+                        if not loc.startswith("http"):
+                            loc = "https:" + loc if loc.startswith("//") else "https://" + loc
+                        return loc
+                    # 无重定向头，尝试读 body（部分场景 Location 在 body 里）
+                    try:
+                        body = await resp.text()
+                    except Exception:
+                        body = ""
+                    import re as _bre
+                    _m = _bre.search(r'(https?://(?:www\.)?bilibili\.com/video/[A-Za-z0-9]+)', body)
+                    if _m:
+                        return _m.group(1)
+            return None
+        except Exception as e:
+            print(f"[B站视频] ⚠️ b23 短链解析异常（已忽略）: {e}")
+            return None
 
     def _bili_check_cooldown(self, group_id, user_id, message_type) -> dict:
         """B站双重限流检查（按用户 + 按群聊，管理员豁免）。
@@ -8307,19 +9153,8 @@ class MessageHandler:
         async def search_task():
             try:
                 import re as _re
-                # B站搜索走 bilibili_api，底层用 curl_cffi 客户端规避 412 风控
-                import bilibili_api
-                from bilibili_api.search import SearchObjectType
-                bilibili_api.select_client("curl_cffi")
-
-                res = await bilibili_api.search.search_by_type(
-                    keyword,
-                    search_type=SearchObjectType.VIDEO,
-                    page=1,
-                    page_size=10,
-                )
-                # 注意：search_by_type 的返回是扁平 dict，结果在 res["result"]（不是 res["data"]["result"]）
-                results = (res or {}).get("result") or []
+                # B站搜索走 bilibili_api，底层用 curl_cffi 客户端规避 412 风控；失败自动兜底直连接口
+                results = await bili_search_impl(keyword, page_size=10)
 
                 items = []
                 for v in results[:10]:
@@ -8349,6 +9184,8 @@ class MessageHandler:
                 for i, v in enumerate(items, 1):
                     lines.append(f"{i}. {v['title']} ({v['author']})")
                 lines.append("请回复数字 1-10 选择要下载的视频 (60秒内有效)")
+                # ===== 结果拿到后、发送前日志：确认走到了发送函数 =====
+                print(f"[B站视频] 📦 结果已生成，准备发送({len(items)}条) group={group_id} user={user_id} official={hasattr(self, '_official_mode') and self._official_mode}")
                 self._bili_send_bg(group_id, user_id, "\n".join(lines))
             except Exception as e:
                 print(f"[B站视频] 搜索失败: {e}")
@@ -8357,7 +9194,7 @@ class MessageHandler:
         asyncio.create_task(search_task())
         return {"_handled": True}
 
-    async def _bili_pick(self, group_id, user_id, index):
+    async def _bili_pick(self, group_id, user_id, index, max_duration=600):
         """用户回复数字 1-10：判断时长 → 发链接或后台下载发视频"""
         entry = getattr(self, "_bili_waiting", {}).get(str(user_id))
         if not entry:
@@ -8377,15 +9214,22 @@ class MessageHandler:
         del self._bili_waiting[str(user_id)]
 
         duration = video.get("duration", 0)
+        try:
+            duration = int(duration)
+        except (ValueError, TypeError):
+            duration = 0
         title = video.get("title", "视频")
         link = video.get("link") or (f"https://www.bilibili.com/video/{video.get('bvid')}" if video.get("bvid") else "")
 
-        if duration > 600:
+        if duration > max_duration:
             self._bili_send_bg(group_id, user_id,
-                f"🎬 《{title}》时长 {duration // 60}分{duration % 60}秒（>10分钟），不下载，直接看：\n{link}")
+                f"🎬 《{title}》时长 {duration // 60}分{duration % 60}秒（>20分钟），不下载，直接看：\n{link}")
             return {"_handled": True}
 
-        self._bili_send_bg(group_id, user_id, f"⏬ 正在下载《{title}》...")
+        # "正在下载"提示：搜视频路径自己发；自动解析路径已在 _bili_auto_parse 发过，用标志位避免重复
+        entry_flag = entry.get("_auto_parse_sending", False)
+        if not entry_flag:
+            self._bili_send_bg(group_id, user_id, f"⏬ 正在下载《{title}》...")
 
         async def download_task():
             try:
@@ -8399,45 +9243,6 @@ class MessageHandler:
                 # 项目根目录（主进程 cwd 不一定是根目录，子进程统一用根目录）
                 project_root = os.path.dirname(os.path.abspath(__file__))
 
-                # ===== 智能查找 ffmpeg：本地目录优先，再查系统 PATH =====
-                ffmpeg = None
-                if os.path.exists("ffmpeg.exe"):
-                    ffmpeg = os.path.abspath("ffmpeg.exe")
-                else:
-                    ffmpeg = shutil.which("ffmpeg")
-                if not ffmpeg:
-                    print("[B站视频] 未找到 ffmpeg")
-                    self._bili_send_bg(group_id, user_id, "❌ 未找到 ffmpeg 工具，无法合并音视频，请安装后重试")
-                    return
-                # --ffmpeg-location 只接受可执行文件所在目录
-                ffmpeg_dir = os.path.dirname(ffmpeg)
-
-                # ===== 智能查找 yt-dlp：本地目录优先，再查系统 PATH，最后查 Python site-packages =====
-                ytdlp_cmd = None
-                if os.path.exists("yt-dlp.exe"):
-                    ytdlp_cmd = [os.path.abspath("yt-dlp.exe")]
-                else:
-                    which = shutil.which("yt-dlp")
-                    if which:
-                        ytdlp_cmd = [which]
-                    else:
-                        # 兜底：Python 包安装的 yt-dlp（console script 未加入 PATH 时）
-                        import site
-                        for p in (site.getusersitepackages(), *site.getsitepackages()):
-                            c = os.path.join(p, "yt_dlp", "__main__.py")
-                            if os.path.exists(c):
-                                ytdlp_cmd = [sys.executable, c]
-                                break
-                        if not ytdlp_cmd:
-                            c = os.path.join("yt_dlp", "__main__.py")
-                            if os.path.exists(c):
-                                ytdlp_cmd = [sys.executable, c]
-
-                if not ytdlp_cmd:
-                    print("[B站视频] 未找到 yt-dlp")
-                    self._bili_send_bg(group_id, user_id, "❌ 未找到 ffmpeg 或 yt-dlp 工具，请安装后重试")
-                    return
-
                 # 文件名强制用 BVID（纯英文+数字，任何系统/编码下都不会乱码）
                 bvid = video.get("bvid", "")
                 if not bvid:
@@ -8447,120 +9252,262 @@ class MessageHandler:
                 # -o 输出模板用绝对路径，与 cwd 无关
                 out_tmpl = os.path.join(target_abs, f"{bvid}.%(ext)s")
 
-                # ===== 组装 yt-dlp 命令 =====
-                ytdlp_args = [
-                    *ytdlp_cmd,
-                    "--newline",
-                    "--no-playlist",
-                    "-f", "bestvideo+bestaudio/best",
-                    "--merge-output-format", "mp4",
-                    "--ffmpeg-location", ffmpeg_dir,
-                    "-o", out_tmpl,
-                    link or bvid,
-                ]
-                print(f"[B站视频] 开始异步下载: {link or bvid}")
-                print(f"[B站视频] ffmpeg={ffmpeg}, yt-dlp={' '.join(ytdlp_cmd)}, 输出文件={bvid}")
+                # ===== 关键：本地已下载好的视频直接复用，严禁再走下载流程 =====
+                _local_file = None
+                for _ext in (".mp4", ".mkv", ".webm", ".flv"):
+                    _cand = os.path.join(target_abs, f"{bvid}{_ext}")
+                    if os.path.exists(_cand) and os.path.getsize(_cand) > 0:
+                        _local_file = _cand
+                        break
+                if not _local_file:
+                    _cands = [f for f in glob.glob(os.path.join(target_abs, f"{bvid}.*")) if not f.endswith(".part")]
+                    _local_file = max(_cands, key=os.path.getsize) if _cands else None
 
-                # ===== 异步子进程下载（cwd 用项目根目录，不再用 target_abs） =====
-                proc = await asyncio.create_subprocess_exec(
-                    *ytdlp_args,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.STDOUT,
-                    cwd=project_root,
-                )
-                last_progress = ""
-                async for raw_line in proc.stdout:
-                    line = raw_line.decode("utf-8", errors="replace").strip()
-                    if not line:
-                        continue
-                    if line != last_progress:
-                        print(f"[B站视频] [download] {line}")
-                        last_progress = line
-                await proc.wait()
+                if _local_file:
+                    print(f"[B站视频] 📁 检测到本地已存在视频文件，跳过下载直接发送: {_local_file} ({os.path.getsize(_local_file)} bytes)")
+                else:
+                    print(f"[B站视频] 本地无视频文件，开始下载: {bvid}")
+                    # ===== 仅在本地没有时才执行下载 =====
+                    # ===== 智能查找 ffmpeg：本地目录优先，再查系统 PATH =====
+                    ffmpeg = None
+                    if os.path.exists("ffmpeg.exe"):
+                        ffmpeg = os.path.abspath("ffmpeg.exe")
+                    else:
+                        ffmpeg = shutil.which("ffmpeg")
+                    if not ffmpeg:
+                        print("[B站视频] 未找到 ffmpeg")
+                        self._bili_send_bg(group_id, user_id, "❌ 未找到 ffmpeg 工具，无法合并音视频，请安装后重试")
+                        return
+                    # --ffmpeg-location 只接受可执行文件所在目录
+                    ffmpeg_dir = os.path.dirname(ffmpeg)
 
-                if proc.returncode != 0:
-                    print(f"[B站视频] yt-dlp 退出码 {proc.returncode}，下载失败")
-                    self._bili_send_bg(group_id, user_id, "❌ 视频下载失败，请稍后再试")
-                    return
+                    # ===== 智能查找 yt-dlp：本地目录优先，再查系统 PATH，最后查 Python site-packages =====
+                    ytdlp_cmd = None
+                    if os.path.exists("yt-dlp.exe"):
+                        ytdlp_cmd = [os.path.abspath("yt-dlp.exe")]
+                    else:
+                        which = shutil.which("yt-dlp")
+                        if which:
+                            ytdlp_cmd = [which]
+                        else:
+                            # 兜底：Python 包安装的 yt-dlp（console script 未加入 PATH 时）
+                            import site
+                            for p in (site.getusersitepackages(), *site.getsitepackages()):
+                                c = os.path.join(p, "yt_dlp", "__main__.py")
+                                if os.path.exists(c):
+                                    ytdlp_cmd = [sys.executable, c]
+                                    break
+                            if not ytdlp_cmd:
+                                c = os.path.join("yt_dlp", "__main__.py")
+                                if os.path.exists(c):
+                                    ytdlp_cmd = [sys.executable, c]
+
+                    if not ytdlp_cmd:
+                        print("[B站视频] 未找到 yt-dlp")
+                        self._bili_send_bg(group_id, user_id, "❌ 未找到 ffmpeg 或 yt-dlp 工具，请安装后重试")
+                        return
+
+                    # ===== 组装 yt-dlp 命令（仅本地无文件时执行） =====
+                    ytdlp_args = [
+                        *ytdlp_cmd,
+                        "--newline",
+                        "--no-playlist",
+                        "-f", "bestvideo+bestaudio/best",
+                        "--merge-output-format", "mp4",
+                        "--ffmpeg-location", ffmpeg_dir,
+                        "-o", out_tmpl,
+                        link or bvid,
+                    ]
+                    print(f"[B站视频] 开始异步下载: {link or bvid}")
+                    print(f"[B站视频] ffmpeg={ffmpeg}, yt-dlp={' '.join(ytdlp_cmd)}, 输出文件={bvid}")
+
+                    # ===== 异步子进程下载（cwd 用项目根目录，不再用 target_abs） =====
+                    proc = await asyncio.create_subprocess_exec(
+                        *ytdlp_args,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.STDOUT,
+                        cwd=project_root,
+                    )
+                    last_progress = ""
+                    async for raw_line in proc.stdout:
+                        line = raw_line.decode("utf-8", errors="replace").strip()
+                        if not line:
+                            continue
+                        if line != last_progress:
+                            print(f"[B站视频] [download] {line}")
+                            last_progress = line
+                    await proc.wait()
+
+                    if proc.returncode != 0:
+                        print(f"[B站视频] yt-dlp 退出码 {proc.returncode}，下载失败")
+                        self._bili_send_bg(group_id, user_id, "❌ 视频下载失败，请稍后再试")
+                        return
 
                 # ===== 文件检查全部用绝对路径 =====
-                filepath = os.path.join(target_abs, f"{bvid}.mp4")
-                print(f"[B站视频] 检查文件是否存在: {filepath}")
-                if not os.path.exists(filepath):
-                    # 兜底：glob 找 BVID.* 扩展名，过滤 .part，取体积最大的
-                    candidates = [f for f in glob.glob(os.path.join(target_abs, f"{bvid}.*")) if not f.endswith(".part")]
-                    filepath = max(candidates, key=os.path.getsize) if candidates else None
+                # 本地已存在的直接复用；否则按下载产物找（.mp4 优先，glob 兜底）
+                filepath = _local_file
+                if not filepath:
+                    filepath = os.path.join(target_abs, f"{bvid}.mp4")
+                    print(f"[B站视频] 检查文件是否存在: {filepath}")
+                    if not os.path.exists(filepath):
+                        # 兜底：glob 找 BVID.* 扩展名，过滤 .part，取体积最大的
+                        candidates = [f for f in glob.glob(os.path.join(target_abs, f"{bvid}.*")) if not f.endswith(".part")]
+                        filepath = max(candidates, key=os.path.getsize) if candidates else None
                 if not filepath or not os.path.exists(filepath):
-                    print(f"[B站视频] 下载后未找到文件: {bvid}")
-                    self._bili_send_bg(group_id, user_id, "❌ 下载失败，请稍后再试")
+                    print(f"[B站视频] 未找到本地视频文件: {bvid}")
+                    self._bili_send_bg(group_id, user_id, "❌ 未找到视频文件，请重试")
                     return
 
                 abs_path = os.path.abspath(filepath)
                 abs_path_unix = abs_path.replace("\\", "/")
                 video_cq = f"[CQ:video,file=file:///{abs_path_unix}]"
-                print(f"[B站视频] 下载完成: {abs_path} ({os.path.getsize(abs_path)} bytes)")
+                _src = "本地已存在（跳过下载）" if _local_file else "下载完成"
+                print(f"[B站视频] {_src}: {abs_path} ({os.path.getsize(abs_path)} bytes)")
 
-                # ===== 发送视频（分两条：先文本提示，再纯视频 CQ 码） =====
-                import aiohttp
-                send_url = "http://127.0.0.1:3000/send_group_msg"
+                is_official = hasattr(self, "_official_mode") and self._official_mode
+                print(f"[B站视频] 发送视频，模式: {'官方' if is_official else 'OneBot'}")
 
-                # --- 第 1 条：文本提示（@用户 + 文字）---
-                text_payload = {
-                    "group_id": int(group_id),
-                    "message": f"[CQ:at,qq={user_id}] ✅ 视频下载好了，请查收~",
-                }
-                try:
-                    async with aiohttp.ClientSession() as session:
-                        async with session.post(
-                            send_url, json=text_payload,
-                            timeout=aiohttp.ClientTimeout(total=30),
-                        ) as resp:
-                            if resp.status != 200:
-                                print(f"[B站视频] 文本提示发送失败 HTTP {resp.status}: {await resp.text()}")
-                except Exception as e:
-                    print(f"[B站视频] 文本提示发送异常: {e}")
-
-                # --- 第 2 条：纯视频（message 里只有 video 一个段，CQ 码格式） ---
-                video_payload = {
-                    "group_id": int(group_id),
-                    "message": video_cq,
-                }
-                send_ok = False
-                try:
-                    async with aiohttp.ClientSession() as session:
-                        async with session.post(
-                            send_url,
-                            json=video_payload,
-                            timeout=120,  # 视频大，超时设长点
-                        ) as resp:
-                            if resp.status == 200:
-                                res_json = await resp.json()
-                                if isinstance(res_json, dict) and res_json.get("retcode") == 0:
-                                    print("[B站视频] ✅ 发送成功")
-                                    send_ok = True
-                                else:
-                                    print(f"[B站视频] ❌ 发送失败: {res_json}")
-                            else:
-                                print(f"[B站视频] ❌ HTTP 失败: {resp.status}")
-                except Exception as e:
-                    print(f"[B站视频] ❌ 发送异常: {e}")
-
-                # 只有发送成功才删本地文件，失败保留用于排查
-                if send_ok:
-                    try:
-                        if os.path.exists(abs_path):
-                            os.remove(abs_path)
-                            print(f"[B站视频] 已清理: {abs_path}")
-                    except Exception as e:
-                        print(f"[B站视频] 清理文件失败: {e}")
+                if is_official:
+                    # ===== 官方模式：用官方富媒体消息接口上传本地视频文件，按 group_openid 发送 =====
+                    import official_bot_adapter
+                    # 取 group_openid（缓存 → 映射）
+                    _cache = getattr(self, "_official_group_openid_cache", {})
+                    gopen = _cache.get(str(group_id)) or official_bot_adapter.group_id_map.get(str(group_id))
+                    gmsg_id = official_bot_adapter.get_group_msg_id(int(group_id))
+                    if not gopen:
+                        print(f"[B站视频] ❌ 官方模式发送失败：群 {group_id} 无 group_openid")
+                        self._bili_send_bg(group_id, user_id, f"❌ 官方发送视频失败：缺少 group_openid")
+                    else:
+                        with open(abs_path, "rb") as _f:
+                            video_data = _f.read()
+                        v_filename = os.path.basename(abs_path)
+                        print(f"[B站视频] 📤 官方模式发送视频: group_openid={str(gopen)[:12]}... file={v_filename} ({len(video_data)} bytes)")
+                        send_ok, send_err = await official_bot_adapter.send_video_official_group(
+                            gopen, video_data, v_filename, msg_id=gmsg_id
+                        )
+                        if send_ok:
+                            # 成功后删除本地临时视频
+                            try:
+                                if os.path.exists(abs_path):
+                                    os.remove(abs_path)
+                                    print(f"[B站视频] ✅ 官方视频发送成功，已清理本地: {abs_path}")
+                            except Exception as e:
+                                print(f"[B站视频] 清理本地视频失败: {e}")
+                        else:
+                            print(f"[B站视频] ❌ 官方视频发送失败(完整): {send_err!r}，保留本地文件 {abs_path}")
                 else:
-                    print(f"[B站视频] 发送失败，保留本地文件: {abs_path}")
+                    # ===== OneBot 模式（mode 1）：保持现有转发到 127.0.0.1:3000 的逻辑不变 =====
+                    import aiohttp
+                    send_url = "http://127.0.0.1:3000/send_group_msg"
+                    # --- 第 1 条：文本提示（@用户 + 文字）---
+                    text_payload = {
+                        "group_id": int(group_id),
+                        "message": f"[CQ:at,qq={user_id}] ✅ 视频下载好了，请查收~",
+                    }
+                    try:
+                        async with aiohttp.ClientSession() as session:
+                            async with session.post(
+                                send_url, json=text_payload,
+                                timeout=aiohttp.ClientTimeout(total=30),
+                            ) as resp:
+                                if resp.status != 200:
+                                    print(f"[B站视频] 文本提示发送失败 HTTP {resp.status}: {await resp.text()}")
+                    except Exception as e:
+                        print(f"[B站视频] 文本提示发送异常: {e}")
+                    # --- 第 2 条：纯视频（message 里只有 video 一个段，CQ 码格式） ---
+                    video_payload = {
+                        "group_id": int(group_id),
+                        "message": video_cq,
+                    }
+                    send_ok = False
+                    try:
+                        async with aiohttp.ClientSession() as session:
+                            async with session.post(
+                                send_url,
+                                json=video_payload,
+                                timeout=120,
+                            ) as resp:
+                                if resp.status == 200:
+                                    res_json = await resp.json()
+                                    if isinstance(res_json, dict) and res_json.get("retcode") == 0:
+                                        print("[B站视频] ✅ 发送成功")
+                                        send_ok = True
+                                    else:
+                                        print(f"[B站视频] ❌ 发送失败: {res_json}")
+                                else:
+                                    print(f"[B站视频] ❌ HTTP 失败: {resp.status}")
+                    except Exception as e:
+                        print(f"[B站视频] ❌ 发送异常: {e}")
+                    # 只有发送成功才删本地文件，失败保留用于排查
+                    if send_ok:
+                        try:
+                            if os.path.exists(abs_path):
+                                os.remove(abs_path)
+                                print(f"[B站视频] 已清理: {abs_path}")
+                        except Exception as e:
+                            print(f"[B站视频] 清理文件失败: {e}")
+                    else:
+                        print(f"[B站视频] 发送失败，保留本地文件: {abs_path}")
             except Exception as e:
                 print(f"[B站视频] 下载异常: {e}")
                 self._bili_send_bg(group_id, user_id, f"❌ 视频下载失败: {e}")
 
         asyncio.create_task(download_task())
         return {"_handled": True}
+
+    # ======================================================================
+    # B站音频 PCDN 过滤：强制 mcdn.bilivideo.* → 稳定官方 CDN 镜像
+    # 修复 WinError 1225 远程计算机拒绝连接（PCDN 边缘节点被本地拒绝）
+    # ======================================================================
+    def _filter_bili_audio_url(self, audio_url: str, backup_urls: list = None) -> tuple:
+        """
+        过滤 B 站官方接口返回的 PCDN 节点。
+        返回 (final_url, strategy)
+          - strategy: "ok" | "backup" | "mirror"
+          - 若 audio_url / backup_urls 都命中 PCDN（mcdn.bilivideo.cn|net），
+            则把 mcdn 域名强制替换为 B 站官方稳定 CDN 镜像：
+            upos-sz-mirrorhwb.bilivideo.com
+        """
+        if not audio_url:
+            return audio_url, "ok"
+
+        PCDN = ("mcdn.bilivideo.cn", "mcdn.bilivideo.net")
+        is_pcdn = any(x in audio_url for x in PCDN)
+        if not is_pcdn:
+            # 主链稳定，直接返回
+            print(f"[点歌] 📡 音频直链稳定（无 PCDN）: {audio_url[:120]}")
+            return audio_url, "ok"
+
+        # 主链命中 PCDN，尝试 backup_url
+        print(f"[点歌] ⚠️ 主链命中 PCDN: {audio_url[:120]}")
+        if backup_urls:
+            for u in backup_urls:
+                if not u:
+                    continue
+                if not any(x in u for x in PCDN):
+                    print(f"[点歌] ✅ 命中稳定 backup_url: {u[:120]}")
+                    return u, "backup"
+
+        # 全部 PCDN → 强制替换域名
+        MIRROR = "upos-sz-mirrorhwb.bilivideo.com"
+        candidate = audio_url
+        for _pcdn in PCDN:
+            candidate = candidate.replace(_pcdn, MIRROR)
+        print(f"[点歌] 🛠️ PCDN 域名强制替换为 {MIRROR}: {candidate[:120]}")
+        return candidate, "mirror"
+
+    def _pick_best_audio(self, audio_list: list) -> tuple:
+        """选码率最高的音频流，并应用 PCDN 过滤。返回 (best_audio, final_url, strategy)"""
+        if not audio_list:
+            return None, "", "empty"
+        best_audio = max(audio_list, key=lambda a: int(a.get("bandwidth") or 0))
+        audio_url = best_audio.get("baseUrl", "")
+        backup_urls = best_audio.get("backup_url") or []
+        # 兼容两种格式：["url1", "url2"] 或 [{"url": "..."}]
+        if backup_urls and isinstance(backup_urls[0], dict):
+            backup_urls = [u.get("url", "") for u in backup_urls if isinstance(u, dict)]
+        final_url, strategy = self._filter_bili_audio_url(audio_url, backup_urls)
+        return best_audio, final_url, strategy
 
     async def _music(self, group_id: int, user_id: str, keyword: str, group_openid: str = None, msg_id: str = None) -> Dict:
         """点歌 - B站音频搜索、下载、发送（彻底废弃 QQ 音乐）"""
@@ -8591,17 +9538,10 @@ class MessageHandler:
             try:
                 import os
                 import re
-                import bilibili_api
-                from bilibili_api.search import SearchObjectType
                 from bilibili_api import video
 
-                bilibili_api.select_client("curl_cffi")
-
-                # 1. 搜索：取第一个视频
-                res = await bilibili_api.search.search_by_type(
-                    keyword, search_type=SearchObjectType.VIDEO, page=1, page_size=1
-                )
-                results = (res or {}).get("result") or []
+                # 1. 搜索：取第一个视频（健壮版，失败自动兜底）
+                results = await bili_search_impl(keyword, page_size=1)
                 if not results:
                     self._bili_send_bg(group_id, user_id, "B站没找到这首歌，换首歌试试喵~")
                     return
@@ -8627,9 +9567,8 @@ class MessageHandler:
                 if not audio_list:
                     self._bili_send_bg(group_id, user_id, "B站没找到这首歌，换首歌试试喵~")
                     return
-                # 选码率最高的音频流
-                best_audio = max(audio_list, key=lambda a: int(a.get("bandwidth") or 0))
-                audio_url = best_audio.get("baseUrl", "")
+                # 选码率最高的音频流，并强制过滤 PCDN 节点（mcdn.bilivideo.*）
+                best_audio, audio_url, audio_strategy = self._pick_best_audio(audio_list)
                 if not audio_url:
                     self._bili_send_bg(group_id, user_id, "B站没找到这首歌，换首歌试试喵~")
                     return
@@ -8641,6 +9580,11 @@ class MessageHandler:
                     "Referer": "https://www.bilibili.com",
                     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
                 }
+                # ===== 发起下载前打印最终真实直链，方便排查 =====
+                _strategy_names = {"ok": "原始直链", "backup": "备用直链", "mirror": "官方CDN镜像(替换PCDN)"}
+                print(f"[点歌] 🎵 最终使用的真实音频直链（策略={_strategy_names.get(audio_strategy, audio_strategy)}）: {audio_url}")
+                print(f"[点歌] 📥 开始下载: bvid={bvid}, 码率={best_audio.get('bandwidth')}")
+
                 # 分块流式下载，避免大文件一次性读入内存 + 总超时
                 chunk_size = 256 * 1024
                 total_bytes = 0
@@ -8677,32 +9621,71 @@ class MessageHandler:
                     try:
                         voice_file = abs_path
                         print(f"[点歌] 官方模式直接发 m4a: {voice_file}")
-                        
-                        # 2. 官方模式只发语音（群消息只能带 msg_id 回复）
+
                         import official_bot_adapter
+                        import time as _time
                         # 优先用调用方传入的 group_openid 和 msg_id，避免跨进程映射问题
                         eff_group_openid = group_openid or official_bot_adapter.group_id_map.get(str(int(group_id)))
                         eff_msg_id = msg_id or official_bot_adapter.get_group_msg_id(int(group_id))
                         print(f"[点歌] 官方发送: group_openid={eff_group_openid}, msg_id={eff_msg_id}")
-                        
-                        # 3. 语音用 msg_id 回复
+
+                        # 读取语音文件字节
+                        with open(voice_file, "rb") as _f:
+                            voice_data = _f.read()
+                        _fname = os.path.basename(voice_file)
                         voice_path = voice_file.replace("\\", "/")
                         voice_cq = f"[CQ:record,file=file:///{voice_path}]"
-                        voice_ok = await official_bot_adapter.send_message_official(
-                            voice_cq,
-                            group_openid=eff_group_openid,
-                            official_msg_id=eff_msg_id
-                        )
+                        title_detail = f"🎵 《{title}》（来自B站音频流）"
+
+                        # ===== ① 先发一条主动测试消息「点歌处理中...」（不带 msg_id） =====
+                        #     若官方 API 允许主动群发，返回 True；否则抛 40034105 等无权限错误
+                        test_ok = False
+                        try:
+                            test_ok = bool(await official_bot_adapter.send_message_official(
+                                "点歌处理中...",
+                                group_openid=eff_group_openid,
+                                official_msg_id=None,
+                            ))
+                        except Exception as e:
+                            print(f"[点歌] 测试消息异常: {e}")
+                            test_ok = False
+
+                        if test_ok:
+                            # ===== ② 测试消息发送成功：正常发两条（文字详情 + 语音） =====
+                            print(f"[点歌] ✅ 测试消息发送成功，正常发文字详情 + 语音")
+                            # 文字详情（带 msg_id 回复）
+                            try:
+                                await official_bot_adapter.send_message_official(
+                                    title_detail,
+                                    group_openid=eff_group_openid,
+                                    official_msg_id=eff_msg_id,
+                                )
+                            except Exception as e:
+                                print(f"[点歌] 文字详情发送异常: {e}")
+                            # 语音（带 msg_id 回复）
+                            voice_ok = await official_bot_adapter.send_message_official(
+                                voice_cq,
+                                group_openid=eff_group_openid,
+                                official_msg_id=eff_msg_id,
+                            )
+                            send_ok = bool(voice_ok)
+                        else:
+                            # ===== ③ 测试消息发送失败（无权限 40034105）→ 退化为只发一条语音 =====
+                            print(f"[点歌] ⚠️ 测试消息发送失败（无主动发送权限），退化为只发语音")
+                            send_ok = await self._music_send_voice_only(
+                                eff_group_openid, eff_msg_id, voice_data, _fname
+                            )
+
                         # 消费 msg_id
                         if not msg_id:
                             official_bot_adapter.consume_group_msg_id(int(group_id))
-                        send_ok = bool(voice_ok)
+
                         if send_ok:
                             print(f"[点歌] ✅ 官方模式语音发送成功")
                         else:
                             print(f"[点歌] ❌ 官方模式语音发送失败")
-                        
-                        # 4. 清理
+
+                        # 清理
                         if send_ok:
                             if os.path.exists(abs_path):
                                 try:
@@ -8776,6 +9759,76 @@ class MessageHandler:
 
         asyncio.create_task(music_task())
         return {"_handled": True}
+
+    async def _music_send_voice_only(self, group_openid: str, msg_id: str, voice_data: bytes, filename: str) -> bool:
+        """官方模式：退化方案 - 只发一条语音（富媒体上传接口）"""
+        import json as _json
+        try:
+            import official_bot_adapter
+            # 1. 富媒体上传，获取 file_info
+            file_info = await upload_voice_official_group(group_openid, voice_data, filename)
+            if not file_info:
+                print("[点歌] ❌ 退化方案：语音富媒体上传失败")
+                return False
+            # 2. 发送语音消息（带 3 次重试 + 强制超时，容忍 WinError 121）
+            token = official_bot_adapter.ensure_token()
+            if not token:
+                print("[点歌] ❌ 退化方案：无有效 Token")
+                return False
+            url = f"https://api.bot.qq.com/v2/groups/{group_openid}/messages"
+            payload = {
+                "msg_type": 7,
+                "media": {"file_info": file_info}
+            }
+            if msg_id:
+                payload["msg_id"] = msg_id
+            import aiohttp
+            headers = {"Authorization": f"QQBot {token}", "Content-Type": "application/json"}
+            timeout_tip = "❌ 点歌成功，但语音发送超时，请稍后重试"
+
+            for attempt in range(1, 4):
+                try:
+                    async with aiohttp.ClientSession() as session:
+                        async with session.post(
+                            url, json=payload, headers=headers,
+                            timeout=aiohttp.ClientTimeout(total=60, connect=15, sock_read=30)
+                        ) as resp:
+                            if resp.status == 200:
+                                print("[点歌] ✅ 退化方案：语音发送成功")
+                                return True
+                            else:
+                                text = await resp.text()
+                                print(f"[点歌] ❌ 退化方案：语音发送失败（第{attempt}次）HTTP {resp.status} - {text[:200]}")
+                except asyncio.TimeoutError:
+                    print(f"[点歌] ⏱️ 退化方案：语音发送超时（第{attempt}次，WinError 121 类），稍后重试")
+                except aiohttp.ClientOSError as ce:
+                    print(f"[点歌] ⏱️ 退化方案：语音发送连接超时（第{attempt}次）: {ce}")
+                except aiohttp.ClientError as ce:
+                    print(f"[点歌] ❌ 退化方案：语音发送网络错误（第{attempt}次）: {type(ce).__name__}: {ce}")
+                except Exception as e:
+                    print(f"[点歌] ❌ 退化方案：语音发送异常（第{attempt}次）: {type(e).__name__}: {e}")
+
+                if attempt < 3:
+                    try:
+                        await asyncio.sleep(2)
+                    except Exception:
+                        pass
+
+            # 3 次都失败 → 降级为纯文本提示，绝不抛出卡死
+            print(f"[点歌] 🚫 语音发送 3 次均失败，降级为纯文本提示")
+            try:
+                await send_message_official(timeout_tip, group_openid=group_openid, official_msg_id=None)
+            except Exception as e:
+                print(f"[点歌] ❌ 降级提示发送失败: {e}")
+            return False
+        except Exception as e:
+            # 外层兜底：绝不抛出，降级为纯文本提示
+            print(f"[点歌] 🚫 退化方案：语音发送整体异常（已降级）: {type(e).__name__}: {e}")
+            try:
+                await send_message_official("❌ 点歌成功，但语音发送超时，请稍后重试", group_openid=group_openid, official_msg_id=None)
+            except Exception:
+                pass
+            return False
 
     async def _send_reply_via_adapter(self, reply: Dict):
         """通过适配器发送回复"""
@@ -9818,6 +10871,7 @@ class MessageHandler:
     1️⃣1️⃣ 婚姻系统   1️⃣2️⃣ 改名功能
     1️⃣3️⃣ 点歌功能   1️⃣4️⃣ AI绘画
     1️⃣7️⃣ B站视频
+    1️⃣8️⃣ B站自动解析
     """
         if is_admin:
             help_text += "1️⃣5️⃣ 管理员命令\n1️⃣6️⃣ 其他功能\n"
@@ -10158,6 +11212,39 @@ class MessageHandler:
                     return None
                 return self._get_text_help(message_type, user_id, group_id)
 
+            # ========== 18. B站自动解析（二级菜单） ==========
+            if category_str in ["18", "b站解析", "自动解析", "bilibili解析"]:
+                _gs = str(group_id) if group_id else ""
+                _st = (self._video_group_state or {}).get(_gs) or {}
+                st_msg = "✅ 已开启" if _st.get("enabled") else "❌ 已关闭"
+                by = "系统管理员" if _st.get("enabled_by") == "admin" else ("群管理" if _st.get("enabled_by") == "group" else "—")
+                commands = [
+                    ("--- 本群状态 ---", ""),
+                    ("状态", st_msg),
+                    ("开启人", by),
+                    ("", ""),
+                    ("--- 子命令 ---", ""),
+                    ("!b站解析 开", "开启本群自动解析"),
+                    ("!b站解析 关", "关闭本群自动解析"),
+                    ("!b站解析 状态", "查看本群状态"),
+                    ("", ""),
+                    ("--- 功能说明 ---", ""),
+                    ("🎬 自动解析", "群内出现B站链接(BV/av/b23)自动解析"),
+                    ("⏰ 时长限制", "≤20分钟自动下载视频，>20分钟只发封面+链接"),
+                    ("🖼️ 封面", "发视频前先尝试发封面（失败不阻断）"),
+                    ("🔁 防刷屏", "每群60秒冷却"),
+                    ("", ""),
+                    ("💡 提示", "仅发送「!b站解析」即显示本菜单"),
+                ]
+                img = generator.create_help_page("B站自动解析", "【📺 B站自动解析】", commands, is_admin)
+                filepath = generator.save_to_temp(img)
+                if filepath:
+                    result = await self._send_help_image_async(message_type, user_id, group_id, filepath)
+                    if result:
+                        return result
+                    return None
+                return self._get_text_help(message_type, user_id, group_id)
+
             # ========== 15. 管理员命令 ==========
             if category_str in ["15", "管理", "管理员"] and is_admin:
                 commands = [
@@ -10328,7 +11415,7 @@ class MessageHandler:
             import traceback
             traceback.print_exc()
             return self._get_text_help(message_type, user_id, group_id)
-    async def _handle_ai_chat(self, text: str, user_id: str, message_type: str, group_id: str, raw_message=None) -> Dict:
+    async def _handle_ai_chat(self, text: str, user_id: str, message_type: str, group_id: str, raw_message=None, local_image_paths=None) -> Dict:
         try:
             favor = None
             if hasattr(self, 'favorability') and self.favorability:
@@ -10384,7 +11471,8 @@ class MessageHandler:
                 use_personality=True,
                 group_id=str(group_id) if group_id else None,
                 user_id=str(user_id),
-                favor=favor
+                favor=favor,
+                local_image_paths=local_image_paths
             )
         
             if user_id and reply_text and "AI服务暂时不可用" not in reply_text:
@@ -10427,10 +11515,22 @@ class MessageHandler:
         elif message_type == "group" and group_id:
             params["message_type"] = "group"
             params["group_id"] = int(group_id)
-            if not message.startswith("[CQ:at"):
-                params["message"] = f"[CQ:at,qq={user_id}] {message}"
-            else:
+            # ===== 给群消息回复加 @，除了：语音消息 和 @全体 =====
+            # 语音：消息含 [CQ:record] 或 [CQ:video]
+            # 全体：消息含 [CQ:at,qq=all] 或 "@全体成员"
+            import re as _rep
+            _is_voice = bool(_rep.search(r'\[CQ:(record|video)', message))
+            _is_everyone = bool(_rep.search(r'\[CQ:at,qq=(?:all|0)\b', message)) or ("@全体" in message or "@全体成员" in message)
+            _already_at = bool(_rep.search(r'\[CQ:at,qq=\d+\]', message)) or message.startswith("[CQ:at")
+            if _is_voice or _is_everyone:
+                # 语音 / 全体：不额外加 @
                 params["message"] = message
+            elif _already_at:
+                # 已经带 @：保持原样
+                params["message"] = message
+            else:
+                # 其余所有回复：都加 @（= 官方模式转 <@openid>，NapCat 用 CQ 码）
+                params["message"] = f"[CQ:at,qq={user_id}] {message}"
         
             # 防撤回记录
             if hasattr(self, "anti_recall") and self.anti_recall:
@@ -11347,21 +12447,33 @@ def ensure_token():
     return ACCESS_TOKEN
 
 # ========== Gateway 获取 ==========
-async def get_gateway_url():
+async def get_gateway_url(retries: int = 3, delay: float = 5.0):
     token = ensure_token()
     if not token:
         return None
     url = "https://api.bot.qq.com/gateway"
     headers = {"Authorization": f"QQBot {token}"}
-    try:
-        timeout = aiohttp.ClientTimeout(total=30)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(url, headers=headers) as resp:
-                data = await resp.json()
-                return data.get("url")
-    except Exception as e:
-        print(f"[官方适配] ❌ Gateway 异常: {e}")
-        return None
+    last_err = None
+    for attempt in range(1, retries + 1):
+        try:
+            timeout = aiohttp.ClientTimeout(total=30)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(url, headers=headers) as resp:
+                    data = await resp.json()
+                    gw = data.get("url")
+                    if gw:
+                        if attempt > 1:
+                            print(f"[官方适配] ✅ Gateway 第{attempt}次重试成功: {gw}")
+                        return gw
+                    print(f"[官方适配] ⚠️ Gateway 返回为空 (第{attempt}/{retries}次)")
+        except Exception as e:
+            last_err = e
+            print(f"[官方适配] ⚠️ Gateway 异常 (第{attempt}/{retries}次): {e}")
+        if attempt < retries:
+            print(f"[官方适配] ⏳ {delay}s 后重试 Gateway...")
+            await asyncio.sleep(delay)
+    print(f"[官方适配] ❌ Gateway 重试{retries}次均失败: {last_err}")
+    return None
 
 # ========== WebSocket 连接（兼容）==========
 async def ws_connect_with_header(uri, headers):
@@ -11713,7 +12825,7 @@ async def upload_voice_official(user_openid: str, voice_data: bytes, filename: s
 
 
 async def upload_voice_official_group(group_openid: str, voice_data: bytes, filename: str = "voice.m4a"):
-    """群聊上传语音 - file_type=4"""
+    """群聊上传语音 - file_type=3"""
     token = ensure_token()
     if not token:
         return None
@@ -11725,10 +12837,10 @@ async def upload_voice_official_group(group_openid: str, voice_data: bytes, file
     file_md5_10m = calc_md5_10m(voice_data)
     file_size = str(len(voice_data))
     
-    # ========== 关键修复：群聊语音用 file_type = 4 ==========
+    # ========== 关键修复：群聊语音用 file_type = 3（官方文档：1=图片 2=视频 3=语音 4=文件） ==========
     preupload_url = f"https://api.bot.qq.com/v2/groups/{group_openid}/upload_prepare"
     payload = {
-        "file_type": 4,  # ← 群聊语音用 4！不是 3！
+        "file_type": 3,  # ← 群聊语音用 3！
         "file_size": file_size,
         "file_name": filename,
         "md5": file_md5,
@@ -11805,7 +12917,7 @@ async def upload_voice_official_group(group_openid: str, voice_data: bytes, file
             
             finalize_url = f"https://api.bot.qq.com/v2/groups/{group_openid}/files"
             finalize_payload = {
-                "file_type": 4,  # ← 合并时也是 4
+                "file_type": 3,  # ← 合并时也是 3（语音）
                 "upload_id": upload_id,
                 "srv_send_msg": False,
                 "file_name": filename
@@ -11867,6 +12979,38 @@ def resolve_image_path(path: str) -> Optional[str]:
 # ========== 消息发送（支持纯文本 + 图片 + 语音）==========
 # ========== 消息发送（支持纯文本 + 图片 + 语音）==========
 # ========== 消息发送（支持纯文本 + 图片 + 语音）==========
+async def delete_official_group_message(group_openid: str, message_id: str) -> tuple:
+    """官方 API 撤回群消息（DELETE /v2/groups/{group_openid}/messages/{message_id}）
+    官方限制：消息发出后 2 分钟内可撤回，且机器人需有群管理权限。
+    返回 (success: bool, error: str|None)"""
+    try:
+        if not group_openid:
+            return False, "缺少 group_openid"
+        if not message_id:
+            return False, "缺少 message_id"
+
+        token = ensure_token()
+        if not token:
+            return False, "无有效 Token"
+
+        url = f"https://api.bot.qq.com/v2/groups/{group_openid}/messages/{message_id}"
+        headers = {"Authorization": f"QQBot {token}"}
+        print(f"[官方适配] 📤 撤回群消息: DELETE {url}")
+        async with aiohttp.ClientSession() as session:
+            async with session.delete(url, headers=headers, timeout=10) as resp:
+                resp_body = await resp.text()
+                if resp.status in (200, 204):
+                    print(f"[官方适配] ✅ 群消息撤回成功: {message_id}")
+                    return True, None
+                else:
+                    print(f"[官方适配] ❌ 群消息撤回失败: HTTP {resp.status} - {resp_body[:300]}")
+                    return False, f"HTTP {resp.status} {resp_body[:300]}"
+    except Exception as e:
+        import traceback
+        print(f"[官方适配] ❌ 群消息撤回异常: {type(e).__name__}: {e}\n{traceback.format_exc()}")
+        return False, f"异常[{type(e).__name__}] {e}"
+
+
 async def send_message_official(message: str, user_openid=None, group_openid=None, official_msg_id=None):
     """发送官方消息 - 支持纯文本、图片、语音"""
     token = ensure_token()
@@ -11953,18 +13097,25 @@ async def send_message_official(message: str, user_openid=None, group_openid=Non
         else:
             return False
         
+        # 发送请求（强制超时 10s + 异常打印 resp.status/resp.text，绝不卡死）
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.post(url, json=payload, headers=headers, timeout=30) as resp:
+                async with session.post(url, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=10, connect=10)) as resp:
+                    resp_body = await resp.text()
                     if resp.status == 200:
                         print("[官方适配] ✅ 图片消息发送成功")
                         return True
                     else:
-                        text = await resp.text()
-                        print(f"[官方适配] ❌ 发送图片失败: {resp.status} - {text}")
+                        print(f"[官方适配] ❌ 发送图片失败: HTTP {resp.status} - {resp_body[:300]}")
                         return False
+        except asyncio.TimeoutError:
+            print(f"[官方适配] ⏱️ 发送图片超时（10s），url={url}")
+            return False
+        except aiohttp.ClientError as ce:
+            print(f"[官方适配] ❌ 发送图片网络错误: {type(ce).__name__}: {ce}")
+            return False
         except Exception as e:
-            print(f"[官方适配] ❌ 发送图片异常: {e}")
+            print(f"[官方适配] ❌ 发送图片异常: {type(e).__name__}: {e}")
             return False
     
     # ============================================================
@@ -12025,19 +13176,25 @@ async def send_message_official(message: str, user_openid=None, group_openid=Non
         else:
             return False
         
-        # 发送请求
+        # 发送请求（强制超时 10s + 异常打印 resp.status/resp.text，绝不卡死）
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.post(url, json=payload, headers=headers, timeout=30) as resp:
+                async with session.post(url, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=10, connect=10)) as resp:
+                    resp_body = await resp.text()
                     if resp.status == 200:
                         print("[官方适配] ✅ 语音消息发送成功")
                         return True
                     else:
-                        text = await resp.text()
-                        print(f"[官方适配] ❌ 发送语音失败: {resp.status} - {text}")
+                        print(f"[官方适配] ❌ 发送语音失败: HTTP {resp.status} - {resp_body[:300]}")
                         return False
+        except asyncio.TimeoutError:
+            print(f"[官方适配] ⏱️ 发送语音超时（10s），url={url}")
+            return False
+        except aiohttp.ClientError as ce:
+            print(f"[官方适配] ❌ 发送语音网络错误: {type(ce).__name__}: {ce}")
+            return False
         except Exception as e:
-            print(f"[官方适配] ❌ 发送语音异常: {e}")
+            print(f"[官方适配] ❌ 发送语音异常: {type(e).__name__}: {e}")
             return False
     
     # ============================================================
@@ -12069,60 +13226,109 @@ async def send_message_official(message: str, user_openid=None, group_openid=Non
             return False
     
     # ============================================================
-    # 4. 纯文本消息
+    # 4. 纯文本消息（含 @ 处理：官方 API 用 mentions 结构，不直接拼 openid）
     # ============================================================
-    clean_message = re.sub(r'\[CQ:[^\]]+\]', '', message).strip()
+    # ① 提取所有 [CQ:at,qq=X] 目标（X 是 openid 或 OneBot 假QQ），映射成真实 openid
+    import re as _re
+    _at_openids = []
+    try:
+        import official_bot_adapter as _oba
+        _uid_map = _oba.user_id_map
+        _bot_openid = _oba.get_bot_openid_sync()
+    except Exception:
+        _uid_map = {}
+        _bot_openid = ""
+    for _m in _re.finditer(r'\[CQ:at,qq=([^\]]+)\]', message):
+        _v = _m.group(1).strip()
+        if not _v:
+            continue
+        # 若 v 是假QQ号，反查真实 openid；否则 v 本身可能就是 openid
+        try:
+            _real = _uid_map.get(str(_v), _v)
+        except Exception:
+            _real = _v
+        if _real and _real not in _at_openids:
+            _at_openids.append(_real)
+    # ② 去掉 content 里的 [CQ:at] 老格式（避免截断成 @cp=xxx），保留其它文本
+    clean_message = _re.sub(r'\[CQ:at,qq=[^\]]+\]', '', message)
+    clean_message = _re.sub(r'<@[^>]+>', '', clean_message)
+    clean_message = _re.sub(r'\[CQ:[^\]]+\]', '', clean_message).strip()
     if not clean_message:
         print("[官方适配] ⚠️ 消息为空，跳过发送")
         return True
-    
+
     if group_openid:
         url = f"https://api.bot.qq.com/v2/groups/{group_openid}/messages"
     elif user_openid:
         url = f"https://api.bot.qq.com/v2/users/{user_openid}/messages"
     else:
         return False
-    
+
     payload = {
         "msg_type": 0,
         "content": clean_message
     }
+    # ③ 构造官方 mentions 结构：{"openid": 真实openid, "is_your_bot": bool}
+    if group_openid and _at_openids:
+        try:
+            mentions = []
+            for _oid in dict.fromkeys(_at_openids):
+                mentions.append({"openid": _oid, "is_your_bot": bool(_bot_openid and _oid == _bot_openid)})
+            payload["mentions"] = mentions
+            print(f"[官方适配] 📌 群文本 @mentions: {mentions}")
+        except Exception as _e:
+            print(f"[官方适配] ⚠️ 构造 mentions 失败: {_e}")
     if official_msg_id:
         payload["msg_id"] = official_msg_id
-    
+
     print(f"[官方适配] 📤 发送文本: {clean_message[:50]}...")
-    
+
+    # 发送请求（强制超时 10s + 异常打印 resp.status/resp.text，绝不卡死）
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.post(url, json=payload, headers=headers, timeout=10) as resp:
+            async with session.post(url, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=10, connect=10)) as resp:
+                resp_body = await resp.text()
                 if resp.status == 200:
                     print("[官方适配] ✅ 文本消息发送成功")
                     return True
                 else:
-                    text = await resp.text()
-                    print(f"[官方适配] ❌ 发送文本失败: {resp.status} - {text}")
+                    print(f"[官方适配] ❌ 发送文本失败: HTTP {resp.status} - {resp_body[:300]}")
                     return False
+    except asyncio.TimeoutError:
+        print(f"[官方适配] ⏱️ 发送文本超时（10s），url={url}")
+        return False
+    except aiohttp.ClientError as ce:
+        print(f"[官方适配] ❌ 发送文本网络错误: {type(ce).__name__}: {ce}")
+        return False
     except Exception as e:
-        print(f"[官方适配] ❌ 发送文本异常: {e}")
+        print(f"[官方适配] ❌ 发送文本异常: {type(e).__name__}: {e}")
         return False
 
 
     
 async def upload_voice_official_group(group_openid: str, voice_data: bytes, filename: str = "voice.m4a"):
-    """群聊上传语音 - file_type=4"""
+    """群聊上传语音 - file_type=4
+
+    【重试与降级】：
+      1. 预上传请求最多重试 3 次，每次失败 sleep(2) 后再试；
+      2. 强制超时：total=60 / connect=15 / sock_read=30，宽容 WinError 121 信号灯超时；
+      3. 3 次全失败 → 降级为发送纯文本提示"❌ 点歌成功，但语音发送超时，请稍后重试"；
+      4. 任何异常都不抛出（避免卡死事件循环），返回 None。
+    """
     token = ensure_token()
     if not token:
+        print("[官方适配] ❌ 无有效 Token，无法上传语音")
         return None
-    
+
     headers = {"Authorization": f"QQBot {token}", "Content-Type": "application/json"}
     import hashlib
-    
+
     file_md5 = calc_md5(voice_data)
     file_sha1 = calc_sha1(voice_data)
     file_md5_10m = calc_md5_10m(voice_data)
     file_size = str(len(voice_data))
-    
-    # 群聊语音用 file_type = 4
+
+    # 群聊语音必须用 file_type = 3（官方文档：1=图片 2=视频 3=语音 4=文件）
     preupload_url = f"https://api.bot.qq.com/v2/groups/{group_openid}/upload_prepare"
     payload = {
         "file_type": 3,
@@ -12132,39 +13338,84 @@ async def upload_voice_official_group(group_openid: str, voice_data: bytes, file
         "sha1": file_sha1,
         "md5_10m": file_md5_10m
     }
-    
-    async with aiohttp.ClientSession() as session:
-        # 预上传
-        async with session.post(preupload_url, json=payload, headers=headers, timeout=30) as resp:
-            if resp.status != 200:
-                text = await resp.text()
-                print(f"[官方适配] ❌ 群聊语音预上传失败: {resp.status} - {text[:200]}")
+
+    # 语音超时降级文本
+    timeout_tip = "❌ 点歌成功，但语音发送超时，请稍后重试"
+
+    try:
+        # 每个重试轮次都新建独立 Session（随 with 结束自动关闭连接池，清理无效连接）
+        async with aiohttp.ClientSession() as session:
+            # ===== 1. 预上传（带 3 次重试） =====
+            upload_id = None
+            parts = []
+            preupload_ok = False
+            for attempt in range(1, 4):
+                try:
+                    async with session.post(
+                        preupload_url, json=payload, headers=headers,
+                        timeout=aiohttp.ClientTimeout(total=60, connect=15, sock_read=30)
+                    ) as resp:
+                        if resp.status != 200:
+                            text = await resp.text()
+                            print(f"[官方适配] ❌ 群聊语音预上传失败（第{attempt}次）: HTTP {resp.status} - {text[:200]}")
+                        else:
+                            data = await resp.json()
+                            upload_id = data.get("upload_id")
+                            parts = data.get("parts", [])
+                            if upload_id and parts:
+                                preupload_ok = True
+                                break
+                            print(f"[官方适配] ⚠️ 群聊语音预上传响应缺 upload_id/parts（第{attempt}次）")
+                except asyncio.TimeoutError:
+                    print(f"[官方适配] ⏱️ 群聊语音预上传超时（第{attempt}次，WinError 121 类），稍后重试")
+                except aiohttp.ClientError as ce:
+                    print(f"[官方适配] ❌ 群聊语音预上传网络错误（第{attempt}次）: {type(ce).__name__}: {ce}")
+                except Exception as e:
+                    print(f"[官方适配] ❌ 群聊语音预上传异常（第{attempt}次）: {type(e).__name__}: {e}")
+
+                # 不是最后一次则等待 2 秒再重试
+                if attempt < 3:
+                    try:
+                        await asyncio.sleep(2)
+                    except Exception:
+                        pass
+
+            if not preupload_ok:
+                print(f"[官方适配] 🚫 群聊语音预上传 3 次均失败，降级为纯文本提示")
+                # 降级：发纯文本，绝不抛出
+                try:
+                    await send_message_official(timeout_tip, group_openid=group_openid, official_msg_id=None)
+                except Exception as e:
+                    print(f"[官方适配] ❌ 降级提示发送失败: {e}")
                 return None
-            data = await resp.json()
-            upload_id = data.get("upload_id")
-            parts = data.get("parts", [])
-            if not upload_id or not parts:
-                return None
-            
-            # 上传分片
+
+            # ===== 2. 上传分片 =====
             for part in parts:
                 part_index = part.get("index", 1)
                 presigned_url = part.get("presigned_url")
                 block_size = int(part.get("block_size", 0))
-                
+
                 start = (part_index - 1) * block_size
                 end = min(start + block_size, len(voice_data))
                 chunk = voice_data[start:end]
                 actual_size = len(chunk)
                 chunk_md5 = hashlib.md5(chunk).hexdigest()
-                
+
                 # PUT 上传
-                async with session.put(presigned_url, data=chunk, headers={"Content-Type": "application/octet-stream"}, timeout=60) as put_resp:
-                    if put_resp.status not in [200, 204]:
-                        text = await put_resp.text()
-                        print(f"[官方适配] ❌ 分片 {part_index} 上传失败: {put_resp.status}")
-                        return None
-                
+                try:
+                    async with session.put(
+                        presigned_url, data=chunk,
+                        headers={"Content-Type": "application/octet-stream"},
+                        timeout=aiohttp.ClientTimeout(total=60, connect=15, sock_read=30)
+                    ) as put_resp:
+                        if put_resp.status not in [200, 204]:
+                            text = await put_resp.text()
+                            print(f"[官方适配] ❌ 分片 {part_index} 上传失败: {put_resp.status}")
+                            return None
+                except (asyncio.TimeoutError, aiohttp.ClientError) as ce:
+                    print(f"[官方适配] ❌ 分片 {part_index} 上传异常: {type(ce).__name__}: {ce}")
+                    return None
+
                 # 确认分片
                 part_finish_url = f"https://api.bot.qq.com/v2/groups/{group_openid}/upload_part_finish"
                 part_finish_payload = {
@@ -12173,41 +13424,132 @@ async def upload_voice_official_group(group_openid: str, voice_data: bytes, file
                     "block_size": str(actual_size),
                     "md5": chunk_md5
                 }
-                
-                async with session.post(part_finish_url, json=part_finish_payload, headers=headers, timeout=30) as pf_resp:
-                    if pf_resp.status != 200:
-                        text = await pf_resp.text()
-                        print(f"[官方适配] ❌ 分片 {part_index} 确认失败: {pf_resp.status} - {text[:200]}")
-                        return None
-            
+                try:
+                    async with session.post(
+                        part_finish_url, json=part_finish_payload, headers=headers,
+                        timeout=aiohttp.ClientTimeout(total=60, connect=15, sock_read=30)
+                    ) as pf_resp:
+                        if pf_resp.status != 200:
+                            text = await pf_resp.text()
+                            print(f"[官方适配] ❌ 分片 {part_index} 确认失败: {pf_resp.status} - {text[:200]}")
+                            return None
+                except (asyncio.TimeoutError, aiohttp.ClientError) as ce:
+                    print(f"[官方适配] ❌ 分片 {part_index} 确认异常: {type(ce).__name__}: {ce}")
+                    return None
+
             # 等待处理
             await asyncio.sleep(2)
-            
-            # 合并上传
+
+            # ===== 3. 合并上传（语音也用 file_type = 3） =====
             finalize_url = f"https://api.bot.qq.com/v2/groups/{group_openid}/files"
             finalize_payload = {
-                "file_type": 4,
+                "file_type": 3,
                 "upload_id": upload_id,
                 "srv_send_msg": False,
                 "file_name": filename
             }
-            
-            async with session.post(finalize_url, json=finalize_payload, headers=headers, timeout=30) as finalize_resp:
-                if finalize_resp.status != 200:
-                    text = await finalize_resp.text()
-                    print(f"[官方适配] ❌ 群聊语音合并失败: {finalize_resp.status} - {text[:200]}")
-                    return None
-                data = await finalize_resp.json()
-                file_info = data.get("file_info")
-                if file_info:
-                    print(f"[官方适配] ✅ 群聊语音合并成功")
-                    return file_info
-                else:
-                    print(f"[官方适配] ❌ 群聊语音未获取到 file_info: {data}")
-                    return None
+            try:
+                async with session.post(
+                    finalize_url, json=finalize_payload, headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=60, connect=15, sock_read=30)
+                ) as finalize_resp:
+                    if finalize_resp.status != 200:
+                        text = await finalize_resp.text()
+                        print(f"[官方适配] ❌ 群聊语音合并失败: {finalize_resp.status} - {text[:200]}")
+                        return None
+                    data = await finalize_resp.json()
+                    file_info = data.get("file_info")
+                    if file_info:
+                        print(f"[官方适配] ✅ 群聊语音合并成功")
+                        return file_info
+                    else:
+                        print(f"[官方适配] ❌ 群聊语音未获取到 file_info: {data}")
+                        return None
+            except (asyncio.TimeoutError, aiohttp.ClientError) as ce:
+                print(f"[官方适配] ❌ 群聊语音合并异常: {type(ce).__name__}: {ce}")
+                return None
+    except Exception as e:
+        # 外层兜底：任何异常都不抛出，降级为纯文本提示
+        print(f"[官方适配] 🚫 群聊语音上传整体异常（已降级）: {type(e).__name__}: {e}")
+        try:
+            await send_message_official(timeout_tip, group_openid=group_openid, official_msg_id=None)
+        except Exception:
+            pass
+        return None
 
 # ========== 消息转换 ==========
 # ========== 消息转换 ==========
+
+# ===== 防重复推送缓存（按 msg_id 去重，防止腾讯重复推送同一条消息） =====
+_seen_msg_ids = []
+_SEEN_MAX = 500
+_msg_seq_counter = {}  # msg_id (str) -> int，同一 msg_id 的回复计数（用于 msg_seq 递增防去重）
+
+def _is_duplicate_msg(msg_id: str) -> bool:
+    """判断该 msg_id 是否已处理过；若没有则记录并返回 False。"""
+    global _seen_msg_ids
+    if not msg_id:
+        return False
+    if msg_id in _seen_msg_ids:
+        return True
+    _seen_msg_ids.append(msg_id)
+    if len(_seen_msg_ids) > _SEEN_MAX:
+        _seen_msg_ids = _seen_msg_ids[-_SEEN_MAX:]
+    return False
+
+
+def parse_official_content(content, top_mentions=None):
+    """解析官方 content 字段，返回 (纯文本, mentions 列表)。
+    官方 content 可能是：
+      1) JSON 字符串（内含 content/text 文本 + mentions 数组）
+      2) 纯文本（含 <@openid> @ 标记）
+    统一转成纯文本（<@openid> → [CQ:at,qq=openid]），并把 mentions 汇总返回。
+    """
+    import re
+    text = ""
+    mentions = []
+    if not content:
+        return "", mentions
+    if isinstance(content, str):
+        c = content.strip()
+        # 1) JSON 字符串
+        if c.startswith("{") or c.startswith("["):
+            parsed = None
+            try:
+                parsed = json.loads(c)
+            except Exception:
+                parsed = None
+            if parsed is not None:
+                if isinstance(parsed, dict):
+                    text = parsed.get("content") or parsed.get("text") or ""
+                    mentions = parsed.get("mentions") or []
+                elif isinstance(parsed, list):
+                    for seg in parsed:
+                        if isinstance(seg, dict):
+                            text += str(seg.get("text") or seg.get("content") or "")
+                            if seg.get("type") == "at":
+                                m = {"member_openid": seg.get("member_openid") or seg.get("id", "")}
+                                mentions.append(m)
+                # JSON 里取不到文本时，回退用原始字符串
+                if not text:
+                    text = c
+            else:
+                text = c
+        else:
+            # 2) 纯文本
+            text = c
+    else:
+        text = str(content or "")
+    # 把 <@openid> 官方 @ 标记转成 OneBot 的 [CQ:at,qq=openid]，便于后续统一匹配
+    text = re.sub(r'<@([^>]+)>', r'[CQ:at,qq=\1]', text).strip()
+    # 汇总顶层 d.mentions（若有）
+    if top_mentions and isinstance(top_mentions, list):
+        for m in top_mentions:
+            if isinstance(m, dict):
+                mentions.append(m)
+    return text, mentions
+
+
 def convert_official_to_onebot(data, openid_map=None, save_map_callback=None):
     """将官方消息转换为 OneBot 格式 - 使用映射表"""
     global BOT_QQ
@@ -12262,6 +13604,10 @@ def convert_official_to_onebot(data, openid_map=None, save_map_callback=None):
         
         # ===== 群聊 @ 消息 =====
         elif event_type == "GROUP_AT_MESSAGE_CREATE":
+            # ===== 防重复推送去重 =====
+            if _is_duplicate_msg(msg_id):
+                print(f"[官方适配] ⏭️ 重复消息已忽略 (msg_id={msg_id})")
+                return None
             # ===== 打印原始数据 =====
             #print(f"[官方适配] 📦 原始群聊数据: {json.dumps(d, ensure_ascii=False)[:500]}")
             print(json.dumps(d, ensure_ascii=False, indent=2))
@@ -12322,11 +13668,37 @@ def convert_official_to_onebot(data, openid_map=None, save_map_callback=None):
             except Exception:
                 pass
             
-            # 移除官方 @ 标记，转为 CQ 格式
-            import re
-            text = re.sub(r'<@([^>]+)>', r'[CQ:at,qq=\1]', raw_text).strip()
+            # 解析官方 content（JSON 字符串 / 纯文本），提取纯文本
+            text, _at_mentions = parse_official_content(raw_text, d.get("mentions"))
+            print(f"[官方适配] 📝 @消息解析后文本: {text[:80]}")
             
-            return {
+            # ===== 图片附件：url 带时效签名，必须在收到事件时同步下载，不能延后 =====
+            try:
+                import official_bot_adapter
+                local_image_paths = official_bot_adapter.download_official_images(d)
+            except Exception as _img_e:
+                print(f"[官方适配] ❌ 图片附件下载异常: {_img_e}")
+                local_image_paths = []
+            if local_image_paths:
+                print(f"[官方适配] 🖼️ 群@消息图片已本地化: {local_image_paths}")
+            # ===== 提取图片附件 URL（供图片违规审核） =====
+            _att_urls = []
+            try:
+                for _att in (d.get("attachments") or []):
+                    if not isinstance(_att, dict):
+                        continue
+                    _img = _att.get("image") or _att.get("image_info") or {}
+                    _a_url = None
+                    if isinstance(_img, dict):
+                        _a_url = _img.get("url")
+                    if not _a_url:
+                        _a_url = _att.get("url")
+                    if _a_url and _a_url not in _att_urls:
+                        _att_urls.append(_a_url)
+            except Exception:
+                _att_urls = []
+            
+            _ret = {
                 "post_type": "message",
                 "message_type": "group",
                 "user_id": real_user_id,
@@ -12341,8 +13713,155 @@ def convert_official_to_onebot(data, openid_map=None, save_map_callback=None):
                 "_official_user_openid": user_openid,
                 "_official_group_openid": group_openid,
                 "_official_msg_id": msg_id,
+                "_attachment_image_urls": _att_urls,
                 "_official_msg_type": "group"
             }
+            if local_image_paths:
+                _ret["_local_image_paths"] = local_image_paths
+            return _ret
+        
+        # ===== 群聊普通消息（开启全量消息后推送，不触发任何回复） =====
+        elif event_type == "GROUP_MESSAGE_CREATE":
+            d = data.get("d", {})
+            msg_id = d.get("id", "")
+            # ===== 防重复推送去重 =====
+            if _is_duplicate_msg(msg_id):
+                print(f"[官方适配] ⏭️ 重复全量消息已忽略 (msg_id={msg_id})")
+                return None
+            # 提取发送者 member_openid
+            author = d.get("author", {})
+            member_openid = (author.get("user_openid", "") or author.get("id", "") or author.get("member_openid", ""))
+            group_openid = d.get("group_openid", "") or d.get("group_id", "")
+            content = d.get("content", "")
+
+            # ===== 提取图片附件（可能 content 为空，只有 attachments 图片） =====
+            attachment_urls = []
+            try:
+                _atts = d.get("attachments") or []
+                for _att in _atts:
+                    if not isinstance(_att, dict):
+                        continue
+                    _img = _att.get("image") or _att.get("image_info") or {}
+                    _a_url = None
+                    if isinstance(_img, dict):
+                        _a_url = _img.get("url")
+                    if not _a_url:
+                        _a_url = _att.get("url")
+                    if _a_url and _a_url not in attachment_urls:
+                        attachment_urls.append(_a_url)
+            except Exception:
+                attachment_urls = []
+
+            # 图片-only 消息：content 为空但有附件图片，仍要进入后续处理（图片审核/撤回）
+            if not content and not attachment_urls:
+                return None
+
+            # ===== 群/用户 ID 映射（供防撤回缓存使用） =====
+            real_user_id = None
+            if member_openid:
+                if openid_map and member_openid in openid_map:
+                    real_user_id = openid_map[member_openid]
+                else:
+                    real_user_id = openid_to_int(member_openid)
+                    if openid_map is not None:
+                        openid_map[member_openid] = real_user_id
+                        if save_map_callback:
+                            save_map_callback()
+            group_key = "group_" + group_openid
+            real_group_id = None
+            if openid_map and group_key in openid_map:
+                real_group_id = openid_map[group_key]
+            else:
+                real_group_id = openid_to_int(group_openid)
+                if openid_map is not None:
+                    openid_map[group_key] = real_group_id
+                    if save_map_callback:
+                        save_map_callback()
+
+            # ===== 同步群/用户映射到 standalone 适配器（全量群消息也要登记群号→group_openid） =====
+            try:
+                import official_bot_adapter
+                official_bot_adapter.register_group_mapping(str(real_group_id), group_openid)
+                if member_openid:
+                    official_bot_adapter.register_user_mapping(str(real_user_id), member_openid)
+            except Exception:
+                pass
+
+            # ===== 解析官方 content（JSON 字符串 / 纯文本），提取纯文本 + 汇总 mentions =====
+            text, _mentions = parse_official_content(content, d.get("mentions"))
+            if not text:
+                text = "（空消息）"
+
+            # ===== 汇总 mentions（content JSON + 顶层 d.mentions）=====
+            _top_mentions = d.get("mentions") or []
+            _all_mentions = []
+            if isinstance(_top_mentions, list):
+                _all_mentions.extend(_top_mentions)
+            if isinstance(_mentions, list):
+                _all_mentions.extend(_mentions)
+
+            # ===== 判断是否 @ 了机器人：is_you:true 或 bot:true 且 openid==本机器人 =====
+            _is_at_bot = False
+            try:
+                import official_bot_adapter
+                _bot_openid = official_bot_adapter.get_bot_openid_sync()
+            except Exception:
+                _bot_openid = ""
+            for _m in _all_mentions:
+                if not isinstance(_m, dict):
+                    continue
+                # 平台直接标记 is_you / bot
+                if _m.get("is_you") is True or _m.get("is_you") == "true":
+                    _is_at_bot = True
+                    break
+                if _m.get("bot") is True or _m.get("bot") == "true":
+                    if _bot_openid:
+                        _mid = _m.get("member_openid") or _m.get("openid") or _m.get("id") or ""
+                        if _mid and _mid == _bot_openid:
+                            _is_at_bot = True
+                            break
+                    else:
+                        _is_at_bot = True
+                        break
+                # 备用：member_openid 直接等于本机器人
+                if _bot_openid:
+                    _mid = _m.get("member_openid") or _m.get("openid") or _m.get("id") or ""
+                    if _mid and _mid == _bot_openid:
+                        _is_at_bot = True
+                        break
+
+            _msg_type = "group" if _is_at_bot else "group_silent"
+            # ===== 图片附件：url 带时效签名，必须在收到事件时同步下载，不能延后 =====
+            try:
+                import official_bot_adapter
+                _local_image_paths = official_bot_adapter.download_official_images(d)
+            except Exception as _img_e:
+                print(f"[官方适配] ❌ 图片附件下载异常: {_img_e}")
+                _local_image_paths = []
+            if _local_image_paths:
+                print(f"[官方适配] 🖼️ 群消息图片已本地化: {_local_image_paths}")
+            _ret = {
+                "post_type": "message",
+                "message_type": "group",
+                "user_id": real_user_id or "",
+                "group_id": real_group_id,
+                "message": text,
+                "raw_message": text,
+                "self_id": BOT_QQ,
+                "message_id": msg_id,
+                "sender": {
+                    "user_id": real_user_id or "",
+                    "nickname": author.get("username", "")
+                },
+                "_official_user_openid": member_openid,
+                "_official_group_openid": group_openid,
+                "_official_msg_id": msg_id,
+                "_official_msg_type": _msg_type,
+                "_attachment_image_urls": attachment_urls
+            }
+            if _local_image_paths:
+                _ret["_local_image_paths"] = _local_image_paths
+            return _ret
         
         else:
             print(f"[官方适配] ⚠️ 未知事件类型: {event_type}")
@@ -12459,9 +13978,16 @@ async def official_bot_main(handler):
         return
     
     # ===== 4. 获取 Gateway =====
-    gateway_url = await get_gateway_url()
+    gateway_url = None
+    for _gw_try in range(3):
+        gateway_url = await get_gateway_url(retries=3, delay=5.0)
+        if gateway_url:
+            break
+        print(f"[适配器] ⏳ Gateway 获取失败，第{_gw_try+1}/3轮重试...")
+        if _gw_try < 2:
+            await asyncio.sleep(10)
     if not gateway_url:
-        print("[适配器] ❌ 无法获取 Gateway")
+        print("[适配器] ❌ 无法获取 Gateway（已重试3轮×3次，全部失败）")
         return
     WS_URL = gateway_url
     print(f"[适配器] ✅ Gateway: {WS_URL}")
@@ -12550,13 +14076,107 @@ async def official_bot_main(handler):
                         raw = await asyncio.wait_for(ws.recv(), timeout=30)
                         data = json.loads(raw)
                         op = data.get("op")
+                        # ===== 抓包：第一时间打印原始 JSON（不做任何 event_type 判断） =====
+                        print(f"🚨 [原始数据抓包]: {json.dumps(data, ensure_ascii=False)}")
                         
                         if op == 11:
                             continue
                         elif op == 0:
+                            # ===== 官方模式入群审批事件监听（不转换消息，直接审批） =====
+                            _evt_type = data.get("t", "")
+                            if _evt_type in ("GROUP_JOIN_REQUEST", "GROUP_ADD_ROBOT", "GROUP_JOIN_APPROVE"):
+                                try:
+                                    _d = data.get("d", {}) or {}
+                                    _goid = _d.get("group_openid", "") or _d.get("group_id", "")
+                                    _mid = (_d.get("member_openid", "") or _d.get("author", {}).get("id", "")
+                                            or _d.get("author", {}).get("user_openid", ""))
+                                    _jid = _d.get("join_request_id", "")
+                                    print(f"[适配器] 📨 收到入群审批事件 {_evt_type}: group={_goid} member={_mid}")
+                                    import official_bot_adapter
+                                    if _goid and _mid:
+                                        ok, err = await official_bot_adapter.approve_join_request(
+                                            _goid, _mid, _jid, op="approve"
+                                        )
+                                        print(f"[适配器] ✅ 自动审批通过: {ok} {err or ''}")
+                                    else:
+                                        print(f"[适配器] ⚠️ 入群审批事件缺少 group_openid/member_openid")
+                                except Exception as _e:
+                                    print(f"[适配器] ❌ 入群审批异常: {_e}")
+                                continue
                             # ===== 转换消息时传入映射表 =====
                             onebot = convert_official_to_onebot(data, openid_map, save_map)
                             if onebot:
+                                # ===== 事件分流：按原始 event_type 明确打印 =====
+                                _raw_evt = data.get("t", "")
+                                if _raw_evt == "GROUP_AT_MESSAGE_CREATE":
+                                    print("🚨 [事件分流] 收到 @ 机器人消息！进入指令/AI")
+                                elif _raw_evt == "GROUP_MESSAGE_CREATE":
+                                    print("🚨 [事件分流] 收到普通群消息，记录防撤回")
+                                else:
+                                    print(f"🚨 [事件分流] 事件: {_raw_evt} (msg_type={onebot.get('_official_msg_type')})")
+                                # ===== 全量群聊消息：防撤回 + 违禁词检测，处理后立刻退出，绝不触发 AI =====
+                                if onebot.get("_official_msg_type") == "group_silent":
+                                    # ① 恢复彩色日志
+                                    try:
+                                        _log_gid = str(onebot.get("group_id", ""))
+                                        _log_uid = str(onebot.get("user_id", ""))
+                                        _log_nick = (onebot.get("sender") or {}).get("nickname", "") or _log_uid
+                                        _log_text = onebot.get("message", "")
+                                        print(ColoredLogger.format_group_message(_log_gid, _log_uid, _log_nick, _log_text))
+                                    except Exception:
+                                        pass
+                                    # ② 记录防撤回
+                                    try:
+                                        if hasattr(handler, "anti_recall") and handler.anti_recall:
+                                            handler.anti_recall.record_message(onebot)
+                                        print(f"[适配器] 📝 已记录全量群聊消息（防撤回缓存）")
+                                    except Exception as e:
+                                        print(f"[适配器] ⚠️ 记录全量消息失败: {e}")
+                                    # ③ 违禁词检测（官方模式下 _check_banned_word 内部会走官方撤回/禁言接口）
+                                    try:
+                                        _gid = onebot.get("group_id")
+                                        _uid = str(onebot.get("user_id", ""))
+                                        if _gid and _uid:
+                                            _banned_result = await handler._check_banned_word(str(_gid), _uid, onebot)
+                                            if _banned_result:
+                                                print(f"[适配器] 🚫 全量消息违禁词命中并已处理（撤回/禁言/提示），不回复")
+                                            else:
+                                                print(f"[适配器] ✅ 全量消息违禁词检测通过，不回复")
+                                        else:
+                                            print(f"[适配器] ⚠️ 全量消息缺 group_id/user_id，跳过违禁词检测")
+                                    except Exception as e:
+                                        print(f"[适配器] ⚠️ 全量消息违禁词检测异常: {e}")
+                                    # ③.5 B站链接自动解析（支持全量消息的群：不要求 @，直接自动触发）
+                                    try:
+                                        if hasattr(handler, 'video_parser') and handler.video_parser:
+                                            _raw_text = onebot.get("message", "") or onebot.get("raw_message", "")
+                                            if isinstance(_raw_text, list):
+                                                _raw_text = "".join([s.get("data", {}).get("text", "") if isinstance(s, dict) else "" for s in _raw_text])
+                                            import re as _vre
+                                            _bili_url = None
+                                            for _m in _vre.finditer(r'(?:https?://)?(?:www\.)?bilibili\.com/video/(?:BV\w+|av\d+)', _raw_text, _vre.IGNORECASE):
+                                                _bili_url = _m.group(0); break
+                                            if not _bili_url:
+                                                for _m in _vre.finditer(r'https?://b23\.tv/\w+', _raw_text, _vre.IGNORECASE):
+                                                    _bili_url = _m.group(0); break
+                                            if _bili_url:
+                                                if not _bili_url.startswith("http"):
+                                                    _bili_url = "https://" + _bili_url
+                                                _gs = str(onebot.get("group_id", ""))
+                                                _st = (handler._video_group_state or {}).get(_gs) or {}
+                                                if _st.get("enabled"):
+                                                    print(f"[B站视频] 📌 全量群消息检测到B站链接，自动解析: {_bili_url}")
+                                                    # 缓存假QQ→真实openid（供后台 _bili_send_bg @ 人用）
+                                                    _uopen = onebot.get("_official_user_openid")
+                                                    if _uopen:
+                                                        handler._user_openid_cache[str(onebot.get("user_id", ""))] = _uopen
+                                                    await handler._bili_auto_parse(onebot.get("group_id"), str(onebot.get("user_id", "")), _bili_url)
+                                                else:
+                                                    print(f"[B站视频] 群 {_gs} 未开启自动解析，跳过")
+                                    except Exception as e:
+                                        print(f"[B站视频] 全量消息自动解析异常: {e}")
+                                    # ④ 无论是否命中，立刻退出，绝不进入 AI 聊天
+                                    continue
                                 print(f"[适配器] 📩 收到消息")
                                 try:
                                     if onebot.get("self_id"):
@@ -12772,6 +14392,57 @@ async def run_bot(port=8765):
                 await asyncio.sleep(5)
 
 
+# ========== B站搜索（健壮版：多格式兼容 + 失败兜底） ==========
+async def bili_search_impl(keyword, page_size=10):
+    """
+    B站视频搜索（返回搜索结果列表）。
+    兼容 bilibili_api 多种返回结构（扁平 / data 包裹），
+    失败时兜底用 aiohttp 直连 B站搜索接口。
+    """
+    results = []
+    # 1) 优先 bilibili_api（curl_cffi 规避 412 风控）
+    try:
+        import bilibili_api
+        from bilibili_api.search import SearchObjectType
+        bilibili_api.select_client("curl_cffi")
+        res = await bilibili_api.search.search_by_type(
+            keyword, search_type=SearchObjectType.VIDEO, page=1, page_size=page_size
+        )
+        data = res or {}
+        if isinstance(data.get("result"), list):
+            results = data["result"]
+        elif isinstance(data.get("data"), dict):
+            inner = data["data"].get("result") or []
+            if isinstance(inner, dict):
+                inner = inner.get("result") or []
+            results = inner
+        if isinstance(results, dict):
+            results = results.get("result") or []
+    except Exception as e:
+        print(f"[B站搜索] bilibili_api 异常，改用直连接口: {e}")
+
+    # 2) 兜底：直连 B站搜索接口
+    if not results:
+        try:
+            import aiohttp
+            url = "https://api.bilibili.com/x/web-interface/search/type"
+            params = {"search_type": "video", "keyword": keyword, "page": 1, "page_size": page_size}
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
+                "Referer": "https://www.bilibili.com",
+            }
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, params=params, headers=headers, timeout=15) as resp:
+                    if resp.status == 200:
+                        js = await resp.json()
+                        inner = (js or {}).get("data") or {}
+                        results = inner.get("result") or []
+                        if isinstance(results, dict):
+                            results = results.get("result") or []
+        except Exception as e:
+            print(f"[B站搜索] 兜底接口异常: {e}")
+    return results
+
 # ========== 轮询适配器函数 ==========
 async def poll_adapter(handler):
     """轮询适配器获取官方消息"""
@@ -12790,6 +14461,69 @@ async def poll_adapter(handler):
                             ctx_group_openid = data.get("_official_group_openid")
                             ctx_msg_id = data.get("_official_msg_id")
                             # 处理消息
+                            # ===== 全量群聊消息：防撤回 + 违禁词检测，处理后立刻退出，绝不触发 AI =====
+                            if data.get("_official_msg_type") == "group_silent":
+                                # ① 恢复彩色日志
+                                try:
+                                    _log_gid = str(data.get("group_id", ""))
+                                    _log_uid = str(data.get("user_id", ""))
+                                    _log_nick = (data.get("sender") or {}).get("nickname", "") or _log_uid
+                                    _log_text = data.get("message", "")
+                                    print(ColoredLogger.format_group_message(_log_gid, _log_uid, _log_nick, _log_text))
+                                except Exception:
+                                    pass
+                                # ② 记录防撤回
+                                try:
+                                    if hasattr(handler, "anti_recall") and handler.anti_recall:
+                                        handler.anti_recall.record_message(data)
+                                    print(f"[主程序] 📝 已记录全量群聊消息（防撤回缓存）")
+                                except Exception as e:
+                                    print(f"[主程序] ⚠️ 记录全量消息失败: {e}")
+                                # ③ 违禁词检测（官方模式下 _check_banned_word 内部会走官方撤回/禁言接口）
+                                try:
+                                    _gid = data.get("group_id")
+                                    _uid = str(data.get("user_id", ""))
+                                    if _gid and _uid:
+                                        _banned_result = await handler._check_banned_word(str(_gid), _uid, data)
+                                        if _banned_result:
+                                            print(f"[主程序] 🚫 全量消息违禁词命中并已处理（撤回/禁言/提示），不回复")
+                                        else:
+                                            print(f"[主程序] ✅ 全量消息违禁词检测通过，不回复")
+                                    else:
+                                        print(f"[主程序] ⚠️ 全量消息缺 group_id/user_id，跳过违禁词检测")
+                                except Exception as e:
+                                    print(f"[主程序] ⚠️ 全量消息违禁词检测异常: {e}")
+                                # ③.5 B站链接自动解析（支持全量消息的群：不要求 @，直接自动触发）
+                                try:
+                                    if hasattr(handler, 'video_parser') and handler.video_parser:
+                                        _raw_text = data.get("message", "") or data.get("raw_message", "")
+                                        if isinstance(_raw_text, list):
+                                            _raw_text = "".join([s.get("data", {}).get("text", "") if isinstance(s, dict) else "" for s in _raw_text])
+                                        import re as _vre
+                                        _bili_url = None
+                                        for _m in _vre.finditer(r'(?:https?://)?(?:www\.)?bilibili\.com/video/(?:BV\w+|av\d+)', _raw_text, _vre.IGNORECASE):
+                                            _bili_url = _m.group(0); break
+                                        if not _bili_url:
+                                            for _m in _vre.finditer(r'https?://b23\.tv/\w+', _raw_text, _vre.IGNORECASE):
+                                                _bili_url = _m.group(0); break
+                                        if _bili_url:
+                                            if not _bili_url.startswith("http"):
+                                                _bili_url = "https://" + _bili_url
+                                            _gs = str(data.get("group_id", ""))
+                                            _st = (handler._video_group_state or {}).get(_gs) or {}
+                                            if _st.get("enabled"):
+                                                print(f"[B站视频] 📌 全量群消息检测到B站链接，自动解析: {_bili_url}")
+                                                # 缓存假QQ→真实openid（供后台 _bili_send_bg @ 人用）
+                                                _uopen = data.get("_official_user_openid")
+                                                if _uopen:
+                                                    handler._user_openid_cache[str(data.get("user_id", ""))] = _uopen
+                                                await handler._bili_auto_parse(data.get("group_id"), str(data.get("user_id", "")), _bili_url)
+                                            else:
+                                                print(f"[B站视频] 群 {_gs} 未开启自动解析，跳过")
+                                except Exception as e:
+                                    print(f"[B站视频] 全量消息自动解析异常: {e}")
+                                # ④ 无论是否命中，立刻退出，绝不进入 AI 聊天
+                                continue
                             reply = await handler.handle_message(data)
                             if reply:
                                 # 发送回复到适配器
@@ -12866,8 +14600,6 @@ def _gie_set_update_flag():
 import os
 os.makedirs("data/queue", exist_ok=True)
 QUEUE_DIR = "data/queue"
-async def main():
-    await run_bot()
 
 import subprocess
 import os
@@ -12896,9 +14628,21 @@ def start_zhenxun():
         print(f"[真寻] 启动失败: {e}")
         return None
 
-def main():
+def start_bot():
+    """正式启动逻辑（内部含最小化 + 启动器选择 + 模式分发）"""
     global main_handler
-    
+
+    # ===== 防呆最小化：仅当 AUTO_MINIMIZE 为 true 且非 DEV_MODE 热重载时 =====
+    _auto_minimize = CONFIG.get("AUTO_MINIMIZE", False)
+    _is_dev = os.environ.get("DEV_MODE", "") == "1"
+    if _auto_minimize and not _is_dev:
+        minimize_cmd_window()
+    else:
+        if _is_dev:
+            print("[启动] 🔧 DEV_MODE 热重载模式：终端保持显示")
+        elif not _auto_minimize:
+            print("[启动] AUTO_MINIMIZE 未开启，窗口保持显示")
+
     # ===== 检测锁定文件 =====
     lock_file = r"C:\ProgramData\qai_locked.dat"
     if os.path.exists(lock_file):
@@ -12907,14 +14651,14 @@ def main():
         print("=" * 50)
         input("按回车键滚蛋...")
         sys.exit(0)
-    
-    # ===== 🆕 注入授权密钥（必须放在任何模块导入之前） =====
+
+    # ===== 授权密钥注入（必须在任何模块导入前） =====
     license_mgr = get_license_manager()
     import builtins
     builtins.XP12_LICENSE_KEY = license_mgr.get_key()
     print(f"[授权] 密钥已注入: {builtins.XP12_LICENSE_KEY}")
-    
-    # ===== 启动前自动清理临时音频/视频缓存，防止撑爆硬盘 =====
+
+    # ===== 启动前清理临时媒体缓存 =====
     def _cleanup_temp_media():
         import glob
         exts = ("*.mp4", "*.m4a", "*.mp3")
@@ -12934,14 +14678,12 @@ def main():
 
     # ===== 创建处理器 =====
     main_handler = MessageHandler()
-    
+
     # ===== 看门狗令牌控制 =====
     GUARD_FILE = "data/.gitkeep"
-    # ... 后续代码不变 ...
     if os.path.exists(GUARD_FILE):
         print("[系统] 检测到令牌，看门狗不启动")
     else:
-        # ... 后续代码不变 ...
         print("[系统] 未检测到守护令牌，看门狗启动")
         import subprocess
         script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -12956,13 +14698,13 @@ def main():
             creationflags=subprocess.CREATE_NO_WINDOW,
         )
         print("[看门狗] 已独立启动")
-    
+
     _check()
 
     # ===== AI 引擎模式提示 =====
     _api_key = CONFIG.get("api", "").strip()
     _api_url = CONFIG.get("api_url", "https://api.agnes-ai.cn/v1").strip()
-    
+
     print("=" * 50)
     if _api_key:
         _masked = _api_key[:8] + "..." + _api_key[-6:]
@@ -12979,33 +14721,29 @@ def main():
         print("   │   \"api_url\": \"https://api.agnes-ai.cn/v1\"")
         print("   └─────────────────────────────────────────")
     print("=" * 50)
-    
+
+    # ===== 从 config.json 读取 BOT_MODE（静默启动，禁止 input） =====
+    bot_mode = str(CONFIG.get("BOT_MODE", "") or "").strip()
     print("=" * 50)
     print("🤖 XP12 机器人启动器")
     print("=" * 50)
-    print("1. NapCat 模式 (连接本地 NapCat WebSocket)")
-    print("2. 官方适配器模式 (直连 QQ 官方机器人)")
+    if bot_mode == "2":
+        print("已配置模式: 官方 API (2)")
+    elif bot_mode == "1":
+        print("已配置模式: OneBot / NapCat (1)")
+    else:
+        print(f"⚠️ config.json 中 BOT_MODE 无效或缺失: {bot_mode!r}")
     print("=" * 50)
-    
-    choice = input("请选择模式 (1/2): ").strip()
-    
+
     # ============================================================
-    # 🚫 NapCat 模式黑名单自毁检测（只针对模式1）
+    # 🚫 OneBot 模式黑名单自毁检测（只针对模式 1）
     # ============================================================
-    if choice == "1":
-        # 获取当前机器人的 QQ 号（从 config.json 读取）
+    if bot_mode == "1":
         bot_qq = CONFIG.get("QQ_OFFICIAL_BOT_QQ") or BOT_QQ or ""
-        
-        # ===== 黑名单列表（要封禁的机器人 QQ 号）=====
-        BLACKLISTED_BOT_QQ = [
-            "123456789",   # 示例：要封禁的机器人
-            "987654321",
-        ]
-        
+        BLACKLISTED_BOT_QQ = ["123456789", "987654321"]
         if str(bot_qq) in BLACKLISTED_BOT_QQ:
-            print(f"❌ 机器人 [{bot_qq}] 已被拉黑，NapCat 模式拒绝运行")
+            print(f"❌ 机器人 [{bot_qq}] 已被拉黑，OneBot 模式拒绝运行")
             print("🔥 正在清理目录中的 .py 文件...")
-            
             script_dir = os.path.dirname(os.path.abspath(__file__))
             deleted = 0
             for root, dirs, files in os.walk(script_dir):
@@ -13017,31 +14755,27 @@ def main():
                             deleted += 1
                         except Exception:
                             pass
-            
-            print(f"💀 已删除 {deleted} 个文件，NapCat 模式已自毁")
-            
-            # 再留个锁定文件，防止复活
+            print(f"💀 已删除 {deleted} 个文件，OneBot 模式已自毁")
             with open(r"C:\ProgramData\qai_locked.dat", 'w') as f:
                 f.write("locked")
             import ctypes
             ctypes.windll.kernel32.SetFileAttributesW(r"C:\ProgramData\qai_locked.dat", 2)
-            
             input("按回车键退出...")
             sys.exit(0)
         else:
-            print(f"✅ NapCat 模式 - 机器人 [{bot_qq}] 验证通过")
-    
+            print(f"✅ OneBot 模式 - 机器人 [{bot_qq}] 验证通过")
+
     # ============================================================
-    
+
     try:
-        if choice == "2":
+        if bot_mode == "2":
             print("🚀 启动官方适配器模式...")
             if main_handler is None:
                 main_handler = MessageHandler()
                 print(f"[主程序] ✅ handler 已创建，ID: {id(main_handler)}")
             asyncio.run(official_bot_main(main_handler))
         else:
-            print("🚀 启动 NapCat 模式...")
+            print("🚀 启动 OneBot (NapCat) 模式...")
             asyncio.run(run_bot())
     except KeyboardInterrupt:
         print("\n[主程序] 收到退出信号")
@@ -13057,8 +14791,92 @@ def main():
             cleanup_on_exit()
         except NameError:
             pass
-    
-    input("按回车键退出...")
+
+
+def main():
+    """主程序启动入口：首次配置向导 / 静默启动 / 热重载"""
+    global CONFIG
+
+    # ===== 判断是否为开发者热重载模式 =====
+    is_dev = os.environ.get("DEV_MODE", "") == "1"
+
+    # ===== 读取 config.json（若不存在则为空） =====
+    if not CONFIG:
+        load_config()
+
+    # ===== 首次配置向导（仅触发一次）：不存在 config.json 或缺 BOT_MODE =====
+    bot_mode = str(CONFIG.get("BOT_MODE", "") or "").strip()
+    if not bot_mode:
+        # 首次运行：不最小化窗口，打印模式选择提示
+        print("=" * 50)
+        print("请选择运行模式：1. OneBot 2. 官方 API")
+        print("=" * 50)
+        try:
+            choice = input("请输入数字 (1/2): ").strip()
+        except EOFError:
+            choice = ""
+        if choice not in ("1", "2"):
+            print("⚠️ 无效选择，默认使用 OneBot (1)")
+            choice = "1"
+
+        # 写入 BOT_MODE + AUTO_MINIMIZE 到 config.json
+        CONFIG["BOT_MODE"] = choice
+        CONFIG["AUTO_MINIMIZE"] = True
+        try:
+            import json as _j
+            with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+                _j.dump(CONFIG, f, ensure_ascii=False, indent=2)
+            print(f"✅ 已写入 config.json: BOT_MODE={choice}, AUTO_MINIMIZE=true")
+        except Exception as e:
+            print(f"⚠️ 写入 config.json 失败: {e}")
+        bot_mode = choice
+
+    # ===== 静默启动（日常）：已有 BOT_MODE，禁止任何 input() =====
+    # 在此绝不调用 input()
+
+    # ===== 热重载支持：DEV_MODE=1 时用 watchfiles 监听 .py 文件 =====
+    if is_dev:
+        try:
+            from watchfiles import watch
+            print("[启动] 🔧 DEV_MODE=1，进入热重载模式（watchfiles 监听 .py 变更）")
+
+            def _reload_watcher():
+                watched_path = os.path.dirname(os.path.abspath(__file__))
+                try:
+                    # 阻塞式监听，文件变更时重启 start_bot()
+                    for changes in watch(watched_path, watch_filter=None):
+                        py_changed = any(
+                            f.endswith(".py")
+                            for _, _p in changes
+                            for f in [_p]
+                        )
+                        if py_changed:
+                            print("[启动] 🔄 检测到 .py 变更，重启 start_bot()...")
+                            start_bot()
+                except KeyboardInterrupt:
+                    print("[启动] 热重载停止")
+                except Exception as e:
+                    print(f"[启动] 热重载异常: {e}")
+
+            # 热重载模式下：首次先启动，然后进入监听循环（阻塞）
+            import threading
+            _t = threading.Thread(target=_reload_watcher, daemon=True)
+            _t.start()
+            start_bot()  # 主线程启动机器人（内部已按 DEV_MODE 不最小化）
+            # 监听线程持续运行，主线程阻塞等待
+            try:
+                while True:
+                    import time as _t2
+                    _t2.sleep(3600)
+            except KeyboardInterrupt:
+                pass
+        except ImportError:
+            print("[启动] ⚠️ watchfiles 未安装，DEV_MODE 热重载不可用，直接普通启动")
+            start_bot()
+    else:
+        # ===== 普通启动：直接调用 start_bot() =====
+        start_bot()
+
 
 if __name__ == "__main__":
     main()
